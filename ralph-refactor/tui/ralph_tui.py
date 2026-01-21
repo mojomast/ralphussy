@@ -42,12 +42,13 @@ from textual.widgets import (  # type: ignore[import-not-found]
     DataTable,
     TextArea,
     Switch,
+    Select,
 )
 from textual.binding import Binding  # type: ignore[import-not-found]
 from textual.reactive import reactive  # type: ignore[import-not-found]
 from textual.message import Message  # type: ignore[import-not-found]
 from textual.timer import Timer  # type: ignore[import-not-found]
-from textual.screen import ModalScreen  # type: ignore[import-not-found]
+from textual.screen import ModalScreen, Screen  # type: ignore[import-not-found]
 from textual import events  # type: ignore[import-not-found]
 from rich.text import Text  # type: ignore[import-not-found]
 from rich.panel import Panel  # type: ignore[import-not-found]
@@ -70,6 +71,31 @@ TUI_CONFIG_PATH = RALPH_DIR / "tui_settings.json"
 SCRIPT_DIR = Path(__file__).parent.resolve()
 RALPH_REFACTOR_DIR = SCRIPT_DIR.parent
 RALPH2_PATH = RALPH_REFACTOR_DIR.parent / "ralph2"
+
+
+def get_opencode_models() -> List[str]:
+    """Fetch available models from opencode."""
+    try:
+        result = subprocess.run(
+            ["opencode", "models"], 
+            capture_output=True, 
+            text=True, 
+            timeout=5
+        )
+        if result.returncode == 0:
+            return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    except Exception:
+        pass
+    # Fallback defaults
+    return [
+        "opencode/claude-sonnet-4-5",
+        "opencode/claude-3-5-haiku",
+        "opencode/gpt-5",
+        "opencode/gpt-4.1",
+        "opencode/gemini-3-pro",
+        "opencode",
+    ]
+
 
 
 @dataclass
@@ -119,6 +145,189 @@ def save_tui_config(cfg: TUIConfig, path: Path = TUI_CONFIG_PATH) -> None:
     path.write_text(json.dumps(asdict(cfg), indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+    class FileEditorScreen(Screen):
+        """Screen for editing files."""
+        BINDINGS = [("escape", "cancel", "Cancel"), ("ctrl+s", "save", "Save")]
+
+        def __init__(self, path: Path):
+            super().__init__()
+            self.path = path
+
+        def compose(self) -> ComposeResult:
+            yield Header()
+            yield Container(
+                Static(f"Editing: {self.path}", id="editor-header"),
+                TextArea(self.path.read_text(encoding="utf-8", errors="replace"), id="editor-area", language="python"),
+                Horizontal(
+                    Button("Save", variant="primary", id="save"),
+                    Button("Cancel", variant="error", id="cancel"),
+                    id="editor-buttons"
+                )
+            )
+            yield Footer()
+
+        def on_button_pressed(self, event: Button.Pressed) -> None:
+            if event.button.id == "save":
+                self.action_save()
+            elif event.button.id == "cancel":
+                self.action_cancel()
+
+        def action_save(self) -> None:
+            content = self.query_one("#editor-area", TextArea).text
+            try:
+                self.path.write_text(content, encoding="utf-8")
+                self.app.notify(f"Saved {self.path}")
+                self.dismiss(True)
+            except Exception as e:
+                self.app.notify(f"Error saving: {e}", severity="error")
+
+        def action_cancel(self) -> None:
+            self.dismiss(False)
+
+    class FileBrowserScreen(ModalScreen[Optional[Path]]):
+        """Popup file browser."""
+        DEFAULT_CSS = """
+        FileBrowserScreen {
+            align: center middle;
+        }
+        FileBrowserScreen #browser-container {
+            width: 80%;
+            height: 80%;
+            border: solid $primary;
+            background: $surface;
+            layout: grid;
+            grid-size: 2 1;
+            grid-columns: 1fr 2fr;
+        }
+        FileBrowserScreen DirectoryTree {
+            height: 100%;
+            border-right: solid $primary;
+        }
+        FileBrowserScreen #preview-container {
+            height: 100%;
+            padding: 1;
+        }
+        FileBrowserScreen #file-preview {
+            height: 1fr;
+            border: solid $secondary;
+        }
+        FileBrowserScreen #browser-buttons {
+            height: 3;
+            dock: bottom;
+            padding: 0 1;
+        }
+        """
+
+        def __init__(self, root_path: Path):
+            super().__init__()
+            self.root_path = root_path
+            self.selected_path: Optional[Path] = None
+
+        def compose(self) -> ComposeResult:
+            with Container(id="browser-container"):
+                yield DirectoryTree(str(self.root_path), id="browser-tree")
+                with Vertical(id="preview-container"):
+                    yield Static("Select a file to preview/edit", id="file-info")
+                    yield TextArea(read_only=True, id="file-preview")
+                    with Horizontal(id="browser-buttons"):
+                        yield Button("Edit", id="edit", disabled=True)
+                        yield Button("Close", id="close", variant="error")
+
+        def on_directory_tree_file_selected(self, event: DirectoryTree.FileSelected) -> None:
+            self.selected_path = Path(event.path)
+            info = self.query_one("#file-info", Static)
+            info.update(f"Selected: {self.selected_path.name}")
+            
+            preview = self.query_one("#file-preview", TextArea)
+            btn_edit = self.query_one("#edit", Button)
+            
+            try:
+                content = self.selected_path.read_text(encoding="utf-8", errors="replace")
+                preview.text = content
+                btn_edit.disabled = False
+            except Exception as e:
+                preview.text = f"Error reading file: {e}"
+                btn_edit.disabled = True
+
+        def on_button_pressed(self, event: Button.Pressed) -> None:
+            if event.button.id == "close":
+                self.dismiss(None)
+            elif event.button.id == "edit" and self.selected_path:
+                self.app.push_screen(FileEditorScreen(self.selected_path))
+
+class WorkerLogScreen(ModalScreen):
+        """Screen to view logs for a specific worker."""
+        DEFAULT_CSS = """
+        WorkerLogScreen {
+            align: center middle;
+        }
+        WorkerLogScreen #log-container {
+            width: 90%;
+            height: 90%;
+            border: solid $primary;
+            background: $surface;
+        }
+        WorkerLogScreen #log-header {
+            height: 3;
+            padding: 1;
+            background: $primary;
+            color: $text;
+            text-style: bold;
+        }
+        WorkerLogScreen TextArea {
+            height: 1fr;
+        }
+        WorkerLogScreen Button {
+            dock: bottom;
+            width: 100%;
+        }
+        """
+
+        def __init__(self, run_id: str, worker_num: int):
+            super().__init__()
+            self.run_id = run_id
+            self.worker_num = worker_num
+
+        def compose(self) -> ComposeResult:
+            with Container(id="log-container"):
+                yield Static(f"Worker {self.worker_num} Logs (Run {self.run_id})", id="log-header")
+                yield TextArea(read_only=True, id="worker-log-area")
+                yield Button("Close", id="close")
+
+        def on_mount(self) -> None:
+            self.refresh_logs()
+            self.set_interval(2.0, self.refresh_logs)
+
+        def refresh_logs(self) -> None:
+            log_area = self.query_one("#worker-log-area", TextArea)
+            log_path = RALPH_DIR / "swarm" / "runs" / self.run_id / f"worker-{self.worker_num}" / "logs"
+            
+            if not log_path.exists():
+                log_area.text = "No logs found."
+                return
+
+            # Find latest log file
+            try:
+                logs = list(log_path.glob("*.log"))
+                if not logs:
+                    log_area.text = "No log files found."
+                    return
+                
+                latest_log = max(logs, key=lambda p: p.stat().st_mtime)
+                content = latest_log.read_text(encoding="utf-8", errors="replace")
+                # Keep scroll position if user scrolled up? 
+                # For now just update text.
+                current_text = log_area.text
+                if content != current_text:
+                    log_area.text = content
+                    log_area.scroll_end(animate=False)
+            except Exception as e:
+                log_area.text = f"Error reading logs: {e}"
+
+        def on_button_pressed(self, event: Button.Pressed) -> None:
+            self.dismiss()
+
+
 class SettingsScreen(ModalScreen[TUIConfig]):
     DEFAULT_CSS = """
     SettingsScreen {
@@ -145,7 +354,7 @@ class SettingsScreen(ModalScreen[TUIConfig]):
         width: 28;
         content-align: left middle;
     }
-    SettingsScreen Input {
+    SettingsScreen Input, SettingsScreen Select {
         width: 1fr;
     }
     SettingsScreen #buttons {
@@ -158,6 +367,7 @@ class SettingsScreen(ModalScreen[TUIConfig]):
     def __init__(self, cfg: TUIConfig):
         super().__init__()
         self._cfg = cfg
+        self._available_models = get_opencode_models()
 
     def compose(self) -> ComposeResult:
         with Container(id="settings"):
@@ -180,7 +390,13 @@ class SettingsScreen(ModalScreen[TUIConfig]):
                     yield Input(value=self._cfg.swarm_provider, id="swarm-provider")
                 with Horizontal(classes="row"):
                     yield Static("Swarm model", classes="label")
-                    yield Input(value=self._cfg.swarm_model, id="swarm-model")
+                    # Use Select for models
+                    model_options = [(m, m) for m in self._available_models]
+                    # Ensure current value is in options
+                    if self._cfg.swarm_model not in self._available_models:
+                         model_options.insert(0, (self._cfg.swarm_model, self._cfg.swarm_model))
+                    
+                    yield Select(model_options, value=self._cfg.swarm_model, id="swarm-model-select")
                 with Horizontal(classes="row"):
                     yield Static("Default workers", classes="label")
                     yield Input(value=str(self._cfg.default_workers), id="swarm-workers")
@@ -232,6 +448,13 @@ class SettingsScreen(ModalScreen[TUIConfig]):
         refresh_raw = self.query_one("#ui-refresh", Input).value.strip()
         default_workers = _parse_int(default_workers_raw or "4", 4)
         refresh_interval_sec = _parse_float(refresh_raw or "2.0", 2.0)
+        
+        # Get selected model
+        swarm_model = self.query_one("#swarm-model-select", Select).value
+        if not swarm_model:
+             # Fallback if Select behaves oddly (though value shouldn't be None usually)
+             swarm_model = "opencode/claude-sonnet-4-5"
+
         if default_workers_raw and str(default_workers) != default_workers_raw:
             chat_pane.log_message("Settings: invalid Default workers value; using 4", "error")
         if refresh_raw and str(refresh_interval_sec) != refresh_raw:
@@ -242,7 +465,7 @@ class SettingsScreen(ModalScreen[TUIConfig]):
             orchestration_model=self.query_one("#orch-model", Input).value.strip(),
             orchestration_attach_url=self.query_one("#orch-attach", Input).value.strip(),
             swarm_provider=self.query_one("#swarm-provider", Input).value.strip() or "opencode",
-            swarm_model=self.query_one("#swarm-model", Input).value.strip() or "opencode/claude-sonnet-4-5",
+            swarm_model=str(swarm_model),
             default_workers=default_workers,
             swarm_auto_merge=self.query_one("#swarm-auto-merge", Switch).value,
             swarm_collect_artifacts=self.query_one("#swarm-artifacts", Switch).value,
@@ -252,6 +475,7 @@ class SettingsScreen(ModalScreen[TUIConfig]):
         )
         cfg.validate()
         self.dismiss(cfg)
+
 
 
 class ProjectManager:
@@ -273,10 +497,17 @@ class ProjectManager:
         (project_dir / "artifacts").mkdir(exist_ok=True)
         (project_dir / "output").mkdir(exist_ok=True)
         
+        # Initialize Git repository
+        subprocess.run(["git", "init"], cwd=str(project_dir), check=True, stdout=subprocess.DEVNULL)
+        
         # Create initial devplan
         devplan = project_dir / "devplan.md"
         if not devplan.exists():
             devplan.write_text(f"# {name} Development Plan\n\n## Tasks\n\n- [ ] Initial task\n")
+        
+        # Initial commit
+        subprocess.run(["git", "add", "."], cwd=str(project_dir), check=True, stdout=subprocess.DEVNULL)
+        subprocess.run(["git", "commit", "-m", "Initial commit"], cwd=str(project_dir), check=True, stdout=subprocess.DEVNULL)
         
         self.current_project = project_dir
         return project_dir
@@ -361,13 +592,19 @@ class SwarmDBReader:
             conn.close()
     
     def get_run_workers(self, run_id: str) -> List[Dict[str, Any]]:
-        """Get workers for a run."""
+        """Get workers for a run, including current task text."""
         conn = self.get_connection()
         if not conn:
             return []
         try:
             cursor = conn.execute(
-                "SELECT * FROM workers WHERE run_id = ? ORDER BY worker_num",
+                """
+                SELECT w.*, t.task_text as current_task_text
+                FROM workers w
+                LEFT JOIN tasks t ON w.current_task_id = t.id
+                WHERE w.run_id = ?
+                ORDER BY w.worker_num
+                """,
                 (run_id,)
             )
             return [dict(row) for row in cursor.fetchall()]
@@ -462,6 +699,7 @@ class ChatPane(Vertical):
     ChatPane #chat-log {
         height: 1fr;
         scrollbar-gutter: stable;
+        overflow-y: scroll;
     }
     
     ChatPane #chat-input {
@@ -477,7 +715,8 @@ class ChatPane(Vertical):
             super().__init__()
     
     def compose(self) -> ComposeResult:
-        yield RichLog(id="chat-log", highlight=True, markup=True, wrap=True)
+        # Use TextArea instead of RichLog for selectable text
+        yield TextArea(id="chat-log", read_only=True)
         yield ChatInput(self, placeholder="Enter command or chat...", id="chat-input")
     
     def on_mount(self) -> None:
@@ -486,8 +725,8 @@ class ChatPane(Vertical):
         self._history_index: Optional[int] = None
         self._autocomplete_last_prefix: str = ""
         self._autocomplete_index: int = 0
-        self.log_message("[bold cyan]Ralph TUI[/bold cyan] initialized", "system")
-        self.log_message("Type [bold]/help[/bold] for available commands", "system")
+        self.log_message("Ralph TUI initialized", "system")
+        self.log_message("Type /help for available commands", "system")
 
     def remember_history(self, command: str) -> None:
         if not command:
@@ -518,13 +757,55 @@ class ChatPane(Vertical):
         self._history_index += 1
         self.query_one("#chat-input", Input).value = self._history[self._history_index]
 
+    def get_command_completions(self, prefix: str) -> List[str]:
+        app = self.app
+        if not isinstance(app, RalphTUI):
+            return []
+
+        commands = [
+            "/help",
+            "/settings",
+            "/mode ",
+            "/new ",
+            "/open ",
+            "/projects",
+            "/devplan ",
+            "/swarm ",
+            "/reiterate ",
+            "/report ",
+            "/sessions",
+            "/focus ",
+            "/status",
+            "/stop",
+            "/logs",
+        ]
+
+        if prefix.startswith("/open "):
+            base = "/open "
+            rest = prefix[len(base):]
+            candidates = [base + p for p in app.project_manager.list_projects() if p.startswith(rest)]
+            return candidates
+
+        if prefix.startswith("/mode "):
+            base = "/mode "
+            rest = prefix[len(base):]
+            return [base + m for m in ["orchestrator", "ralph"] if m.startswith(rest)]
+
+        if prefix.startswith("/swarm "):
+            base = "/swarm "
+            rest = prefix[len(base):]
+            sub = ["start", "status", "stop", "logs", "inspect", "cleanup", "reiterate"]
+            return [base + s + (" " if s in {"logs", "reiterate"} else "") for s in sub if (s + " ").startswith(rest) or s.startswith(rest)]
+
+        return [c for c in commands if c.startswith(prefix)]
+
     def autocomplete(self) -> None:
         input_widget = self.query_one("#chat-input", Input)
         value = input_widget.value
         if not value.startswith("/"):
             return
 
-        candidates = self.app.get_command_completions(value)
+        candidates = self.get_command_completions(value)
         if not candidates:
             return
 
@@ -538,19 +819,40 @@ class ChatPane(Vertical):
     
     def log_message(self, message: str, msg_type: str = "info") -> None:
         """Log a message to the chat."""
-        log = self.query_one("#chat-log", RichLog)
+        log = self.query_one("#chat-log", TextArea)
         timestamp = datetime.now().strftime("%H:%M:%S")
         
+        prefix = ""
         if msg_type == "user":
-            log.write(f"[dim]{timestamp}[/dim] [bold green]You:[/bold green] {message}")
+            prefix = f"{timestamp} You: "
         elif msg_type == "ralph":
-            log.write(f"[dim]{timestamp}[/dim] [bold blue]Ralph:[/bold blue] {message}")
+            prefix = f"{timestamp} Ralph: "
         elif msg_type == "system":
-            log.write(f"[dim]{timestamp}[/dim] [bold yellow]System:[/bold yellow] {message}")
+            prefix = f"{timestamp} System: "
         elif msg_type == "error":
-            log.write(f"[dim]{timestamp}[/dim] [bold red]Error:[/bold red] {message}")
+            prefix = f"{timestamp} Error: "
         else:
-            log.write(f"[dim]{timestamp}[/dim] {message}")
+            prefix = f"{timestamp} "
+            
+        # Append text to the TextArea
+        # Strip rich markup for the plain text area
+        try:
+            clean_msg = Text.from_markup(message).plain
+        except Exception:
+            clean_msg = message
+            
+        # Append text directly to the property
+        log.text += f"{prefix}{clean_msg}\n"
+        
+        # Pin to bottom without animation to prevent jumping ("popcorning")
+        log.scroll_end(animate=False)
+        
+        # Force cursor to end to help maintain position
+        # Note: TextArea cursor logic can be version dependent, so we rely mainly on scroll_end
+        try:
+            log.cursor_location = (log.document.line_count - 1, 0)
+        except Exception:
+            pass
     
     def on_input_submitted(self, event: Input.Submitted) -> None:
         """Handle input submission."""
@@ -560,6 +862,7 @@ class ChatPane(Vertical):
             self.remember_history(command)
             self.log_message(command, "user")
             self.post_message(self.CommandSubmitted(command))
+
 
 
 class WorkerPane(Vertical):
@@ -582,14 +885,21 @@ class WorkerPane(Vertical):
     }
     """
     
+    class WorkerSelected(Message):
+        """Message when a worker is selected from the table."""
+        def __init__(self, run_id: str, worker_num: int):
+            self.run_id = run_id
+            self.worker_num = worker_num
+            super().__init__()
+
     def compose(self) -> ComposeResult:
-        yield Static("[bold]Workers[/bold]", id="worker-header")
-        yield DataTable(id="worker-table")
+        yield Static("[bold]Workers[/bold] (Click ID for logs)", id="worker-header")
+        yield DataTable(id="worker-table", cursor_type="row")
     
     def on_mount(self) -> None:
         """Initialize worker table."""
         table = self.query_one("#worker-table", DataTable)
-        table.add_columns("ID", "Status", "Task", "Branch", "Heartbeat")
+        table.add_columns("ID", "Status", "Task", "Branch", "RunID")
     
     def update_workers(self, workers: List[Dict[str, Any]]) -> None:
         """Update worker table with current workers."""
@@ -600,8 +910,9 @@ class WorkerPane(Vertical):
             worker_num = worker.get("worker_num", "?")
             status = worker.get("status", "unknown")
             task_id = worker.get("current_task_id", "-")
+            task_text = worker.get("current_task_text", "") # Added in DB later maybe? Or we need to fetch
             branch = worker.get("branch_name", "-")
-            heartbeat = worker.get("last_heartbeat", "-")
+            run_id = worker.get("run_id", "")
             
             # Colorize status
             status_display = status
@@ -612,13 +923,34 @@ class WorkerPane(Vertical):
             elif status == "error":
                 status_display = "[red]error[/red]"
             
+            # Truncate task text if available, otherwise use ID
+            task_display = str(task_id)
+            if task_text:
+                task_display = f"{task_id}: {task_text[:30]}..."
+            elif task_id and task_id != "-":
+                 # If we don't have text in the worker record, maybe just show ID
+                 pass
+
             table.add_row(
                 str(worker_num),
                 status_display,
-                str(task_id) if task_id else "-",
-                branch[:20] if branch else "-",
-                heartbeat[-8:] if heartbeat else "-"
+                task_display,
+                branch[:15] if branch else "-",
+                str(run_id),
+                key=f"{run_id}|{worker_num}"
             )
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Handle row selection."""
+        if not event.row_key.value:
+             return
+        try:
+            parts = str(event.row_key.value).split("|")
+            if len(parts) == 2:
+                run_id, worker_num = parts[0], int(parts[1])
+                self.post_message(self.WorkerSelected(run_id, worker_num))
+        except Exception:
+            pass
 
 
 class ProgressPane(Vertical):
@@ -626,41 +958,29 @@ class ProgressPane(Vertical):
     
     DEFAULT_CSS = """
     ProgressPane {
-        height: 100%;
-        border: solid yellow;
-    }
-    
-    ProgressPane #progress-header {
-        height: 3;
-        background: $surface;
-        padding: 1;
-    }
-    
-    ProgressPane #progress-stats {
         height: auto;
-        padding: 1;
+        border-top: solid yellow;
+        dock: bottom;
+        max-height: 4;
     }
     
     ProgressPane #progress-bar-container {
-        height: 3;
-        padding: 1;
+        height: 1;
+        width: 1fr;
     }
     
-    ProgressPane #task-list {
-        height: 1fr;
+    ProgressPane #stats-line {
+        height: 1;
+        width: 1fr;
     }
     """
     
     progress = reactive(0.0)
     
     def compose(self) -> ComposeResult:
-        yield Static("[bold]Progress[/bold]", id="progress-header")
-        yield Static("", id="progress-stats")
-        yield Container(
-            ProgressBar(total=100, id="progress-bar"),
-            id="progress-bar-container"
-        )
-        yield RichLog(id="task-list", highlight=True, markup=True)
+         with Vertical():
+            yield Static("Ready", id="stats-line")
+            yield ProgressBar(total=100, id="progress-bar", show_eta=False)
     
     def update_progress(self, run_info: Optional[Dict], stats: Dict[str, int], total_cost: float = 0.0) -> None:
         """Update progress display."""
@@ -671,17 +991,25 @@ class ProgressPane(Vertical):
         pending = stats.get("pending", 0)
         
         # Update stats display
-        stats_widget = self.query_one("#progress-stats", Static)
-        run_id = run_info.get("run_id", "N/A") if run_info else "N/A"
-        status = run_info.get("status", "N/A") if run_info else "N/A"
+        stats_widget = self.query_one("#stats-line", Static)
         
-        cost_text = f"  [bold]Cost:[/bold] ${total_cost:.4f}" if total_cost else ""
+        cost_text = f" | Cost: ${total_cost:.4f}" if total_cost else ""
+        
+        if not run_info:
+             stats_widget.update("[dim]No active run[/dim]")
+             self.query_one("#progress-bar", ProgressBar).update(progress=0)
+             return
+
+        run_id = run_info.get("run_id", "N/A")
+        status = run_info.get("status", "N/A")
+
         stats_text = (
-            f"[bold]Run:[/bold] {run_id}  [bold]Status:[/bold] {status}{cost_text}\n"
+            f"[bold]{status}[/bold] (Run {run_id[:8]}) | "
             f"[green]Done: {completed}[/green] | "
             f"[blue]Active: {in_progress}[/blue] | "
             f"[yellow]Pending: {pending}[/yellow] | "
             f"[red]Failed: {failed}[/red]"
+            f"{cost_text}"
         )
         stats_widget.update(stats_text)
         
@@ -693,18 +1021,10 @@ class ProgressPane(Vertical):
             progress_bar.update(progress=0)
     
     def add_task_update(self, task_text: str, status: str) -> None:
-        """Add a task update to the log."""
-        task_log = self.query_one("#task-list", RichLog)
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        
-        if status == "completed":
-            task_log.write(f"[dim]{timestamp}[/dim] [green]✓[/green] {task_text[:50]}")
-        elif status == "failed":
-            task_log.write(f"[dim]{timestamp}[/dim] [red]✗[/red] {task_text[:50]}")
-        elif status == "in_progress":
-            task_log.write(f"[dim]{timestamp}[/dim] [blue]→[/blue] {task_text[:50]}")
-        else:
-            task_log.write(f"[dim]{timestamp}[/dim] [yellow]○[/yellow] {task_text[:50]}")
+        # We no longer have a log in the single-line progress pane
+        # Task updates should go to the main chat log instead
+        pass
+
 
 
 class FilePane(Vertical):
@@ -799,7 +1119,6 @@ class FilePane(Vertical):
         # Update existing tree in place to avoid duplicate widget IDs.
         tree = self.query_one("#file-tree", DirectoryTree)
         tree.path = root_path
-        tree.reset(str(root_path), root_path)
         tree.reload()
 
     def refresh_tree(self) -> None:
@@ -873,6 +1192,10 @@ class RalphTUI(App):
         self.active_process_id: Optional[str] = None
 
         self.chat_mode: str = "orchestrator"  # orchestrator | ralph
+
+        # State tracking for notifications
+        self._last_task_stats: Dict[str, str] = {}  # task_id -> status
+        self._last_run_id: Optional[str] = None
 
         self.refresh_timer: Optional[Timer] = None
         self._file_watch_task: Optional[asyncio.Task] = None
@@ -954,6 +1277,34 @@ class RalphTUI(App):
         total_cost = self.db_reader.get_run_cost(run_id)
         progress_pane = self.query_one("#progress-pane", ProgressPane)
         progress_pane.update_progress(run_info, stats, total_cost)
+
+        # Task completion notifications
+        if self._last_run_id != run_id:
+            # New run detected, reset tracking
+            self._last_run_id = run_id
+            self._last_task_stats = {}
+        
+        # We need to fetch tasks to check for status changes
+        current_tasks = self.db_reader.get_run_tasks(run_id)
+        chat_pane = self.query_one("#chat-pane", ChatPane)
+        
+        for task in current_tasks:
+            t_id = str(task.get("id"))
+            t_status = task.get("status")
+            t_text = task.get("task_text", "")
+            
+            # If we've seen this task before and status changed
+            if t_id in self._last_task_stats:
+                old_status = self._last_task_stats[t_id]
+                if old_status != t_status:
+                    if t_status == "completed":
+                        chat_pane.log_message(f"[green]Task Completed:[/green] {t_text[:60]}...", "system")
+                    elif t_status == "failed":
+                        err = task.get("error_message", "Unknown error")
+                        chat_pane.log_message(f"[red]Task Failed:[/red] {t_text[:60]}... ({err})", "error")
+            
+            # Update tracked status
+            self._last_task_stats[t_id] = str(t_status)
     
     def on_chat_pane_command_submitted(self, event: ChatPane.CommandSubmitted) -> None:
         """Handle commands from chat pane."""
@@ -1892,7 +2243,7 @@ class RalphTUI(App):
         except Exception as e:
             chat_pane.log_message(f"Failed to run command: {e}", "error")
     
-    def action_quit(self) -> None:
+    async def action_quit(self) -> None:
         """Quit the application."""
         # Best-effort: terminate any active sessions.
         for proc in list(self.processes.values()):
