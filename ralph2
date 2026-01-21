@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+
+# Experimental wrapper for the refactored Ralph entrypoint.
+#
+# This wrapper is meant to be installed via symlink into ~/.local/bin (or
+# elsewhere). Because of that, we must resolve symlinks to find the real repo
+# location before jumping into ralph-refactor/.
+
+set -euo pipefail
+
+SOURCE=${BASH_SOURCE[0]}
+while [ -L "$SOURCE" ]; do
+  DIR=$(cd -P "$(dirname "$SOURCE")" && pwd)
+  SOURCE=$(readlink "$SOURCE")
+  case "$SOURCE" in
+    /*) ;;
+    *) SOURCE="$DIR/$SOURCE" ;;
+  esac
+done
+
+SCRIPT_DIR=$(cd -P "$(dirname "$SOURCE")" && pwd)
+
+exec "$SCRIPT_DIR/ralph-refactor/ralph" "$@"

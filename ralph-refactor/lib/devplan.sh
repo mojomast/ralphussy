@@ -1,0 +1,633 @@
+# Devplan helpers (task parsing, state updates, stall detection, devplan runs).
+
+has_pending_tasks() {
+    local devpath="$1"
+
+    if [ ! -f "$devpath" ]; then
+        return 1
+    fi
+
+    # Check for any pending tasks ([ ] or ⏳)
+    if grep -qE '^[ ]*- \[ \]|^[ ]*- \[⏳\]|^[ ]*- ⏳' "$devpath" 2>/dev/null; then
+        return 0  # Has pending tasks
+    fi
+
+    return 1  # No pending tasks
+}
+
+count_devplan_tasks() {
+    local devpath="$1"
+
+    if [ ! -f "$devpath" ]; then
+        echo "0 0 0 0"
+        return 1
+    fi
+
+    local pending
+    pending=$(grep -cE '^[ ]*- \[ \]' "$devpath" 2>/dev/null || true)
+    [ -z "$pending" ] && pending=0
+    local in_progress
+    in_progress=$(grep -cE '^[ ]*- \[⏳\]|^[ ]*- ⏳' "$devpath" 2>/dev/null || true)
+    [ -z "$in_progress" ] && in_progress=0
+    local completed
+    completed=$(grep -cE '^[ ]*- \[✅\]|^[ ]*- ✅' "$devpath" 2>/dev/null || true)
+    [ -z "$completed" ] && completed=0
+    local needs_review
+    needs_review=$(grep -cE '^[ ]*- \[🔄\]|^[ ]*- 🔄' "$devpath" 2>/dev/null || true)
+    [ -z "$needs_review" ] && needs_review=0
+
+    # Ensure all values are numbers
+    pending=${pending//[^0-9]/}
+    in_progress=${in_progress//[^0-9]/}
+    completed=${completed//[^0-9]/}
+    needs_review=${needs_review//[^0-9]/}
+
+    echo "$pending $in_progress $completed $needs_review"
+}
+
+get_next_pending_task() {
+    local devpath="$1"
+    if [ ! -f "$devpath" ]; then
+        echo ""
+        return 1
+    fi
+
+    # Find first pending task (marked with ⏳ or unchecked)
+    # Devplan uses format: - [✅] task or - ⏳ task or - [ ] task
+    # Skip tasks marked with [🔄] (needs review)
+    local task
+    task=$(awk '
+    /^[ ]*- \[🔄\]/ { next }
+    /^[ ]*- 🔄/ { next }
+    /^[ ]*- \[✅\]/ { next }
+    /^[ ]*- \[⏳\]/ {
+        sub(/^[ ]*- \[⏳\] /, "")
+        gsub(/^\s+|\s+$/, "")
+        print
+        exit
+    }
+    /^[ ]*- ⏳/ {
+        sub(/^[ ]*- ⏳ /, "")
+        gsub(/^\s+|\s+$/, "")
+        print
+        exit
+    }
+    /^[ ]*- \[ \]/ {
+        sub(/^[ ]*- \[ \] /, "")
+        gsub(/^\s+|\s+$/, "")
+        print
+        exit
+    }
+    ' "$devpath")
+
+    echo "$task"
+}
+
+get_all_tasks_with_states() {
+    local devpath="$1"
+    if [ ! -f "$devpath" ]; then
+        echo ""
+        return 1
+    fi
+
+    awk '
+    /^[ ]*- \[✅\]/ {
+        sub(/^[ ]*- \[✅\] /, "")
+        gsub(/^\s+|\s+$/, "")
+        print "complete: " $0
+    }
+    /^[ ]*- ✅/ {
+        sub(/^[ ]*- ✅ /, "")
+        gsub(/^\s+|\s+$/, "")
+        print "complete: " $0
+    }
+    /^[ ]*- \[⏳\]/ {
+        sub(/^[ ]*- \[⏳\] /, "")
+        gsub(/^\s+|\s+$/, "")
+        print "in_progress: " $0
+    }
+    /^[ ]*- ⏳/ {
+        sub(/^[ ]*- ⏳ /, "")
+        gsub(/^\s+|\s+$/, "")
+        print "in_progress: " $0
+    }
+    /^[ ]*- \[🔄\]/ {
+        sub(/^[ ]*- \[🔄\] /, "")
+        gsub(/<!--.*-->/, "")
+        gsub(/^\s+|\s+$/, "")
+        print "needs_review: " $0
+    }
+    /^[ ]*- 🔄/ {
+        sub(/^[ ]*- 🔄 /, "")
+        gsub(/<!--.*-->/, "")
+        gsub(/^\s+|\s+$/, "")
+        print "needs_review: " $0
+    }
+    /^[ ]*- \[ \]/ {
+        sub(/^[ ]*- \[ \] /, "")
+        gsub(/^\s+|\s+$/, "")
+        print "pending: " $0
+    }
+    ' "$devpath"
+}
+
+mark_task_in_progress() {
+    local devpath="$1"
+    local task="$2"
+
+    if [ ! -f "$devpath" ]; then
+        return 1
+    fi
+
+    # Use awk to perform an exact, literal match update to avoid sed regex pitfalls.
+    # This replaces the first matching pending/completed line containing the exact
+    # task text with the in-progress marker while preserving indentation.
+    awk -v task="$task" '
+    BEGIN { updated=0 }
+    {
+      line = $0
+      if (!updated) {
+        # strip leading indentation
+        match(line, /^[ \t]*/)
+        indent = substr(line, RSTART, RLENGTH)
+        body = substr(line, RLENGTH+1)
+        # possible prefixes: - [ ] , - ✅ , - ⏳ , - [🔄] etc.
+        if (body ~ /^- (\[[ ]\]|\[⏳\]|⏳|\[🔄\]|🔄|\[✅\]|✅) /) {
+          # remove checkbox/prefix for comparison
+          gsub(/^(- (\[[^]]*\]|[⏳✅🔄]) )/, "", body)
+          if (body == task) {
+            print indent "- [⏳] " task
+            updated=1
+            next
+          }
+        }
+      }
+      print $0
+    }
+    END { if (updated==0) exit 0 }
+    ' "$devpath" > "${devpath}.tmp" && mv "${devpath}.tmp" "$devpath" 2>/dev/null || true
+}
+
+mark_task_complete() {
+    local devpath="$1"
+    local task="$2"
+
+    if [ ! -f "$devpath" ]; then
+        return 1
+    fi
+
+    # Use awk to mark the exact task as complete in a safe way.
+    awk -v task="$task" '
+    BEGIN { updated=0 }
+    {
+      line = $0
+      if (!updated) {
+        match(line, /^[ \t]*/)
+        indent = substr(line, RSTART, RLENGTH)
+        body = substr(line, RLENGTH+1)
+        if (body ~ /^- (\[[ ]\]|\[⏳\]|⏳|\[🔄\]|🔄|\[✅\]|✅) /) {
+          gsub(/^(- (\[[^]]*\]|[⏳✅🔄]) )/, "", body)
+          if (body == task) {
+            print indent "- [✅] " task
+            updated=1
+            next
+          }
+        }
+      }
+      print $0
+    }
+    END { if (updated==0) exit 0 }
+    ' "$devpath" > "${devpath}.tmp" && mv "${devpath}.tmp" "$devpath" 2>/dev/null || true
+}
+
+mark_task_needs_review() {
+    local devpath="$1"
+    local task="$2"
+    local reason="${3:-}"
+
+    if [ ! -f "$devpath" ]; then
+        return 1
+    fi
+
+    # Use awk to mark the task as needing review and optionally append a reason
+    awk -v task="$task" -v reason="$reason" '
+    BEGIN { updated=0 }
+    {
+      line = $0
+      if (!updated) {
+        match(line, /^[ \t]*/)
+        indent = substr(line, RSTART, RLENGTH)
+        body = substr(line, RLENGTH+1)
+        if (body ~ /^- (\[[ ]\]|\[⏳\]|⏳|\[🔄\]|🔄|\[✅\]|✅) /) {
+          gsub(/^(- (\[[^]]*\]|[⏳✅🔄]) )/, "", body)
+          if (body == task) {
+            out = indent "- [🔄] " task
+            if (reason != "") out = out " <!-- " reason " -->"
+            print out
+            updated=1
+            next
+          }
+        }
+      }
+      print $0
+    }
+    END { if (updated==0) exit 0 }
+    ' "$devpath" > "${devpath}.tmp" && mv "${devpath}.tmp" "$devpath" 2>/dev/null || true
+
+    log_info "Task marked as needing review: $task"
+}
+
+get_tasks_needing_review() {
+    local devpath="$1"
+    if [ ! -f "$devpath" ]; then
+        echo ""
+        return 1
+    fi
+
+    # Find all tasks marked with 🔄
+    local tasks
+    tasks=$(awk '
+    /^[ ]*- \[🔄\]/ {
+        sub(/^[ ]*- \[🔄\] /, "")
+        gsub(/<!--.*-->/, "")  # Remove comments
+        gsub(/^\s+|\s+$/, "")
+        print
+    }
+    /^[ ]*- 🔄/ {
+        sub(/^[ ]*- 🔄 /, "")
+        gsub(/<!--.*-->/, "")  # Remove comments
+        gsub(/^\s+|\s+$/, "")
+        print
+    }
+    ' "$devpath")
+
+    echo "$tasks"
+}
+
+is_task_stalled() {
+    local task="$1"
+    local max_attempts="${2:-3}"
+
+    # Check if this task has been attempted multiple times without completion
+    # This would be tracked in a separate stall counter file
+    local stall_file="$RALPH_DIR/task_stalls.txt"
+
+    if [ ! -f "$stall_file" ]; then
+        return 1
+    fi
+
+    local attempts
+    attempts=$(grep -c "^$task$" "$stall_file" 2>/dev/null || echo "0")
+
+    if [ "$attempts" -ge "$max_attempts" ]; then
+        return 0
+    fi
+
+    return 1
+}
+
+record_stall_attempt() {
+    local task="$1"
+    local stall_file="$RALPH_DIR/task_stalls.txt"
+
+    echo "$task" >> "$stall_file"
+}
+
+clear_stall_record() {
+    local task="$1"
+    local stall_file="$RALPH_DIR/task_stalls.txt"
+    local temp_file="$RALPH_DIR/task_stalls_temp.txt"
+
+    if [ -f "$stall_file" ]; then
+        grep -v "^$task$" "$stall_file" > "$temp_file" 2>/dev/null || true
+        mv "$temp_file" "$stall_file"
+    fi
+}
+
+detect_stall() {
+    local iteration="$1"
+    local output="$2"
+    local tools_used="$3"
+
+    # Check for multiple failure indicators
+    local stall_indicators=0
+
+    # 1. No file modifications in this iteration
+    if ! echo "$tools_used" | grep -qE '(Write|Edit|task)'; then
+        stall_indicators=$((stall_indicators + 1))
+    fi
+
+    # 2. Output contains stuck/stalled language or timeout
+    if echo "$output" | grep -qiE '(cannot|unable|stuck|blocked|failing|error|failed|timeout|not found|command not found)'; then
+        stall_indicators=$((stall_indicators + 1))
+    fi
+
+    # 3. Bash was used but no file changes (command may have failed/timed out)
+    if echo "$tools_used" | grep -qE '(bash|Bash)' && ! echo "$tools_used" | grep -qE '(Write|Edit|task)'; then
+        stall_indicators=$((stall_indicators + 1))
+    fi
+
+    # 4. No completion promise after multiple retries
+    if ! echo "$output" | grep -q "<promise>COMPLETE</promise>"; then
+        stall_indicators=$((stall_indicators + 1))
+    fi
+
+    # Return stall detected if 2+ indicators present
+    if [ "$stall_indicators" -ge 2 ]; then
+        return 0
+    fi
+
+    return 1
+}
+
+generate_stall_reason() {
+    local output="$1"
+    local tools_used="$2"
+
+    if ! echo "$tools_used" | grep -qE '(Write|Edit|bash|Bash|task)'; then
+        echo "no_file_changes"
+    elif echo "$output" | grep -qiE '(cannot|unable|blocked)'; then
+        echo "blocked_operation"
+    elif echo "$output" | grep -qiE '(error|failing|failed|timeout)'; then
+        echo "errors_detected"
+    else
+        echo "stalled_progress"
+    fi
+}
+
+reset_task_state() {
+    local devpath="$1"
+    local task="$2"
+
+    if [ ! -f "$devpath" ]; then
+        log_error "Devplan file not found: $devpath"
+        return 1
+    fi
+
+    # Use awk to reset the task state back to pending
+    awk -v task="$task" '
+    BEGIN { updated=0 }
+    {
+      line = $0
+      if (!updated) {
+        match(line, /^[ \t]*/)
+        indent = substr(line, RSTART, RLENGTH)
+        body = substr(line, RLENGTH+1)
+        if (body ~ /^- (\[[^]]*\]|[⏳✅🔄]) /) {
+          gsub(/^(- (\[[^]]*\]|[⏳✅🔄]) )/, "", body)
+          if (body == task) {
+            print indent "- [ ] " task
+            updated=1
+            next
+          }
+        }
+      }
+      print $0
+    }
+    END { if (updated==0) exit 0 }
+    ' "$devpath" > "${devpath}.tmp" && mv "${devpath}.tmp" "$devpath" 2>/dev/null || true
+
+    # Clear stall record
+    clear_stall_record "$task"
+
+    log_success "Task reset to pending: $task"
+}
+
+show_devplan_summary() {
+    local devpath="${1:-./devplan.md}"
+
+    if [ ! -f "$devpath" ]; then
+        log_error "Devplan file not found: $devpath"
+        return 1
+    fi
+
+    echo "╔══════════════════════════════════════════════════════════╗"
+    echo "║                  DevPlan Summary                         ║"
+    echo "╚══════════════════════════════════════════════════════════╝"
+    echo ""
+
+    local tasks
+    tasks=$(get_all_tasks_with_states "$devpath")
+
+    # Compute counts using count_devplan_tasks helper
+    local counts
+    counts=$(count_devplan_tasks "$devpath" 2>/dev/null || echo "0 0 0 0")
+    local pending_count
+    local in_progress_count
+    local complete_count
+    local needs_review_count
+    pending_count=$(echo "$counts" | cut -d' ' -f1)
+    in_progress_count=$(echo "$counts" | cut -d' ' -f2)
+    complete_count=$(echo "$counts" | cut -d' ' -f3)
+    needs_review_count=$(echo "$counts" | cut -d' ' -f4)
+    local total_count=$((pending_count + in_progress_count + complete_count + needs_review_count))
+
+    echo "📋 Total tasks: $total_count"
+    echo "   ✅ Complete: $complete_count"
+    echo "   ⏳ In Progress: $in_progress_count"
+    echo "   🔄 Needs Review: $needs_review_count"
+    echo "   [ ] Pending: $pending_count"
+    echo ""
+
+    if [ "$needs_review_count" -gt 0 ]; then
+        echo "⚠️  Tasks needing review:"
+        echo "$tasks" | grep "^needs_review:" | while read -r line; do
+            local task
+            task=$(echo "$line" | cut -d':' -f2-)
+            echo "   🔄 $task"
+        done
+        echo ""
+        echo "   These tasks stalled. To retry:"
+        echo "   1. Edit devplan.md and change [🔄] back to [ ]"
+        echo "   2. Or use: ralph --reset-task \"task name\" --devplan $devpath"
+        echo ""
+    fi
+
+    if [ "$in_progress_count" -gt 0 ]; then
+        echo "🔄 Tasks in progress:"
+        echo "$tasks" | grep "^in_progress:" | while read -r line; do
+            local task
+            task=$(echo "$line" | cut -d':' -f2-)
+            echo "   ⏳ $task"
+        done
+        echo ""
+    fi
+
+    # Show active blockers
+    if [ -f "$BLOCKERS_FILE" ] && [ -s "$BLOCKERS_FILE" ]; then
+        echo "🚫 Active Blockers:"
+        cat "$BLOCKERS_FILE" | while read -r line; do
+            echo "   $line"
+        done
+        echo ""
+    fi
+}
+
+run_devplan_iteration() {
+    local prompt="$1"
+    local iteration="$2"
+    local devfile="$3"
+    local task="$4"
+    local timestamp
+    timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    log_info "=========================================="
+    log_info "=== Task $iteration: $task ==="
+    log_info "=========================================="
+    echo ""
+
+    # Build command for real-time output
+    local opencode_cmd="opencode run"
+    if [ -n "$PROVIDER" ]; then
+        opencode_cmd="$opencode_cmd --provider $PROVIDER"
+    fi
+    if [ -n "$MODEL" ]; then
+        opencode_cmd="$opencode_cmd --model $MODEL"
+    fi
+
+    # Show API request info
+    echo -e "${BLUE}📤 API REQUEST${NC}"
+    echo -e "   ${YELLOW}Provider:${NC} ${PROVIDER:-default}"
+    echo -e "   ${YELLOW}Model:${NC} ${MODEL:-default}"
+    echo -e "   ${YELLOW}Task:${NC} $task"
+    echo -e "   ${YELLOW}DevPlan:${NC} $devfile"
+    echo ""
+
+    # Show waiting indicator
+    echo -e "${YELLOW}⏳ Waiting for API response...${NC}"
+
+    # Start background monitor
+    start_monitor
+
+    # Run with JSON format - single API call
+    local start_time
+    start_time=$(date +%s)
+    local json_output
+    json_output=$($opencode_cmd --format json "$prompt" 2>&1)
+    local exit_code=$?
+    local end_time
+    end_time=$(date +%s)
+    local duration=$((end_time - start_time))
+
+    # Stop background monitor
+    stop_monitor
+
+    # Clear waiting message and show response received
+    echo -e "${GREEN}📥 API RESPONSE received (${duration}s)${NC}"
+    echo ""
+
+    # Check for API errors
+    if [ $exit_code -ne 0 ]; then
+        log_error "API call failed with exit code $exit_code"
+        echo -e "${RED}Error output: $(echo "$json_output" | head -c 500)${NC}"
+        record_stall_attempt "$task"
+        return 1
+    fi
+
+    # Extract text content for display (robust helper)
+    local text_output=""
+    text_output=$(json_extract_text "$json_output") || text_output=""
+
+    # Display tool calls and output (filter out Ralph's own headers)
+    echo "$text_output" | tr '|' '\n' | grep -vE '^\[RALPH\]|^=== Task|^=================================|^[0-9]\+' | while IFS= read -r line; do
+        line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        if [ -z "$line" ]; then
+            continue
+        fi
+        if echo "$line" | grep -qE '^(Read|Write|Edit|Bash|grep|glob|task|webfetch|codesearch|websearch|todoread|todowrite)'; then
+            echo -e "\033[0;36m🔧 $line\033[0m"
+        elif echo "$line" | grep -qE '^Thinking|^Analyzing|^Searching|^Reading|^Writing|^Executing|^Running|^Created|^Modified|^Updated'; then
+            echo -e "\033[0;33m💭 $line\033[0m"
+        elif echo "$line" | grep -qE '^(✅|❌|⚠️|ℹ️|🔧|📁|📝)'; then
+            echo -e "\033[0;32m$line\033[0m"
+        elif echo "$line" | grep -qE '^\[.*\]'; then
+            echo "$line"
+        else
+            echo "$line"
+        fi
+    done
+
+    echo ""
+    log_info "----------------------------------------"
+
+    # Parse token stats from JSON
+    local prompt_tokens=0
+    local completion_tokens=0
+    local cost=0
+    if command -v jq &> /dev/null; then
+        prompt_tokens=$(echo "$json_output" | jq -r '.part.tokens.input // .tokens.input // 0' 2>/dev/null | head -1) || prompt_tokens=0
+        completion_tokens=$(echo "$json_output" | jq -r '.part.tokens.output // .tokens.output // 0' 2>/dev/null | head -1) || completion_tokens=0
+        cost=$(echo "$json_output" | jq -r '.part.cost // .cost // 0' 2>/dev/null | head -1) || cost=0
+    fi
+    local total_tokens=$((prompt_tokens + completion_tokens))
+
+    log_info "Provider/Model: ${PROVIDER:-opencode}/${MODEL:-default} | Tokens: ${prompt_tokens:-0}→${completion_tokens:-0} (total: ${total_tokens:-0}) | Cost: \$${cost:-0} | Duration: ${duration}s"
+
+    # Extract tool calls from JSON
+    local tools_used=""
+    tools_used=$(json_extract_tools "$json_output") || tools_used=""
+    if [ -n "$tools_used" ]; then
+        log_info "Tools used: $tools_used"
+    fi
+
+    log_info "----------------------------------------"
+    echo ""
+
+    # Check for completion
+    if echo "$text_output" | grep -q "<promise>$COMPLETION_PROMISE</promise>"; then
+        log_success "Task completed!"
+        mark_task_complete "$devfile" "$task"
+        clear_stall_record "$task"
+        clear_blockers "$task"
+        log_progress "$iteration" "$task" "completed" "$duration"
+        update_docs "✅ Completed: $task (${duration}s, ${total_tokens} tokens)"
+        return 0
+    fi
+
+    # Check if devplan was updated
+    if grep -qE "✅.*$task" "$devfile" 2>/dev/null; then
+        log_success "Task marked complete in devplan"
+        clear_stall_record "$task"
+        clear_blockers "$task"
+        log_progress "$iteration" "$task" "completed" "$duration"
+        update_docs "✅ Completed: $task (${duration}s, ${total_tokens} tokens)"
+        return 0
+    fi
+
+    # If work was done, mark complete
+    if echo "$tools_used" | grep -qE "(Write|Edit|bash|Bash|task)"; then
+        log_info "Work detected - marking task as complete"
+        mark_task_complete "$devfile" "$task"
+        clear_stall_record "$task"
+        clear_blockers "$task"
+        log_progress "$iteration" "$task" "completed" "$duration"
+        update_docs "✅ Completed: $task (${duration}s, ${total_tokens} tokens, tools: $tools_used)"
+        return 0
+    fi
+
+    # Check for blockers in output
+    if echo "$text_output" | grep -qiE '(cannot|blocked|error|failed|permission denied|not found|dependency)'; then
+        local blocker
+        blocker=$(echo "$text_output" | grep -oiE '(cannot|blocked|error|failed|permission denied|not found|dependency).*' | head -1 | tr '\n' ' ' | sed 's/  */ /g')
+        record_blocker "$task" "$blocker"
+        update_docs "🚫 Blocked: $task - $blocker"
+    fi
+
+    # Check for stall indicators
+    record_stall_attempt "$task"
+
+    if detect_stall "$iteration" "$text_output" "$tools_used" "$duration"; then
+        local stall_reason
+        stall_reason=$(generate_stall_reason "$text_output" "$tools_used")
+        log_warning "Stall detected for task: $task (reason: $stall_reason)"
+        mark_task_needs_review "$devfile" "$task" "$stall_reason"
+        log_progress "$iteration" "$task" "stalled: $stall_reason" "$duration"
+        update_docs "🔄 Stalled: $task - $stall_reason (${duration}s)"
+        return 2  # Special return code for stalled task
+    fi
+
+    log_warning "Task not completed"
+    log_progress "$iteration" "$task" "incomplete" "$duration"
+    update_docs "⚠️ Incomplete: $task (${duration}s, tools: $tools_used)"
+    return 1
+}

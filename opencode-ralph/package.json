@@ -1,0 +1,26 @@
+{
+  "name": "@opencode-ai/ralph",
+  "version": "1.0.0",
+  "description": "Ralph autonomous loop agent mode for OpenCode",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "opencode",
+    "ralph",
+    "agent",
+    "autonomous",
+    "loop"
+  ],
+  "author": "OpenCode Team",
+  "license": "MIT",
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.1.0",
+    "@opencode-ai/sdk": ">=1.1.0",
+    "zod": ">=3.0.0"
+  }
+}

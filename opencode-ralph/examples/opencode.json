@@ -1,0 +1,11 @@
+{
+  "ralph": {
+    "maxIterations": 100,
+    "completionPromise": "COMPLETE",
+    "autoCommit": true,
+    "staleTimeout": 3600,
+    "verbose": false,
+    "progressFile": ".ralph/progress.md",
+    "historyFile": ".ralph/history.json"
+  }
+}

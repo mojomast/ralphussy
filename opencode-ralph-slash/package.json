@@ -1,0 +1,26 @@
+{
+  "name": "@opencode-ai/ralph-slash",
+  "version": "1.0.0",
+  "description": "Ralph slash commands plugin for OpenCode",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "opencode": {
+    "version": ">=1.1.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": ["opencode", "ralph", "slash", "commands", "agent"],
+  "author": "OpenCode Team",
+  "license": "MIT",
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.1.26",
+    "zod": "^3.22.0"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.1.26",
+    "typescript": "^5.0.0"
+  }
+}

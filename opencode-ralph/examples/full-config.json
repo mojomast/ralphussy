@@ -1,0 +1,18 @@
+{
+  "plugins": [
+    "@opencode-ai/ralph"
+  ],
+  "ralph": {
+    "maxIterations": 50,
+    "completionPromise": "COMPLETE",
+    "autoCommit": true,
+    "verbose": false
+  },
+  "agents": {
+    "ralph": {
+      "description": "Autonomous loop agent - iterates until task completion",
+      "temperature": 0.1,
+      "topP": 0.95
+    }
+  }
+}

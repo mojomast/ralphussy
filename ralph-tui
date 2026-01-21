@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+#
+# ralph-tui - Top-level launcher for Ralph TUI
+#
+# This is a convenience wrapper that locates and runs ralph-refactor/ralph-tui
+
+set -euo pipefail
+
+# Resolve script location (follow symlinks)
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+    DIR=$(cd -P "$(dirname "$SOURCE")" && pwd)
+    SOURCE=$(readlink "$SOURCE")
+    case "$SOURCE" in
+        /*) ;;
+        *) SOURCE="$DIR/$SOURCE" ;;
+    esac
+done
+SCRIPT_DIR=$(cd -P "$(dirname "$SOURCE")" && pwd)
+
+exec "$SCRIPT_DIR/ralph-refactor/ralph-tui" "$@"

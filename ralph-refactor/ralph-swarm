@@ -1,0 +1,749 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+__RALPH_SWARM_DIR__="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Ensure we have a sane default RALPH_DIR even if the caller didn't set it.
+RALPH_DIR="${RALPH_DIR:-$HOME/.ralph}"
+
+# Load the main ralph core helpers (logging, dependency checks, etc.) if present.
+# Note: in this repo, core.sh lives at ralph-refactor/lib/core.sh.
+if [ -f "$__RALPH_SWARM_DIR__/lib/core.sh" ]; then
+    # shellcheck source=ralph-refactor/lib/core.sh
+    source "$__RALPH_SWARM_DIR__/lib/core.sh"
+fi
+
+# Swarm modules
+# shellcheck source=ralph-refactor/lib/swarm_db.sh
+source "$__RALPH_SWARM_DIR__/lib/swarm_db.sh"
+# shellcheck source=ralph-refactor/lib/swarm_analyzer.sh
+source "$__RALPH_SWARM_DIR__/lib/swarm_analyzer.sh"
+# shellcheck source=ralph-refactor/lib/swarm_git.sh
+source "$__RALPH_SWARM_DIR__/lib/swarm_git.sh"
+# shellcheck source=ralph-refactor/lib/swarm_worker.sh
+source "$__RALPH_SWARM_DIR__/lib/swarm_worker.sh"
+# shellcheck source=ralph-refactor/lib/swarm_scheduler.sh
+source "$__RALPH_SWARM_DIR__/lib/swarm_scheduler.sh"
+# shellcheck source=ralph-refactor/lib/swarm_display.sh
+source "$__RALPH_SWARM_DIR__/lib/swarm_display.sh"
+# shellcheck source=ralph-refactor/lib/swarm_artifacts.sh
+source "$__RALPH_SWARM_DIR__/lib/swarm_artifacts.sh"
+
+# Set default provider/model if not specified.
+# These are only used by the swarm analyzer (which calls `opencode run`).
+RALPH_LLM_PROVIDER="${RALPH_LLM_PROVIDER:-${RALPH_PROVIDER:-opencode}}"
+RALPH_LLM_MODEL="${RALPH_LLM_MODEL:-${RALPH_MODEL:-opencode/claude-sonnet-4-5}}"
+
+swarm_orchestrator_start() {
+    local run_id="$1"
+    local mode="$2"
+    local devplan_path="$3"
+    local prompt_text="$4"
+    local worker_count="$5"
+    local timeout_seconds="${6:-3600}"
+    local verbose="${7:-false}"
+
+    echo "Starting swarm run..."
+    echo "Run ID: $run_id"
+    echo "Mode: $mode"
+    echo "Workers: $worker_count"
+    echo "Timeout: $timeout_seconds seconds"
+
+    local task_list_file
+    task_list_file=$(mktemp)
+
+    if [ "$mode" = "devplan" ] && [ -n "$devplan_path" ]; then
+        swarm_analyzer_parse_devplan_tasks "$devplan_path" "$task_list_file" || {
+            rm -f "$task_list_file"
+            echo "Error: Failed to parse devplan"
+            return 1
+        }
+    elif [ -n "$prompt_text" ]; then
+        swarm_analyzer_decompose_prompt "$prompt_text" "$RALPH_LLM_PROVIDER" "$RALPH_LLM_MODEL" > "$task_list_file" || {
+            rm -f "$task_list_file"
+            echo "Error: Failed to decompose prompt"
+            return 1
+        }
+    else
+        echo "Error: No mode or source specified"
+        rm -f "$task_list_file"
+        return 1
+    fi
+
+    local task_count
+    if command -v jq >/dev/null 2>&1; then
+        task_count=$(jq -r 'length' "$task_list_file" 2>/dev/null || echo "0")
+    else
+        task_count=$(python3 - "$task_list_file" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], 'r', encoding='utf-8', errors='replace') as f:
+    try:
+        data = json.load(f)
+    except Exception:
+        data = []
+print(len(data))
+PY
+)
+    fi
+
+    if [ "$task_count" -eq 0 ]; then
+        echo "Error: No tasks found"
+        rm -f "$task_list_file"
+        return 1
+    fi
+
+    echo "Found $task_count tasks"
+
+    local run_id_result
+    run_id_result=$(swarm_db_start_run "$mode" "$devplan_path" "$prompt_text" "$worker_count")
+
+    if [ $? -ne 0 ]; then
+        echo "Error: Failed to start run"
+        rm -f "$task_list_file"
+        return 1
+    fi
+
+    echo "Run ID: $run_id_result"
+
+    local task_id
+    local current_priority=1
+
+    python3 - "$task_list_file" <<'PY' | while IFS= read -r task_json; do
+import base64
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, 'r', encoding='utf-8', errors='replace') as f:
+    data = json.load(f)
+
+for item in data:
+    task = (item.get('task') or '').strip()
+    if not task:
+        continue
+    line = item.get('line')
+    priority = item.get('priority')
+    payload = {
+        'task_b64': base64.b64encode(task.encode('utf-8')).decode('ascii'),
+        'line': line,
+        'priority': priority,
+    }
+    sys.stdout.write(json.dumps(payload) + "\n")
+PY
+        [ -z "$task_json" ] && continue
+
+        local task_b64 devplan_line priority
+        if command -v jq >/dev/null 2>&1; then
+            task_b64=$(printf '%s' "$task_json" | jq -r '.task_b64')
+            devplan_line=$(printf '%s' "$task_json" | jq -r '.line // "null"')
+            priority=$(printf '%s' "$task_json" | jq -r '.priority // empty')
+        else
+            task_b64=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("task_b64",""))' <<<"$task_json")
+            devplan_line=$(python3 -c 'import json,sys; v=json.load(sys.stdin).get("line", None); print("null" if v is None else v)' <<<"$task_json")
+            priority=$(python3 -c 'import json,sys; v=json.load(sys.stdin).get("priority", None); print("" if v is None else v)' <<<"$task_json")
+        fi
+
+        local task_text
+        task_text=$(python3 -c 'import base64,sys; print(base64.b64decode(sys.argv[1]).decode("utf-8", "replace"))' "$task_b64")
+
+        if [ -z "$priority" ]; then
+            priority="$current_priority"
+        fi
+
+        task_id=$(swarm_db_add_task "$run_id_result" "$task_text" "[]" "$devplan_line" "$priority")
+        echo "Added task $task_id: $task_text"
+
+        current_priority=$((current_priority + 1))
+    done
+
+    rm -f "$task_list_file"
+
+    local spawn_result
+    # Spawn N workers (worker_num=1..N) using the ralph entrypoint.
+    # NOTE: swarm_worker_spawn currently expects a single worker number.
+    local worker_num
+    for worker_num in $(seq 1 "$worker_count"); do
+        swarm_worker_spawn "$run_id_result" "$worker_num" "main" "$__RALPH_SWARM_DIR__/ralph" "/tmp/swarm.log" >/dev/null
+    done
+
+    if [ $? -ne 0 ]; then
+        echo "Error: Failed to spawn workers"
+        return 1
+    fi
+
+    local scheduler_result
+    scheduler_result=$(swarm_scheduler_main_loop "$run_id_result" "$timeout_seconds" "$verbose")
+
+    echo ""
+    echo "=== Run Completed ==="
+    echo "$scheduler_result"
+
+    local merge_result=""
+    if [ "${SWARM_AUTO_MERGE:-false}" = "true" ]; then
+        merge_result=$(swarm_git_merge_worker_branches "$run_id_result")
+        echo ""
+        echo "=== Git Merge Result ==="
+        echo "$merge_result"
+    else
+        echo ""
+        echo "=== Git Merge Result ==="
+        echo "(skipped; set SWARM_AUTO_MERGE=true to auto-merge worker branches)"
+    fi
+
+    # Artifact collection (controlled by env var or --collect-artifacts CLI flag)
+    if [ "${SWARM_COLLECT_ARTIFACTS:-false}" = "true" ]; then
+        echo ""
+        echo "Collecting artifacts..."
+        swarm_collect_artifacts "$run_id_result" || echo "Artifact collection failed"
+    fi
+
+    local db_status
+    db_status=$(swarm_db_get_run_status "$run_id_result")
+
+    echo ""
+    echo "=== Run Status ==="
+    echo "$db_status"
+
+    swarm_db_end_run "$run_id_result" >/dev/null
+
+    echo ""
+    echo "Swarm run $run_id_result completed"
+}
+
+swarm_orchestrator_status() {
+    local run_id="$1"
+
+    if [ -z "$run_id" ]; then
+        run_id=$(sqlite3 "$RALPH_DIR/swarm.db" "SELECT run_id FROM swarm_runs ORDER BY id DESC LIMIT 1" 2>/dev/null || true)
+    fi
+
+    if [ -z "$run_id" ]; then
+        echo "No swarm runs found"
+        return 1
+    fi
+
+    echo "=== Swarm Run Status: $run_id ==="
+    echo ""
+    echo "Run Status:"
+    swarm_db_get_run_status "$run_id" || true
+    echo ""
+    echo "Workers:"
+    swarm_db_list_workers "$run_id" || true
+    echo ""
+    echo "Tasks by Status:"
+    swarm_db_get_task_count_by_status "$run_id" || true
+    echo ""
+    echo "Pending Tasks:"
+    swarm_db_get_pending_tasks "$run_id" || true
+}
+
+swarm_orchestrator_stop() {
+    local run_id="$1"
+
+    if [ -z "$run_id" ]; then
+        run_id=$(sqlite3 "$RALPH_DIR/swarm.db" "SELECT run_id FROM swarm_runs ORDER BY id DESC LIMIT 1" 2>/dev/null || true)
+    fi
+
+    if [ -z "$run_id" ]; then
+        echo "No swarm runs found"
+        return 1
+    fi
+
+    echo "Stopping swarm run $run_id..."
+    swarm_db_list_workers "$run_id" 2>/dev/null | while IFS='|' read -r id worker_num pid branch_name status current_task_id started_at last_heartbeat; do
+        [ -z "$id" ] && continue
+        if [ -n "${pid:-}" ] && [ "$pid" != "NULL" ]; then
+            echo "Stopping worker #$worker_num (PID: $pid)..."
+            kill "$pid" 2>/dev/null || true
+        fi
+    done
+}
+
+swarm_orchestrator_cleanup() {
+    local run_id="$1"
+
+    if [ -z "$run_id" ]; then
+        run_id=$(sqlite3 "$RALPH_DIR/swarm.db" "SELECT run_id FROM swarm_runs ORDER BY id DESC LIMIT 1" 2>/dev/null || true)
+    fi
+
+    if [ -z "$run_id" ]; then
+        echo "No swarm runs found"
+        return 1
+    fi
+
+    echo "Cleaning up run $run_id..."
+
+    # Remove worktrees (best-effort)
+    local run_dir="$RALPH_DIR/swarm/runs/$run_id"
+    if [ -d "$run_dir" ]; then
+        for worker_repo in "$run_dir"/worker-*/repo; do
+            if [ -d "$worker_repo" ]; then
+                git worktree remove "$worker_repo" 2>/dev/null || true
+            fi
+        done
+        rm -rf "$run_dir"
+    fi
+
+    echo "Cleanup complete for run $run_id"
+}
+
+swarm_orchestrator_logs() {
+    local run_id="$1"
+    local worker_num="${2:-}"
+    local lines="${3:-50}"
+
+    if [ -z "$run_id" ]; then
+        run_id=$(sqlite3 "$RALPH_DIR/swarm.db" "SELECT run_id FROM swarm_runs ORDER BY id DESC LIMIT 1" 2>/dev/null || true)
+    fi
+
+    if [ -z "$run_id" ]; then
+        echo "No swarm runs found"
+        return 1
+    fi
+
+    local run_dir="$RALPH_DIR/swarm/runs/$run_id"
+    if [ ! -d "$run_dir" ]; then
+        echo "Run directory not found: $run_dir"
+        return 1
+    fi
+
+    if [ -n "$worker_num" ]; then
+        tail -n "$lines" "$run_dir/worker-$worker_num/logs"/*.log 2>/dev/null || echo "No log files"
+        return 0
+    fi
+
+    for worker_logs in "$run_dir"/worker-*/logs; do
+        [ -d "$worker_logs" ] || continue
+        local wn
+        wn=$(basename "$(dirname "$worker_logs")" | sed 's/worker-//')
+        echo "--- Worker $wn ---"
+        tail -n "$lines" "$worker_logs"/*.log 2>/dev/null || echo "No log files"
+        echo ""
+    done
+}
+
+swarm_orchestrator_analyze() {
+    local devplan_path="$1"
+    local verbose="${2:-false}"
+
+    if [ -z "$devplan_path" ]; then
+        echo "Error: Devplan path required for analysis"
+        return 1
+    fi
+    if [ ! -f "$devplan_path" ]; then
+        echo "Error: Devplan file not found: $devplan_path"
+        return 1
+    fi
+
+    echo "=== Analyzing Devplan: $devplan_path ==="
+
+    local task_list_file
+    task_list_file=$(mktemp)
+
+    swarm_analyzer_parse_devplan_tasks "$devplan_path" "$task_list_file"
+
+    local task_count
+    task_count=$(python3 - "$task_list_file" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], 'r', encoding='utf-8', errors='replace') as f:
+    data = json.load(f)
+print(len(data))
+PY
+)
+
+    echo ""
+    echo "Found $task_count tasks:"
+    echo ""
+
+    python3 - "$task_list_file" <<'PY' | while IFS= read -r row; do
+import json
+import sys
+
+with open(sys.argv[1], 'r', encoding='utf-8', errors='replace') as f:
+    data = json.load(f)
+for idx, item in enumerate(data, start=1):
+    task = (item.get('task') or '').strip()
+    line = item.get('line')
+    if not task:
+        continue
+    sys.stdout.write(f"{idx}\t{line if line is not None else 'null'}\t{task}\n")
+PY
+        [ -z "$row" ] && continue
+        local priority devplan_line task_text
+        priority=$(printf '%s' "$row" | cut -f1)
+        devplan_line=$(printf '%s' "$row" | cut -f2)
+        task_text=$(printf '%s' "$row" | cut -f3-)
+
+        echo "[$priority] Line $devplan_line: $task_text"
+
+        if [ "$verbose" = "true" ]; then
+            local tree_file
+            tree_file=$(mktemp)
+            swarm_analyzer_generate_tree_output "$tree_file" 3 >/dev/null
+            echo "  File patterns:"
+            swarm_analyzer_analyze_task_files "$task_text" "$tree_file" "$RALPH_LLM_PROVIDER" "$RALPH_LLM_MODEL" | sed 's/^/  /'
+            rm -f "$tree_file"
+        fi
+    done
+
+    rm -f "$task_list_file"
+
+    echo ""
+    echo "=== Analysis Complete ==="
+    echo "Total tasks: $task_count"
+}
+
+swarm_usage() {
+    cat <<EOF
+ ralph-swarm - Parallel task runner for Ralph
+
+ USAGE:
+   ralph-refactor/ralph-swarm --devplan PATH [--workers N] [--timeout SECONDS] [--verbose]
+   ralph-refactor/ralph-swarm "<prompt>" [--workers N] [--timeout SECONDS] [--verbose]
+   ralph-refactor/ralph-swarm --analyze PATH [--verbose]
+   ralph-refactor/ralph-swarm --status [RUN_ID]
+   ralph-refactor/ralph-swarm --logs [RUN_ID] [--worker N] [--lines N]
+   ralph-refactor/ralph-swarm --stop [RUN_ID]
+   ralph-refactor/ralph-swarm --reiterate [RUN_ID] --worker N
+   ralph-refactor/ralph-swarm --cleanup [RUN_ID]
+  ralph-refactor/ralph-swarm --interactive|-i   Start interactive configuration prompts
+  ralph-refactor/ralph-swarm --inspect [RUN_ID]   Show artifacts and quick info for a run
+
+ ENV:
+   RALPH_DIR            State directory (default: ~/.ralph)
+   RALPH_LLM_PROVIDER   Provider for analyzer (default: opencode)
+   RALPH_LLM_MODEL      Model for analyzer (default: opencode/claude-sonnet-4-5)
+   SWARM_COLLECT_ARTIFACTS  If true, collect artifacts after run (or use --collect-artifacts)
+   SWARM_ARTIFACTS_DIR      Base folder for artifacts. Use %RUN_ID% to place run id in path.
+
+ NOTES:
+   - The analyzer uses OpenCode CLI: `opencode run --format json`.
+   - This script expects `opencode` to be installed and accessible in PATH.
+EOF
+}
+
+main() {
+    local mode=""
+    local devplan_path=""
+    local prompt_text=""
+    local worker_count=4
+    local timeout_seconds=3600
+    local verbose=false
+    local interactive=false
+
+    local action="start"
+    local run_id=""
+    local logs_worker=""
+    local logs_lines=50
+    local reiterate_worker=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --help|-h)
+                swarm_usage
+                exit 0
+                ;;
+            --devplan|-d)
+                mode="devplan"
+                devplan_path="$2"
+                shift 2
+                ;;
+            --workers|-w)
+                worker_count="$2"
+                shift 2
+                ;;
+            --timeout)
+                timeout_seconds="$2"
+                shift 2
+                ;;
+            --verbose|-v)
+                verbose=true
+                shift
+                ;;
+            --provider)
+                RALPH_LLM_PROVIDER="$2"
+                shift 2
+                ;;
+            --model)
+                RALPH_LLM_MODEL="$2"
+                shift 2
+                ;;
+            --analyze)
+                action="analyze"
+                devplan_path="$2"
+                shift 2
+                ;;
+            --interactive|-i)
+                interactive=true
+                shift
+                ;;
+            --status)
+                action="status"
+                if [ -n "${2:-}" ] && [ "${2#--}" = "${2}" ]; then
+                    run_id="$2"
+                    shift 2
+                else
+                    shift
+                fi
+                ;;
+            --stop)
+                action="stop"
+                if [ -n "${2:-}" ] && [ "${2#--}" = "${2}" ]; then
+                    run_id="$2"
+                    shift 2
+                else
+                    shift
+                fi
+                ;;
+            --reiterate)
+                action="reiterate"
+                if [ -n "${2:-}" ] && [ "${2#--}" = "${2}" ]; then
+                    run_id="$2"
+                    shift 2
+                else
+                    shift
+                fi
+                ;;
+            --cleanup)
+                action="cleanup"
+                if [ -n "${2:-}" ] && [ "${2#--}" = "${2}" ]; then
+                    run_id="$2"
+                    shift 2
+                else
+                    shift
+                fi
+                ;;
+            --logs)
+                action="logs"
+                if [ -n "${2:-}" ] && [ "${2#--}" = "${2}" ]; then
+                    run_id="$2"
+                    shift 2
+                else
+                    shift
+                fi
+                ;;
+            --worker)
+                if [ "$action" = "reiterate" ]; then
+                    reiterate_worker="$2"
+                else
+                    logs_worker="$2"
+                fi
+                shift 2
+                ;;
+            --lines)
+                logs_lines="$2"
+                shift 2
+                ;;
+            --)
+                shift
+                break
+                ;;
+            --collect-artifacts)
+                export SWARM_COLLECT_ARTIFACTS="true"
+                shift
+                ;;
+            --inspect)
+                action="inspect"
+                if [ -n "${2:-}" ] && [ "${2#--}" = "${2}" ]; then
+                    run_id="$2"
+                    shift 2
+                else
+                    shift
+                fi
+                ;;
+            -* )
+                echo "Unknown option: $1" 1>&2
+                swarm_usage
+                exit 1
+                ;;
+            *)
+                # Positional prompt
+                prompt_text="$1"
+                shift
+                ;;
+        esac
+    done
+
+    if command -v init_ralph >/dev/null 2>&1; then
+        init_ralph
+    else
+        mkdir -p "$RALPH_DIR"
+    fi
+
+    if command -v check_opencode >/dev/null 2>&1; then
+        check_opencode
+    fi
+
+    swarm_db_init >/dev/null
+
+    if [ "$interactive" = true ]; then
+        # Interactive prompts for common options
+        echo "Starting interactive swarm configuration"
+
+        read -r -p "Number of workers [$worker_count]: " input_workers || true
+        if [ -n "$input_workers" ]; then
+            worker_count="$input_workers"
+        fi
+
+        read -r -p "Timeout in seconds [$timeout_seconds]: " input_timeout || true
+        if [ -n "$input_timeout" ]; then
+            timeout_seconds="$input_timeout"
+        fi
+
+        read -r -p "Use auto-merge? (y/N) [${SWARM_AUTO_MERGE:-false}]: " input_auto_merge || true
+        case "${input_auto_merge,,}" in
+            y|yes) export SWARM_AUTO_MERGE=true ;;
+            *) export SWARM_AUTO_MERGE=${SWARM_AUTO_MERGE:-false} ;;
+        esac
+
+        read -r -p "Collect artifacts? (y/N) [${SWARM_COLLECT_ARTIFACTS:-false}]: " input_collect || true
+        case "${input_collect,,}" in
+            y|yes) export SWARM_COLLECT_ARTIFACTS=true ;;
+            *) export SWARM_COLLECT_ARTIFACTS=${SWARM_COLLECT_ARTIFACTS:-false} ;;
+        esac
+
+        read -r -p "Artifacts base folder (leave empty for default): " input_artifacts_dir || true
+        if [ -n "$input_artifacts_dir" ]; then
+            export SWARM_ARTIFACTS_DIR="$input_artifacts_dir"
+        fi
+
+        read -r -p "LLM Provider (current: $RALPH_LLM_PROVIDER): " input_provider || true
+        if [ -n "$input_provider" ]; then
+            RALPH_LLM_PROVIDER="$input_provider"
+        fi
+
+        read -r -p "LLM Model (current: $RALPH_LLM_MODEL): " input_model || true
+        if [ -n "$input_model" ]; then
+            RALPH_LLM_MODEL="$input_model"
+        fi
+
+        echo ""
+        echo "Configuration:"
+        echo "  workers: $worker_count"
+        echo "  timeout: $timeout_seconds"
+        echo "  provider: $RALPH_LLM_PROVIDER"
+        echo "  model: $RALPH_LLM_MODEL"
+        echo "  auto-merge: ${SWARM_AUTO_MERGE:-false}"
+        echo "  collect-artifacts: ${SWARM_COLLECT_ARTIFACTS:-false}"
+        echo "  artifacts_dir: ${SWARM_ARTIFACTS_DIR:-(default)}"
+
+        read -r -p "Proceed with these settings? (Y/n): " proceed || true
+        case "${proceed,,}" in
+            n|no)
+                echo "Cancelled by user"
+                exit 1
+                ;;
+            *)
+                ;; # proceed
+        esac
+    fi
+
+    case "$action" in
+        analyze)
+            swarm_orchestrator_analyze "$devplan_path" "$verbose"
+            ;;
+        status)
+            swarm_orchestrator_status "$run_id"
+            ;;
+        stop)
+            swarm_orchestrator_stop "$run_id"
+            ;;
+        cleanup)
+            swarm_orchestrator_cleanup "$run_id"
+            ;;
+        logs)
+            swarm_orchestrator_logs "$run_id" "$logs_worker" "$logs_lines"
+            ;;
+        reiterate)
+            if [ -z "$run_id" ]; then
+                run_id=$(sqlite3 "$RALPH_DIR/swarm.db" "SELECT run_id FROM swarm_runs ORDER BY id DESC LIMIT 1" 2>/dev/null || true)
+            fi
+            if [ -z "$run_id" ]; then
+                echo "No swarm runs found"
+                exit 1
+            fi
+            if [ -z "$reiterate_worker" ]; then
+                echo "Error: --reiterate requires --worker N" 1>&2
+                exit 1
+            fi
+
+            echo "Forcing reiteration for run $run_id worker #$reiterate_worker..."
+            # Requeue current task and reset worker status.
+            if command -v swarm_db_force_reiterate_worker >/dev/null 2>&1; then
+                swarm_db_force_reiterate_worker "$run_id" "$reiterate_worker" >/dev/null
+            else
+                echo "Error: swarm_db_force_reiterate_worker missing" 1>&2
+                exit 1
+            fi
+
+            # Best-effort: stop the worker process so it restarts and picks up pending tasks.
+            local pid
+            pid=$(sqlite3 "$RALPH_DIR/swarm.db" "SELECT pid FROM workers WHERE run_id = '$run_id' AND worker_num = $reiterate_worker ORDER BY id DESC LIMIT 1;")
+            if [ -n "$pid" ] && [ "$pid" != "NULL" ]; then
+                echo "Stopping worker #$reiterate_worker (PID: $pid)..."
+                kill "$pid" 2>/dev/null || true
+                sleep 1
+                if ps -p "$pid" > /dev/null 2>&1; then
+                    echo "  Force killing worker #$reiterate_worker..."
+                    kill -9 "$pid" 2>/dev/null || true
+                fi
+            fi
+
+            echo "Reiterate requested. Worker will pick up re-queued work on next loop."
+            ;;
+        inspect)
+            swarm_orchestrator_status "$run_id"
+            # show artifacts location
+            if [ -z "$run_id" ]; then
+                run_id=$(sqlite3 "$RALPH_DIR/swarm.db" "SELECT run_id FROM swarm_runs ORDER BY id DESC LIMIT 1" 2>/dev/null || true)
+            fi
+            if [ -n "$run_id" ]; then
+                artifacts_dir="$RALPH_DIR/swarm/runs/$run_id/artifacts"
+                if [ -n "${SWARM_ARTIFACTS_DIR:-}" ]; then
+                    if printf '%s' "$SWARM_ARTIFACTS_DIR" | grep -q '%RUN_ID%'; then
+                        artifacts_dir=${SWARM_ARTIFACTS_DIR//%RUN_ID%/$run_id}
+                    else
+                        artifacts_dir="$SWARM_ARTIFACTS_DIR/$run_id"
+                    fi
+                    if [ "${artifacts_dir#/}" = "$artifacts_dir" ]; then
+                        artifacts_dir="$RALPH_DIR/swarm/runs/$run_id/$artifacts_dir"
+                    fi
+                fi
+                echo ""
+                echo "Artifacts path: $artifacts_dir"
+                if [ -d "$artifacts_dir" ]; then
+                    echo "Contents:"
+                    ls -la "$artifacts_dir" | sed -n '1,20p'
+                else
+                    echo "No artifacts folder found for run $run_id"
+                fi
+            fi
+            ;;
+        start)
+            if [ -n "$devplan_path" ]; then
+                mode="${mode:-devplan}"
+            elif [ -n "$prompt_text" ]; then
+                mode="prompt"
+            else
+                echo "Error: Provide --devplan PATH or a prompt string" 1>&2
+                swarm_usage
+                exit 1
+            fi
+
+            swarm_orchestrator_start "" "$mode" "$devplan_path" "$prompt_text" "$worker_count" "$timeout_seconds" "$verbose"
+            ;;
+        *)
+            echo "Error: Unknown action: $action" 1>&2
+            exit 1
+            ;;
+    esac
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main "$@"
+fi

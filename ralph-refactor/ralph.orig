@@ -1,0 +1,2059 @@
+#!/bin/bash
+
+# Ralph Wiggum - Autonomous AI Coding Loop for OpenCode
+# Based on the Ralph methodology by Geoffrey Huntley
+
+set -euo pipefail
+
+# Configuration
+RALPH_DIR="${RALPH_DIR:-$HOME/.ralph}"
+STATE_FILE="$RALPH_DIR/state.json"
+HISTORY_FILE="$RALPH_DIR/history.json"
+LOG_DIR="$RALPH_DIR/logs"
+CONTEXT_FILE="$RALPH_DIR/context.md"
+PROGRESS_FILE="$RALPH_DIR/progress.md"
+HANDOFF_FILE="${HANDOFF_FILE:-./handoff.md}"
+AGENT_FILE="${AGENT_FILE:-./agent.md}"
+DEVPATH="${DEVPATH:-./devplan.md}"
+DOCS_PATH="${DOCS_PATH:-./docs/progress.md}"
+BLOCKERS_FILE="$RALPH_DIR/blockers.txt"
+PROMPT_FILE=""
+
+# Default settings
+MAX_ITERATIONS="${MAX_ITERATIONS:-100}"
+COMPLETION_PROMISE="${COMPLETION_PROMISE:-COMPLETE}"
+VERBOSE="${VERBOSE:-false}"
+MODEL="${MODEL:-}"
+PROVIDER="${PROVIDER:-}"
+# Simple task threshold - tasks estimated under this complexity can be batched
+SIMPLE_TASK_THRESHOLD="${SIMPLE_TASK_THRESHOLD:-2}"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+log_info() {
+    echo -e "${BLUE}[RALPH]${NC} $1"
+}
+
+log_success() {
+    echo -e "${GREEN}[RALPH]${NC} $1"
+}
+
+log_warning() {
+    echo -e "${YELLOW}[RALPH]${NC} $1"
+}
+
+log_error() {
+    echo -e "${RED}[RALPH]${NC} $1"
+}
+
+# Live Monitor - Background process to show real-time activity
+MONITOR_PID=""
+MONITOR_LOG=""
+MONITOR_ENABLED="${MONITOR_ENABLED:-true}"
+
+# Find latest opencode log
+find_latest_log() {
+    local log_dir="$HOME/.local/share/opencode/log"
+    if [ -d "$log_dir" ]; then
+        find "$log_dir" -name "*.log" -type f -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-
+    fi
+}
+
+# Start background monitor
+start_monitor() {
+    if [ "$MONITOR_ENABLED" != "true" ]; then
+        return 0
+    fi
+    
+    local log_dir="$HOME/.local/share/opencode/log"
+    if [ ! -d "$log_dir" ]; then
+        return 1
+    fi
+    
+    # Get initial newest log (before opencode starts)
+    local initial_log=$(find "$log_dir" -name "*.log" -type f -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
+    
+    # Start monitoring in background
+    (
+        local monitor_started=$(date +%s)
+        local found_new_log=false
+        local spinner_idx=0
+        local last_msg=""
+        
+        # Spinner characters
+        local spinner_chars=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+        
+        # Watch for new log file
+        while [ "$found_new_log" = false ]; do
+            spinner_idx=$(( (spinner_idx + 1) % 10 ))
+            sleep 0.1
+            
+            # Print searching spinner
+            echo -ne "\r\033[K${CYAN}${spinner_chars[$spinner_idx]}${NC} Waiting for Ralph to start..." >&2
+
+            local newest_log=$(find "$log_dir" -name "*.log" -type f -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
+            
+            if [ -n "$newest_log" ] && [ "$newest_log" != "$initial_log" ]; then
+                local newest_time=$(stat -c %Y "$newest_log" 2>/dev/null || echo "0")
+                if [ "$newest_time" -ge "$monitor_started" ]; then
+                    MONITOR_LOG="$newest_log"
+                    found_new_log=true
+                fi
+            fi
+            
+            local current_time=$(date +%s)
+            if [ $((current_time - monitor_started)) -gt 10 ]; then
+                if [ -n "$newest_log" ]; then
+                    MONITOR_LOG="$newest_log"
+                    found_new_log=true
+                else
+                    exit 0
+                fi
+            fi
+        done
+        
+        if [ -f "$MONITOR_LOG" ]; then
+            # Initial status
+            echo -ne "\r\033[K${CYAN}${spinner_chars[$spinner_idx]}${NC} Connected to $(basename "$MONITOR_LOG")" >&2
+            
+            local last_file_size=$(stat -c %s "$MONITOR_LOG" 2>/dev/null || echo "0")
+            local last_activity_time=0
+            local tool_output_dir="$HOME/.local/share/opencode/tool-output"
+            
+            while [ -f "$MONITOR_LOG" ]; do
+                spinner_idx=$(( (spinner_idx + 1) % 10 ))
+                
+                local current_size=$(stat -c %s "$MONITOR_LOG" 2>/dev/null || echo "0")
+                local current_display_msg=""
+                
+                if [ "$current_size" -gt "$last_file_size" ]; then
+                    last_file_size=$current_size
+                    last_activity_time=$(date +%s)
+                    
+                    # Check for bash tool output
+                    if [ -d "$tool_output_dir" ]; then
+                        local latest_output=$(ls -t "$tool_output_dir"/tool_b* 2>/dev/null | head -1)
+                        if [ -n "$latest_output" ] && [ -f "$latest_output" ]; then
+                            local output_content=$(head -n 20 "$latest_output" 2>/dev/null)
+                            local first_line=$(echo "$output_content" | head -1)
+                            local output_lines=$(wc -l < "$latest_output" 2>/dev/null || echo "0")
+                            
+                            # Enhanced detection logic
+                            
+                            # 1. Test Failures (Prioritize errors)
+                            if echo "$output_content" | grep -qE "FAILED|ERROR|Error:|Exception:"; then
+                                local error_detail=$(echo "$output_content" | grep -E "FAILED|ERROR|Error:|Exception:" | head -1 | sed 's/^[[:space:]]*//' | head -c 60)
+                                current_display_msg="${RED}💥 ERROR DETECTED: $error_detail${NC}"
+                            
+                            # 2. Test Success
+                            elif echo "$output_content" | grep -qE "PASSED"; then
+                                local pass_detail=$(echo "$output_content" | grep "PASSED" | head -1 | sed 's/^[[:space:]]*//' | head -c 60)
+                                current_display_msg="${GREEN}🧪 TESTS PASSED: $pass_detail${NC}"
+                                
+                            # 3. File Operations
+                            elif echo "$first_line" | grep -qE '\.(py|ts|js|md|json|css|html|sh|txt)'; then
+                                local file=$(basename "$first_line" 2>/dev/null)
+                                current_display_msg="${YELLOW}📄 Editing: $file${NC}"
+                                
+                            # 4. Git Operations
+                            elif echo "$first_line" | grep -q "^diff "; then
+                                local file_diff=$(echo "$first_line" | awk '{print $NF}')
+                                local hunk_count=$(echo "$output_content" | grep -c "^@@")
+                                current_display_msg="${MAGENTA}📝 Reviewing diffs: $file_diff ($hunk_count hunks)${NC}"
+                                
+                            # 5. Directory Listings
+                            elif [ "$output_lines" -gt 5 ] && echo "$first_line" | grep -qE "^\.:"; then
+                                local dir_count=$(echo "$output_content" | grep -cE "/$")
+                                local file_count=$(echo "$output_content" | grep -vcE "/$")
+                                current_display_msg="${BLUE}📁 Listing files ($file_count files, $dir_count dirs)${NC}"
+                                
+                            # 6. General Commands
+                            elif [ ${#first_line} -gt 3 ] && echo "$first_line" | grep -qvE "^.:$|^\.$"; then
+                                local cmd_display=$(echo "$first_line" | head -c 50)
+                                current_display_msg="${BLUE}💻 Exec: $cmd_display${NC}"
+                            fi
+                        fi
+                    fi
+                fi
+                
+                # Update display if message changed
+                if [ -n "$current_display_msg" ] && [ "$current_display_msg" != "$last_msg" ]; then
+                    # Print new significant event on its own line
+                    echo -ne "\r\033[K" >&2
+                    echo -e "${spinner_chars[$spinner_idx]} $current_display_msg" >&2
+                    last_msg="$current_display_msg"
+                fi
+                
+                # Always update the bottom status line (ephemeral)
+                local status_line_content="$last_msg"
+                if [ -z "$status_line_content" ]; then
+                    status_line_content="Monitoring..."
+                fi
+                # Strip colors for length calc
+                local clean_msg=$(echo "$status_line_content" | sed -r "s/\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[mGK]//g")
+                echo -ne "\r\033[K${CYAN}${spinner_chars[$spinner_idx]}${NC} [$(basename "$MONITOR_LOG")] $clean_msg" >&2
+                
+                sleep 0.1
+            done
+            # Cleanup status line
+            echo -ne "\r\033[K" >&2
+        fi
+    ) &
+    MONITOR_PID=$!
+    
+    sleep 0.3
+}
+
+# Stop background monitor
+stop_monitor() {
+    if [ -n "$MONITOR_PID" ]; then
+        kill $MONITOR_PID 2>/dev/null || true
+        wait $MONITOR_PID 2>/dev/null || true
+        MONITOR_PID=""
+    fi
+}
+
+# Initialize Ralph environment
+init_ralph() {
+    mkdir -p "$RALPH_DIR" "$LOG_DIR"
+    
+    # Initialize state file
+    if [ ! -f "$STATE_FILE" ]; then
+        cat > "$STATE_FILE" << EOF
+{
+  "status": "idle",
+  "iteration": 0,
+  "prompt": "",
+  "start_time": null,
+  "last_activity": null,
+  "context": ""
+}
+EOF
+    fi
+    
+    # Initialize history file
+    if [ ! -f "$HISTORY_FILE" ]; then
+        cat > "$HISTORY_FILE" << EOF
+{
+  "iterations": [],
+  "total_time": 0,
+  "success": false
+}
+EOF
+    fi
+    
+    # Initialize progress file
+    if [ ! -f "$PROGRESS_FILE" ]; then
+        echo "# Ralph Progress Log" > "$PROGRESS_FILE"
+        echo "" >> "$PROGRESS_FILE"
+    fi
+    
+    # Initialize blockers file
+    if [ ! -f "$BLOCKERS_FILE" ]; then
+        touch "$BLOCKERS_FILE"
+    fi
+}
+
+# Escape special regex characters for sed patterns
+escape_sed_pattern() {
+    local text="$1"
+    # Escape characters that are meaningful in sed regexes so the result can
+    # be safely used in a sed search pattern. Escape backslash first.
+    printf '%s' "$text" | sed \
+        -e 's/\\/\\\\/g' \
+        -e 's/\./\\./g' \
+        -e 's/\*/\\*/g' \
+        -e 's/\[/\\[/g' \
+        -e 's/\]/\\]/g' \
+        -e 's/\^/\\^/g' \
+        -e 's/\$/\\$/g' \
+        -e 's/&/\\&/g' \
+        -e 's/|/\\|/g' \
+        -e 's/(/\\(/g' \
+        -e 's/)/\\)/g' \
+        -e 's/{/\\{/g' \
+        -e 's/}/\\}/g' \
+        -e 's/+/\\+/g' \
+        -e 's/?/\\?/g' \
+        -e 's/\//\\\//g'
+}
+
+# Record a blocker
+record_blocker() {
+    local task="$1"
+    local blocker="$2"
+    local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    
+    echo "[$timestamp] $task: $blocker" >> "$BLOCKERS_FILE"
+    log_warning "🚫 Blocker recorded: $task - $blocker"
+}
+
+# Get active blockers
+get_blockers() {
+    cat "$BLOCKERS_FILE"
+}
+
+# Clear blockers for a task
+clear_blockers() {
+    local task="$1"
+    local temp_file="$BLOCKERS_FILE.tmp"
+    
+    if [ -f "$BLOCKERS_FILE" ]; then
+        grep -v "^.*$task.*:" "$BLOCKERS_FILE" > "$temp_file" 2>/dev/null || true
+        mv "$temp_file" "$BLOCKERS_FILE"
+    fi
+}
+
+# Update documentation file
+update_docs() {
+    local message="$1"
+    local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    
+    # Create docs directory if needed
+    local docs_dir=$(dirname "$DOCS_PATH")
+    mkdir -p "$docs_dir" 2>/dev/null || true
+    
+    # Append to docs progress file
+    echo "[$timestamp] $message" >> "$DOCS_PATH" 2>/dev/null || true
+    
+    log_info "📝 Documentation updated: $message"
+    
+    # Auto-commit agent.md on successful task completion
+    if echo "$message" | grep -q "Completed.*task"; then
+        if git rev-parse --git-dir >/dev/null 2>&1; then
+            if [ -f "$AGENT_FILE" ]; then
+                log_info "📦 Committing agent.md..."
+                git add "$AGENT_FILE" 2>/dev/null || true
+                git commit -m "Ralph: $message" 2>/dev/null && log_success "✅ agent.md committed" || log_warning "⚠️ Could not commit agent.md"
+            fi
+        fi
+    fi
+}
+
+# ============================================================================
+# HANDOFF SYSTEM - Fresh context per task with knowledge transfer
+# ============================================================================
+
+# Create a handoff file for the next Ralph instance
+create_handoff() {
+    local completed_task="$1"
+    local next_task="$2"
+    local devfile="$3"
+    local notes="${4:-}"
+    local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    
+    log_info "📋 Creating handoff for next Ralph..."
+    
+    cat > "$HANDOFF_FILE" << EOF
+# Ralph Handoff
+
+**Created**: $timestamp
+**DevPlan**: $devfile
+
+## Just Completed
+- $completed_task
+
+## Next Task
+- $next_task
+
+## Context & Notes
+$notes
+
+## Important Files Modified
+$(git diff --name-only HEAD~1 2>/dev/null | head -20 | sed 's/^/- /' || echo "- (no git history available)")
+
+## Current DevPlan Status
+\`\`\`
+$(grep -E '^[ ]*- \[' "$devfile" 2>/dev/null | head -20 || echo "No tasks found")
+\`\`\`
+
+## Instructions for Next Ralph
+1. Read this handoff to understand context
+2. Read the devplan at: $devfile
+3. Work on the next task listed above
+4. When complete, update devplan and create new handoff
+5. Output \`<promise>COMPLETE</promise>\` when task is done
+
+---
+*This handoff was auto-generated by Ralph to maintain context across fresh sessions.*
+EOF
+
+    log_success "📋 Handoff created: $HANDOFF_FILE"
+}
+
+# Read existing handoff if present
+read_handoff() {
+    if [ -f "$HANDOFF_FILE" ]; then
+        cat "$HANDOFF_FILE"
+    else
+        echo ""
+    fi
+}
+
+# Check if handoff exists
+has_handoff() {
+    [ -f "$HANDOFF_FILE" ] && [ -s "$HANDOFF_FILE" ]
+}
+
+# Archive old handoff before creating new one
+archive_handoff() {
+    if [ -f "$HANDOFF_FILE" ]; then
+        local archive_dir="$RALPH_DIR/handoffs"
+        mkdir -p "$archive_dir"
+        local timestamp=$(date +"%Y%m%d_%H%M%S")
+        cp "$HANDOFF_FILE" "$archive_dir/handoff_$timestamp.md"
+    fi
+}
+
+# Estimate task complexity (simple heuristic)
+# Returns: 1 = simple, 2 = medium, 3 = complex
+estimate_task_complexity() {
+    local task="$1"
+    local complexity=2  # Default to medium
+    
+    # Simple tasks (can be batched)
+    if echo "$task" | grep -qiE '^(update|fix typo|rename|add comment|remove|delete|change|set|toggle)'; then
+        complexity=1
+    fi
+    
+    # Simple if task is short (less than 50 chars usually means simple)
+    if [ ${#task} -lt 50 ]; then
+        complexity=1
+    fi
+    
+    # Complex tasks
+    if echo "$task" | grep -qiE '(implement|create|build|design|refactor|migrate|integrate|test|debug|analyze)'; then
+        complexity=3
+    fi
+    
+    # Complex if task mentions multiple things
+    if echo "$task" | grep -qE '(and|with|including|also|plus)'; then
+        complexity=3
+    fi
+    
+    echo "$complexity"
+}
+
+# Check if we should batch the next task with current
+should_batch_tasks() {
+    local current_task="$1"
+    local next_task="$2"
+    
+    if [ -z "$next_task" ]; then
+        return 1  # No next task to batch
+    fi
+    
+    local current_complexity=$(estimate_task_complexity "$current_task")
+    local next_complexity=$(estimate_task_complexity "$next_task")
+    
+    # Only batch if both are simple
+    if [ "$current_complexity" -le "$SIMPLE_TASK_THRESHOLD" ] && [ "$next_complexity" -le "$SIMPLE_TASK_THRESHOLD" ]; then
+        return 0  # Yes, batch them
+    fi
+    
+    return 1  # No, don't batch
+}
+
+# ============================================================================
+
+# Update devplan progress section
+update_devplan_progress() {
+    local devpath="$1"
+    local iteration="$2"
+    local status="$3"
+    local task="$4"
+
+    if [ ! -f "$devpath" ]; then
+        return 1
+    fi
+
+    local timestamp
+    timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    local progress_entry="- **$timestamp**: $status - $task"
+
+    # Insert the progress entry after the first top-level '### ' heading, if present.
+    # Otherwise append to the top of the file.
+    local temp_file="${devpath}.progress.tmp"
+    awk -v entry="$progress_entry" '
+    BEGIN { inserted=0 }
+    /^### / && !inserted {
+      print
+      print entry
+      inserted=1
+      next
+    }
+    { print }
+    END { if (!inserted) print entry }
+    ' "$devpath" > "$temp_file" && mv "$temp_file" "$devpath"
+}
+
+# Log progress to progress file
+log_progress() {
+    local iteration="$1"
+    local task="$2"
+    local result="$3"
+    local duration="$4"
+    
+    echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] Iteration $iteration: $task - $result (${duration}s)" >> "$PROGRESS_FILE"
+}
+
+# Show blockers
+show_blockers() {
+    if [ -f "$BLOCKERS_FILE" ] && [ -s "$BLOCKERS_FILE" ]; then
+        echo ""
+        echo "🚫 ACTIVE BLOCKERS:"
+        cat "$BLOCKERS_FILE" | while read -r line; do
+            echo "   $line"
+        done
+        echo ""
+    fi
+}
+
+# Check if OpenCode is installed
+check_opencode() {
+    if ! command -v opencode &> /dev/null; then
+        log_error "OpenCode is not installed. Please install it first:"
+        echo "  curl -fsSL https://opencode.ai/install | bash"
+        exit 1
+    fi
+    log_success "OpenCode found: $(which opencode)"
+}
+
+# Check for optional dependencies and warn if missing
+check_dependencies() {
+    if ! command -v jq &> /dev/null; then
+        log_warning "Optional tool 'jq' not found — JSON parsing will fall back to slower, less-robust methods. Install jq for best results (apt/yum/brew install jq)."
+    else
+        log_info "jq found: $(which jq)"
+    fi
+}
+
+# Extract textual content from various OpenCode JSON shapes.
+# Uses jq when available; falls back to greps if not.
+json_extract_text() {
+    local json="$1"
+    local text=""
+
+    if command -v jq &> /dev/null; then
+        # Try several common fields used by different providers / versions.
+        # This covers OpenCode (.part.messages[].text), OpenAI chat/completions,
+        # Anthropic (.completion), Google (.candidates[].content), and other shapes.
+        text=$(printf '%s' "$json" | jq -r '
+            (
+              (.part.messages[]?.text)
+              // (.messages[]?.text)
+              // (.part.output.text?)
+              // (.output.text?)
+              // (.outputs[]?.content[]?.text)
+              // (.choices[]?.message?.content)
+              // (.choices[]?.text)
+              // (.candidates[]?.content)
+              // (.result?.candidates[]?.content)
+              // (.result?.content)
+              // (.completion)
+              // (.text)
+            ) // ""'
+            2>/dev/null | tr '\n' ' ' | sed 's/  */ /g' | sed 's/^ *//;s/ *$//' | head -1) || text=
+    fi
+
+    if [ -z "$text" ]; then
+        # Fallback: best-effort grep/sed extraction for older/unknown shapes
+        text=$(printf '%s' "$json" | grep '"type":"text"' | grep -v '"role":"user"' | grep -o '"text":"[^"]*"' | sed 's/"text":"//;s/"$//' | head -1 | tr '\n' ' ' | sed 's/  */ /g')
+        if [ -z "$text" ]; then
+            text=$(printf '%s' "$json" | grep -o '"text":"[^"]*"' | sed 's/"text":"//;s/"$//' | tail -1 | tr '\n' ' ' | sed 's/  */ /g')
+        fi
+    fi
+
+    printf '%s' "$text"
+}
+
+# Extract tool names used from JSON (dedupe, truncated)
+json_extract_tools() {
+    local json="$1"
+    local tools=""
+    if command -v jq &> /dev/null; then
+        # Try several possible locations for tool calls across providers
+        tools=$(printf '%s' "$json" | jq -r '
+            (
+              (.part.tool_calls[]?.name)
+              // (.tool_calls[]?.name)
+              // (.toolCalls[]?.name)
+              // (.tools[]?.name)
+              // (.metadata.tools[]?.name)
+            ) // empty' 2>/dev/null | grep -v '^$' | sort -u | tr '\n' ' ' | head -c 200)
+    else
+        # Best-effort fallback: look for "name":"<tool>" occurrences
+        tools=$(printf '%s' "$json" | grep -o '"name":"[^"]\+"' | sed 's/"name":"//;s/"$//' | sort -u | tr '\n' ' ' | head -c 200 || true)
+    fi
+    printf '%s' "$tools"
+}
+
+
+# Get the current state
+get_state() {
+    cat "$STATE_FILE"
+}
+
+# Update state
+update_state() {
+    local status="$1"
+    local iteration="$2"
+    local prompt="$3"
+    local context="$4"
+    
+    local start_time=$(get_state | grep -o '"start_time": *"[^"]*"' | cut -d'"' -f4)
+    if [ "$status" = "running" ] && [ -z "$start_time" ] || [ "$start_time" = "null" ]; then
+        start_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    fi
+    
+    cat > "$STATE_FILE" << EOF
+{
+  "status": "$status",
+  "iteration": $iteration,
+  "prompt": "$(echo "$prompt" | sed 's/"/\\"/g')",
+  "start_time": "$start_time",
+  "last_activity": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+  "context": "$(echo "$context" | sed 's/"/\\"/g' | tr '\n' ' ')"
+}
+EOF
+}
+
+# Add context for next iteration
+add_context() {
+    local context="$1"
+    echo "$context" >> "$CONTEXT_FILE"
+    log_info "Context added for next iteration"
+}
+
+# Get and clear context
+get_and_clear_context() {
+    if [ -f "$CONTEXT_FILE" ] && [ -s "$CONTEXT_FILE" ]; then
+        local context=$(cat "$CONTEXT_FILE")
+        rm -f "$CONTEXT_FILE"
+        echo "$context"
+    fi
+}
+
+# Detect and format devplan to proper format
+# Check if devplan has any remaining pending tasks
+has_pending_tasks() {
+    local devpath="$1"
+    
+    if [ ! -f "$devpath" ]; then
+        return 1
+    fi
+    
+    # Check for any pending tasks ([ ] or ⏳)
+    if grep -qE '^[ ]*- \[ \]|^[ ]*- \[⏳\]|^[ ]*- ⏳' "$devpath" 2>/dev/null; then
+        return 0  # Has pending tasks
+    fi
+    
+    return 1  # No pending tasks
+}
+
+# Count tasks in devplan by status
+count_devplan_tasks() {
+    local devpath="$1"
+    
+    if [ ! -f "$devpath" ]; then
+        echo "0 0 0 0"
+        return 1
+    fi
+    
+    local pending=$(grep -cE '^[ ]*- \[ \]' "$devpath" 2>/dev/null || true)
+    [ -z "$pending" ] && pending=0
+    local in_progress=$(grep -cE '^[ ]*- \[⏳\]|^[ ]*- ⏳' "$devpath" 2>/dev/null || true)
+    [ -z "$in_progress" ] && in_progress=0
+    local completed=$(grep -cE '^[ ]*- \[✅\]|^[ ]*- ✅' "$devpath" 2>/dev/null || true)
+    [ -z "$completed" ] && completed=0
+    local needs_review=$(grep -cE '^[ ]*- \[🔄\]|^[ ]*- 🔄' "$devpath" 2>/dev/null || true)
+    [ -z "$needs_review" ] && needs_review=0
+    
+    # Ensure all values are numbers
+    pending=${pending//[^0-9]/}
+    in_progress=${in_progress//[^0-9]/}
+    completed=${completed//[^0-9]/}
+    needs_review=${needs_review//[^0-9]/}
+    
+    echo "$pending $in_progress $completed $needs_review"
+}
+
+# Get next pending task from devplan.md
+get_next_pending_task() {
+    local devpath="$1"
+    if [ ! -f "$devpath" ]; then
+        echo ""
+        return 1
+    fi
+    
+    # Find first pending task (marked with ⏳ or unchecked)
+    # Devplan uses format: - [✅] task or - ⏳ task or - [ ] task
+    # Skip tasks marked with [🔄] (needs review)
+    local task=$(awk '
+    /^[ ]*- \[🔄\]/ { next }
+    /^[ ]*- 🔄/ { next }
+    /^[ ]*- \[✅\]/ { next }
+    /^[ ]*- \[⏳\]/ { 
+        sub(/^[ ]*- \[⏳\] /, "")
+        gsub(/^\s+|\s+$/, "")
+        print
+        exit
+    }
+    /^[ ]*- ⏳/ {
+        sub(/^[ ]*- ⏳ /, "")
+        gsub(/^\s+|\s+$/, "")
+        print
+        exit
+    }
+    /^[ ]*- \[ \]/ {
+        sub(/^[ ]*- \[ \] /, "")
+        gsub(/^\s+|\s+$/, "")
+        print
+        exit
+    }
+    ' "$devpath")
+    
+    echo "$task"
+}
+
+# Get all tasks from devplan with their states
+get_all_tasks_with_states() {
+    local devpath="$1"
+    if [ ! -f "$devpath" ]; then
+        echo ""
+        return 1
+    fi
+    
+    awk '
+    /^[ ]*- \[✅\]/ {
+        sub(/^[ ]*- \[✅\] /, "")
+        gsub(/^\s+|\s+$/, "")
+        print "complete: " $0
+    }
+    /^[ ]*- ✅/ {
+        sub(/^[ ]*- ✅ /, "")
+        gsub(/^\s+|\s+$/, "")
+        print "complete: " $0
+    }
+    /^[ ]*- \[⏳\]/ {
+        sub(/^[ ]*- \[⏳\] /, "")
+        gsub(/^\s+|\s+$/, "")
+        print "in_progress: " $0
+    }
+    /^[ ]*- ⏳/ {
+        sub(/^[ ]*- ⏳ /, "")
+        gsub(/^\s+|\s+$/, "")
+        print "in_progress: " $0
+    }
+    /^[ ]*- \[🔄\]/ {
+        sub(/^[ ]*- \[🔄\] /, "")
+        gsub(/<!--.*-->/, "")
+        gsub(/^\s+|\s+$/, "")
+        print "needs_review: " $0
+    }
+    /^[ ]*- 🔄/ {
+        sub(/^[ ]*- 🔄 /, "")
+        gsub(/<!--.*-->/, "")
+        gsub(/^\s+|\s+$/, "")
+        print "needs_review: " $0
+    }
+    /^[ ]*- \[ \]/ {
+        sub(/^[ ]*- \[ \] /, "")
+        gsub(/^\s+|\s+$/, "")
+        print "pending: " $0
+    }
+    ' "$devpath"
+}
+
+# Mark task as in-progress in devplan.md
+mark_task_in_progress() {
+    local devpath="$1"
+    local task="$2"
+    
+    if [ ! -f "$devpath" ]; then
+        return 1
+    fi
+    
+    # Use awk to perform an exact, literal match update to avoid sed regex pitfalls.
+    # This replaces the first matching pending/completed line containing the exact
+    # task text with the in-progress marker while preserving indentation.
+    awk -v task="$task" '
+    BEGIN { updated=0 }
+    {
+      line = $0
+      if (!updated) {
+        # strip leading indentation
+        match(line, /^[ \t]*/)
+        indent = substr(line, RSTART, RLENGTH)
+        body = substr(line, RLENGTH+1)
+        # possible prefixes: - [ ] , - ✅ , - ⏳ , - [🔄] etc.
+        if (body ~ /^- (\[[ ]\]|\[⏳\]|⏳|\[🔄\]|🔄|\[✅\]|✅) /) {
+          # remove checkbox/prefix for comparison
+          gsub(/^(- (\[[^]]*\]|[⏳✅🔄]) )/, "", body)
+          if (body == task) {
+            print indent "- [⏳] " task
+            updated=1
+            next
+          }
+        }
+      }
+      print $0
+    }
+    END { if (updated==0) exit 0 }
+    ' "$devpath" > "${devpath}.tmp" && mv "${devpath}.tmp" "$devpath" 2>/dev/null || true
+}
+
+# Mark task as complete in devplan.md
+mark_task_complete() {
+    local devpath="$1"
+    local task="$2"
+    
+    if [ ! -f "$devpath" ]; then
+        return 1
+    fi
+    
+    # Use awk to mark the exact task as complete in a safe way.
+    awk -v task="$task" '
+    BEGIN { updated=0 }
+    {
+      line = $0
+      if (!updated) {
+        match(line, /^[ \t]*/)
+        indent = substr(line, RSTART, RLENGTH)
+        body = substr(line, RLENGTH+1)
+        if (body ~ /^- (\[[ ]\]|\[⏳\]|⏳|\[🔄\]|🔄|\[✅\]|✅) /) {
+          gsub(/^(- (\[[^]]*\]|[⏳✅🔄]) )/, "", body)
+          if (body == task) {
+            print indent "- [✅] " task
+            updated=1
+            next
+          }
+        }
+      }
+      print $0
+    }
+    END { if (updated==0) exit 0 }
+    ' "$devpath" > "${devpath}.tmp" && mv "${devpath}.tmp" "$devpath" 2>/dev/null || true
+}
+
+# Mark task as needing review (stalled/blocked)
+mark_task_needs_review() {
+    local devpath="$1"
+    local task="$2"
+    local reason="${3:-}"
+    
+    if [ ! -f "$devpath" ]; then
+        return 1
+    fi
+    
+    # Use awk to mark the task as needing review and optionally append a reason
+    awk -v task="$task" -v reason="$reason" '
+    BEGIN { updated=0 }
+    {
+      line = $0
+      if (!updated) {
+        match(line, /^[ \t]*/)
+        indent = substr(line, RSTART, RLENGTH)
+        body = substr(line, RLENGTH+1)
+        if (body ~ /^- (\[[ ]\]|\[⏳\]|⏳|\[🔄\]|🔄|\[✅\]|✅) /) {
+          gsub(/^(- (\[[^]]*\]|[⏳✅🔄]) )/, "", body)
+          if (body == task) {
+            out = indent "- [🔄] " task
+            if (reason != "") out = out " <!-- " reason " -->"
+            print out
+            updated=1
+            next
+          }
+        }
+      }
+      print $0
+    }
+    END { if (updated==0) exit 0 }
+    ' "$devpath" > "${devpath}.tmp" && mv "${devpath}.tmp" "$devpath" 2>/dev/null || true
+    
+    log_info "Task marked as needing review: $task"
+}
+
+# Get all tasks that need review
+get_tasks_needing_review() {
+    local devpath="$1"
+    if [ ! -f "$devpath" ]; then
+        echo ""
+        return 1
+    fi
+    
+    # Find all tasks marked with 🔄
+    local tasks=$(awk '
+    /^[ ]*- \[🔄\]/ {
+        sub(/^[ ]*- \[🔄\] /, "")
+        gsub(/<!--.*-->/, "")  # Remove comments
+        gsub(/^\s+|\s+$/, "")
+        print
+    }
+    /^[ ]*- 🔄/ {
+        sub(/^[ ]*- 🔄 /, "")
+        gsub(/<!--.*-->/, "")  # Remove comments
+        gsub(/^\s+|\s+$/, "")
+        print
+    }
+    ' "$devpath")
+    
+    echo "$tasks"
+}
+
+# Check if task is stalled (no progress after multiple attempts)
+is_task_stalled() {
+    local task="$1"
+    local max_attempts="${2:-3}"
+    
+    # Check if this task has been attempted multiple times without completion
+    # This would be tracked in a separate stall counter file
+    local stall_file="$RALPH_DIR/task_stalls.txt"
+    
+    if [ ! -f "$stall_file" ]; then
+        return 1
+    fi
+    
+    local attempts=$(grep -c "^$task$" "$stall_file" 2>/dev/null || echo "0")
+    
+    if [ "$attempts" -ge "$max_attempts" ]; then
+        return 0
+    fi
+    
+    return 1
+}
+
+# Record a stall attempt for a task
+record_stall_attempt() {
+    local task="$1"
+    local stall_file="$RALPH_DIR/task_stalls.txt"
+    
+    echo "$task" >> "$stall_file"
+}
+
+# Clear stall record for a task
+clear_stall_record() {
+    local task="$1"
+    local stall_file="$RALPH_DIR/task_stalls.txt"
+    local temp_file="$RALPH_DIR/task_stalls_temp.txt"
+    
+    if [ -f "$stall_file" ]; then
+        grep -v "^$task$" "$stall_file" > "$temp_file" 2>/dev/null || true
+        mv "$temp_file" "$stall_file"
+    fi
+}
+
+# Detect if a devplan iteration is stalling
+detect_stall() {
+    local iteration="$1"
+    local output="$2"
+    local tools_used="$3"
+    
+    # Check for multiple failure indicators
+    local stall_indicators=0
+    
+    # 1. No file modifications in this iteration
+    if ! echo "$tools_used" | grep -qE '(Write|Edit|task)'; then
+        stall_indicators=$((stall_indicators + 1))
+    fi
+    
+    # 2. Output contains stuck/stalled language or timeout
+    if echo "$output" | grep -qiE '(cannot|unable|stuck|blocked|failing|error|failed|timeout|not found|command not found)'; then
+        stall_indicators=$((stall_indicators + 1))
+    fi
+    
+    # 3. Bash was used but no file changes (command may have failed/timed out)
+    if echo "$tools_used" | grep -qE '(bash|Bash)' && ! echo "$tools_used" | grep -qE '(Write|Edit|task)'; then
+        stall_indicators=$((stall_indicators + 1))
+    fi
+    
+    # 4. No completion promise after multiple retries
+    if ! echo "$output" | grep -q "<promise>COMPLETE</promise>"; then
+        stall_indicators=$((stall_indicators + 1))
+    fi
+    
+    # Return stall detected if 2+ indicators present
+    if [ "$stall_indicators" -ge 2 ]; then
+        return 0
+    fi
+    
+    return 1
+}
+
+# Generate stall reason based on indicators
+generate_stall_reason() {
+    local output="$1"
+    local tools_used="$2"
+    
+    if ! echo "$tools_used" | grep -qE '(Write|Edit|bash|Bash|task)'; then
+        echo "no_file_changes"
+    elif echo "$output" | grep -qiE '(cannot|unable|blocked)'; then
+        echo "blocked_operation"
+    elif echo "$output" | grep -qiE '(error|failing|failed|timeout)'; then
+        echo "errors_detected"
+    else
+        echo "stalled_progress"
+    fi
+}
+
+# Reset a task from needs_review back to pending
+reset_task_state() {
+    local devpath="$1"
+    local task="$2"
+    
+    if [ ! -f "$devpath" ]; then
+        log_error "Devplan file not found: $devpath"
+        return 1
+    fi
+    
+    # Use awk to reset the task state back to pending
+    awk -v task="$task" '
+    BEGIN { updated=0 }
+    {
+      line = $0
+      if (!updated) {
+        match(line, /^[ \t]*/)
+        indent = substr(line, RSTART, RLENGTH)
+        body = substr(line, RLENGTH+1)
+        if (body ~ /^- (\[[^]]*\]|[⏳✅🔄]) /) {
+          gsub(/^(- (\[[^]]*\]|[⏳✅🔄]) )/, "", body)
+          if (body == task) {
+            print indent "- [ ] " task
+            updated=1
+            next
+          }
+        }
+      }
+      print $0
+    }
+    END { if (updated==0) exit 0 }
+    ' "$devpath" > "${devpath}.tmp" && mv "${devpath}.tmp" "$devpath" 2>/dev/null || true
+
+    # Clear stall record
+    clear_stall_record "$task"
+
+    log_success "Task reset to pending: $task"
+}
+
+# Show devplan summary
+show_devplan_summary() {
+    local devpath="${1:-./devplan.md}"
+    
+    if [ ! -f "$devpath" ]; then
+        log_error "Devplan file not found: $devpath"
+        return 1
+    fi
+    
+    echo "╔══════════════════════════════════════════════════════════╗"
+    echo "║                  DevPlan Summary                         ║"
+    echo "╚══════════════════════════════════════════════════════════╝"
+    echo ""
+    
+    local tasks=$(get_all_tasks_with_states "$devpath")
+
+    # Compute counts using count_devplan_tasks helper
+    local counts
+    counts=$(count_devplan_tasks "$devpath" 2>/dev/null || echo "0 0 0 0")
+    local pending_count
+    local in_progress_count
+    local complete_count
+    local needs_review_count
+    pending_count=$(echo "$counts" | cut -d' ' -f1)
+    in_progress_count=$(echo "$counts" | cut -d' ' -f2)
+    complete_count=$(echo "$counts" | cut -d' ' -f3)
+    needs_review_count=$(echo "$counts" | cut -d' ' -f4)
+    local total_count=$((pending_count + in_progress_count + complete_count + needs_review_count))
+    
+    echo "📋 Total tasks: $total_count"
+    echo "   ✅ Complete: $complete_count"
+    echo "   ⏳ In Progress: $in_progress_count"
+    echo "   🔄 Needs Review: $needs_review_count"
+    echo "   [ ] Pending: $pending_count"
+    echo ""
+    
+    if [ "$needs_review_count" -gt 0 ]; then
+        echo "⚠️  Tasks needing review:"
+        echo "$tasks" | grep "^needs_review:" | while read -r line; do
+            local task=$(echo "$line" | cut -d':' -f2-)
+            echo "   🔄 $task"
+        done
+        echo ""
+        echo "   These tasks stalled. To retry:"
+        echo "   1. Edit devplan.md and change [🔄] back to [ ]"
+        echo "   2. Or use: ralph --reset-task \"task name\" --devplan $devpath"
+        echo ""
+    fi
+    
+    if [ "$in_progress_count" -gt 0 ]; then
+        echo "🔄 Tasks in progress:"
+        echo "$tasks" | grep "^in_progress:" | while read -r line; do
+            local task=$(echo "$line" | cut -d':' -f2-)
+            echo "   ⏳ $task"
+        done
+        echo ""
+    fi
+    
+    # Show active blockers
+    if [ -f "$BLOCKERS_FILE" ] && [ -s "$BLOCKERS_FILE" ]; then
+        echo "🚫 Active Blockers:"
+        cat "$BLOCKERS_FILE" | while read -r line; do
+            echo "   $line"
+        done
+        echo ""
+    fi
+}
+
+# Run one iteration of OpenCode with real-time output
+run_iteration() {
+    local prompt="$1"
+    local iteration="$2"
+    local context=$(get_and_clear_context)
+    
+    # Combine prompt with context if available
+    local full_prompt="$prompt
+
+IMPORTANT: Output <promise>$COMPLETION_PROMISE</promise> when the task is complete."
+    if [ -n "$context" ]; then
+        full_prompt="$prompt
+
+IMPORTANT: Output <promise>$COMPLETION_PROMISE</promise> when the task is complete.
+
+Additional context from previous iterations:
+$context"
+    fi
+    
+    log_info "=========================================="
+    log_info "Iteration $iteration starting..."
+    log_info "=========================================="
+    echo ""
+    
+    # Build command for real-time output
+    local opencode_cmd="opencode run"
+    if [ -n "$PROVIDER" ]; then
+        opencode_cmd="$opencode_cmd --provider $PROVIDER"
+    fi
+    if [ -n "$MODEL" ]; then
+        opencode_cmd="$opencode_cmd --model $MODEL"
+    fi
+    
+    # Show API request info
+    echo -e "${BLUE}📤 API REQUEST${NC}"
+    echo -e "   ${YELLOW}Provider:${NC} ${PROVIDER:-default}"
+    echo -e "   ${YELLOW}Model:${NC} ${MODEL:-default}"
+    echo -e "   ${YELLOW}Prompt:${NC} $(echo "$full_prompt" | head -c 100 | tr '\n' ' ')..."
+    echo ""
+    
+    # Show waiting indicator
+    echo -e "${YELLOW}⏳ Waiting for API response...${NC}"
+    
+    # Start background monitor
+    start_monitor
+    
+    # Run with JSON format - single API call
+    local start_time=$(date +%s)
+    local json_output=$($opencode_cmd --format json "$full_prompt" 2>&1)
+    local exit_code=$?
+    local end_time=$(date +%s)
+    local duration=$((end_time - start_time))
+    
+    # Stop background monitor
+    stop_monitor
+    
+    # Clear waiting message and show response received
+    echo -e "${GREEN}📥 API RESPONSE received (${duration}s)${NC}"
+    echo ""
+    
+    # Check for API errors
+    if [ $exit_code -ne 0 ]; then
+        log_error "API call failed with exit code $exit_code"
+        echo -e "${RED}Error output: $(echo "$json_output" | head -c 200)${NC}"
+        return 1
+    fi
+    
+    # Extract text content for display and completion check (robust helper)
+    local text_output=""
+    text_output=$(json_extract_text "$json_output") || text_output=""
+    
+    # Display tool calls and output (filter out Ralph's own headers)
+    echo "$text_output" | tr '|' '\n' | grep -vE '^\[RALPH\]|^=== Task|^=================================|^[0-9]\+' | while IFS= read -r line; do
+        line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        if [ -z "$line" ]; then
+            continue
+        fi
+        if echo "$line" | grep -qE '^(Read|Write|Edit|Bash|grep|glob|task|webfetch|codesearch|websearch|todoread|todowrite)'; then
+            echo -e "\033[0;36m🔧 $line\033[0m"
+        elif echo "$line" | grep -qE '^Thinking|^Analyzing|^Searching|^Reading|^Writing|^Executing'; then
+            echo -e "\033[0;33m💭 $line\033[0m"
+        elif echo "$line" | grep -qE '^(✅|❌|⚠️|ℹ️|🔧)'; then
+            echo -e "\033[0;32m$line\033[0m"
+        elif echo "$line" | grep -qE '^\[.*\]'; then
+            echo "$line"
+        else
+            echo "$line"
+        fi
+    done
+    
+    echo ""
+    log_info "----------------------------------------"
+    
+    # Parse token stats from JSON
+    local prompt_tokens=0
+    local completion_tokens=0
+    local cost=0
+    if command -v jq &> /dev/null; then
+        prompt_tokens=$(echo "$json_output" | jq -r '.part.tokens.input // .tokens.input // 0' 2>/dev/null | head -1) || prompt_tokens=0
+        completion_tokens=$(echo "$json_output" | jq -r '.part.tokens.output // .tokens.output // 0' 2>/dev/null | head -1) || completion_tokens=0
+        cost=$(echo "$json_output" | jq -r '.part.cost // .cost // 0' 2>/dev/null | head -1) || cost=0
+    fi
+    local total_tokens=$((prompt_tokens + completion_tokens))
+    
+    log_info "Provider/Model: ${PROVIDER:-opencode}/${MODEL:-default} | Tokens: ${prompt_tokens:-0}→${completion_tokens:-0} (total: ${total_tokens:-0}) | Cost: \$${cost:-0} | Duration: ${duration}s"
+    
+    # Extract tool calls from JSON
+    local tools_used=""
+    tools_used=$(json_extract_tools "$json_output") || tools_used=""
+    if [ -n "$tools_used" ]; then
+        log_info "Tools used: $tools_used"
+    fi
+    
+    log_info "----------------------------------------"
+    echo ""
+    
+    # Check for completion promise
+    if echo "$text_output" | grep -q "<promise>$COMPLETION_PROMISE</promise>"; then
+        log_success "Completion promise detected!"
+        return 0
+    fi
+    
+    log_warning "Iteration $iteration completed without completion promise"
+    return 1
+}
+
+# Run one iteration for devplan tasks with real-time output
+run_devplan_iteration() {
+    local prompt="$1"
+    local iteration="$2"
+    local devfile="$3"
+    local task="$4"
+    local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    
+    log_info "=========================================="
+    log_info "=== Task $iteration: $task ==="
+    log_info "=========================================="
+    echo ""
+    
+    # Build command for real-time output
+    local opencode_cmd="opencode run"
+    if [ -n "$PROVIDER" ]; then
+        opencode_cmd="$opencode_cmd --provider $PROVIDER"
+    fi
+    if [ -n "$MODEL" ]; then
+        opencode_cmd="$opencode_cmd --model $MODEL"
+    fi
+    
+    # Show API request info
+    echo -e "${BLUE}📤 API REQUEST${NC}"
+    echo -e "   ${YELLOW}Provider:${NC} ${PROVIDER:-default}"
+    echo -e "   ${YELLOW}Model:${NC} ${MODEL:-default}"
+    echo -e "   ${YELLOW}Task:${NC} $task"
+    echo -e "   ${YELLOW}DevPlan:${NC} $devfile"
+    echo ""
+    
+    # Show waiting indicator
+    echo -e "${YELLOW}⏳ Waiting for API response...${NC}"
+    
+    # Start background monitor
+    start_monitor
+    
+    # Run with JSON format - single API call
+    local start_time=$(date +%s)
+    local json_output=$($opencode_cmd --format json "$prompt" 2>&1)
+    local exit_code=$?
+    local end_time=$(date +%s)
+    local duration=$((end_time - start_time))
+    
+    # Stop background monitor
+    stop_monitor
+    
+    # Clear waiting message and show response received
+    echo -e "${GREEN}📥 API RESPONSE received (${duration}s)${NC}"
+    echo ""
+    
+    # Check for API errors
+    if [ $exit_code -ne 0 ]; then
+        log_error "API call failed with exit code $exit_code"
+        echo -e "${RED}Error output: $(echo "$json_output" | head -c 500)${NC}"
+        record_stall_attempt "$task"
+        return 1
+    fi
+    
+    # Extract text content for display (robust helper)
+    local text_output=""
+    text_output=$(json_extract_text "$json_output") || text_output=""
+    
+    # Display tool calls and output (filter out Ralph's own headers)
+    echo "$text_output" | tr '|' '\n' | grep -vE '^\[RALPH\]|^=== Task|^=================================|^[0-9]\+' | while IFS= read -r line; do
+        line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        if [ -z "$line" ]; then
+            continue
+        fi
+        if echo "$line" | grep -qE '^(Read|Write|Edit|Bash|grep|glob|task|webfetch|codesearch|websearch|todoread|todowrite)'; then
+            echo -e "\033[0;36m🔧 $line\033[0m"
+        elif echo "$line" | grep -qE '^Thinking|^Analyzing|^Searching|^Reading|^Writing|^Executing|^Running|^Created|^Modified|^Updated'; then
+            echo -e "\033[0;33m💭 $line\033[0m"
+        elif echo "$line" | grep -qE '^(✅|❌|⚠️|ℹ️|🔧|📁|📝)'; then
+            echo -e "\033[0;32m$line\033[0m"
+        elif echo "$line" | grep -qE '^\[.*\]'; then
+            echo "$line"
+        else
+            echo "$line"
+        fi
+    done
+    
+    echo ""
+    log_info "----------------------------------------"
+    
+    # Parse token stats from JSON
+    local prompt_tokens=0
+    local completion_tokens=0
+    local cost=0
+    if command -v jq &> /dev/null; then
+        prompt_tokens=$(echo "$json_output" | jq -r '.part.tokens.input // .tokens.input // 0' 2>/dev/null | head -1) || prompt_tokens=0
+        completion_tokens=$(echo "$json_output" | jq -r '.part.tokens.output // .tokens.output // 0' 2>/dev/null | head -1) || completion_tokens=0
+        cost=$(echo "$json_output" | jq -r '.part.cost // .cost // 0' 2>/dev/null | head -1) || cost=0
+    fi
+    local total_tokens=$((prompt_tokens + completion_tokens))
+    
+    log_info "Provider/Model: ${PROVIDER:-opencode}/${MODEL:-default} | Tokens: ${prompt_tokens:-0}→${completion_tokens:-0} (total: ${total_tokens:-0}) | Cost: \$${cost:-0} | Duration: ${duration}s"
+    
+    # Extract tool calls from JSON
+    local tools_used=""
+    tools_used=$(json_extract_tools "$json_output") || tools_used=""
+    if [ -n "$tools_used" ]; then
+        log_info "Tools used: $tools_used"
+    fi
+    
+    log_info "----------------------------------------"
+    echo ""
+    
+    # Check for completion
+    if echo "$text_output" | grep -q "<promise>$COMPLETION_PROMISE</promise>"; then
+        log_success "Task completed!"
+        mark_task_complete "$devfile" "$task"
+        clear_stall_record "$task"
+        clear_blockers "$task"
+        log_progress "$iteration" "$task" "completed" "$duration"
+        update_docs "✅ Completed: $task (${duration}s, ${total_tokens} tokens)"
+        return 0
+    fi
+    
+    # Check if devplan was updated
+    if grep -qE "✅.*$task" "$devfile" 2>/dev/null; then
+        log_success "Task marked complete in devplan"
+        clear_stall_record "$task"
+        clear_blockers "$task"
+        log_progress "$iteration" "$task" "completed" "$duration"
+        update_docs "✅ Completed: $task (${duration}s, ${total_tokens} tokens)"
+        return 0
+    fi
+    
+    # If work was done, mark complete
+    if echo "$tools_used" | grep -qE "(Write|Edit|bash|Bash|task)"; then
+        log_info "Work detected - marking task as complete"
+        mark_task_complete "$devfile" "$task"
+        clear_stall_record "$task"
+        clear_blockers "$task"
+        log_progress "$iteration" "$task" "completed" "$duration"
+        update_docs "✅ Completed: $task (${duration}s, ${total_tokens} tokens, tools: $tools_used)"
+        return 0
+    fi
+    
+    # Check for blockers in output
+    if echo "$text_output" | grep -qiE '(cannot|blocked|error|failed|permission denied|not found|dependency)'; then
+        local blocker=$(echo "$text_output" | grep -oiE '(cannot|blocked|error|failed|permission denied|not found|dependency).*' | head -1 | tr '\n' ' ' | sed 's/  */ /g')
+        record_blocker "$task" "$blocker"
+        update_docs "🚫 Blocked: $task - $blocker"
+    fi
+    
+    # Check for stall indicators
+    record_stall_attempt "$task"
+    
+    if detect_stall "$iteration" "$text_output" "$tools_used" "$duration"; then
+        local stall_reason=$(generate_stall_reason "$text_output" "$tools_used")
+        log_warning "Stall detected for task: $task (reason: $stall_reason)"
+        mark_task_needs_review "$devfile" "$task" "$stall_reason"
+        log_progress "$iteration" "$task" "stalled: $stall_reason" "$duration"
+        update_docs "🔄 Stalled: $task - $stall_reason (${duration}s)"
+        return 2  # Special return code for stalled task
+    fi
+    
+    log_warning "Task not completed"
+    log_progress "$iteration" "$task" "incomplete" "$duration"
+    update_docs "⚠️ Incomplete: $task (${duration}s, tools: $tools_used)"
+    return 1
+}
+
+# Check for struggle indicators
+check_struggle() {
+    local iterations=$(jq '.iterations | length' "$HISTORY_FILE")
+    
+    if [ "$iterations" -lt 3 ]; then
+        return 0
+    fi
+    
+    # Check if last 3 iterations have no file changes
+    local recent_iterations=$(jq -r '.iterations[-3:] | .[] | .tools_used' "$HISTORY_FILE" | tr '\n' '\n')
+    
+    # Simple struggle detection - no bash/write/edit tools in recent iterations
+    if ! echo "$recent_iterations" | grep -qE '(Write|Edit|bash|Bash)'; then
+        log_warning "Struggle detected: No file modifications in recent iterations"
+        return 1
+    fi
+    
+    return 0
+}
+
+# Display status
+show_status() {
+    local state=$(get_state)
+    local status=$(echo "$state" | jq -r '.status')
+    local iteration=$(echo "$state" | jq -r '.iteration')
+    local start_time=$(echo "$state" | jq -r '.start_time')
+    local prompt=$(echo "$state" | jq -r '.prompt')
+    
+    cat << 'BANNER'
+╔═══════════════════════════════════════════════════════════════════╗
+║                                                                   ║
+║    ██████╗  █████╗ ██╗     ██████╗ ██╗  ██╗██╗   ██╗███████╗███████╗██╗   ██╗    ║
+║    ██╔══██╗██╔══██╗██║     ██╔══██╗██║  ██║██║   ██║██╔════╝██╔════╝╚██╗ ██╔╝    ║
+║    ██████╔╝███████║██║     ██████╔╝███████║██║   ██║███████╗███████╗ ╚████╔╝     ║
+║    ██╔══██╗██╔══██║██║     ██╔═══╝ ██╔══██║██║   ██║╚════██║╚════██║  ╚██╔╝      ║
+║    ██║  ██║██║  ██║███████╗██║     ██║  ██║╚██████╔╝███████║███████║   ██║       ║
+║    ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚══════╝   ╚═╝       ║
+║                                                                   ║
+╚═══════════════════════════════════════════════════════════════════╝
+BANNER
+    echo ""
+    
+    if [ "$status" = "idle" ]; then
+        echo "🔄 No active loop"
+        echo ""
+        echo "Usage: ralph \"<prompt>\" [options]"
+        echo ""
+        echo "Options:"
+        echo "  --max-iterations N    Stop after N iterations (default: 100)"
+        echo "  --completion-promise T Text that signals completion (default: COMPLETE)"
+        echo "  --model MODEL         OpenCode model to use"
+        echo "  --prompt-file FILE    Read prompt from file"
+        echo "  --verbose             Show detailed output"
+        echo ""
+    elif [ "$status" = "running" ]; then
+        echo "🔄 ACTIVE LOOP"
+        echo "   Iteration:    $iteration / $MAX_ITERATIONS"
+        
+        if [ "$start_time" != "null" ]; then
+            local elapsed=$(($(date +%s) - $(date -d "$start_time" +%s)))
+            local minutes=$((elapsed / 60))
+            local seconds=$((elapsed % 60))
+            echo "   Elapsed:      ${minutes}m ${seconds}s"
+        fi
+        
+        echo "   Promise:      $COMPLETION_PROMISE"
+        echo "   Prompt:       $(echo "$prompt" | head -c 50)..."
+        echo ""
+        
+        # Show recent history
+        local history_length=$(jq '.iterations | length' "$HISTORY_FILE")
+        if [ "$history_length" -gt 0 ]; then
+            echo "📊 HISTORY ($history_length iterations)"
+            
+            jq -r '.iterations[-5:] | .[] | "   🔄 #\(.iteration): \(.duration)s | \(.tools_used)"' "$HISTORY_FILE" 2>/dev/null || true
+            echo ""
+        fi
+        
+        # Check for struggle
+        check_struggle && echo "✅ Agent appears to be making progress" || echo "⚠️  Agent may be stuck - consider using 'ralph --add-context'"
+    fi
+    
+    # Show devplan tasks needing review if devplan exists
+    if [ -f "$DEVPATH" ]; then
+        local review_tasks=$(get_tasks_needing_review "$DEVPATH")
+        if [ -n "$review_tasks" ]; then
+            echo "⚠️  TASKS NEEDING REVIEW (marked with [🔄]):"
+            echo "$review_tasks" | while read -r t; do
+                echo "   🔄 $t"
+            done
+            echo ""
+            echo "   These tasks stalled and need manual intervention."
+            echo "   To retry, change [🔄] back to [ ] in devplan.md"
+            echo ""
+        fi
+    fi
+    
+    # Show active blockers
+    show_blockers
+    
+    # Show pending context
+    if [ -f "$CONTEXT_FILE" ] && [ -s "$CONTEXT_FILE" ]; then
+        echo "📝 PENDING CONTEXT:"
+        cat "$CONTEXT_FILE" | head -5 | sed 's/^/   /'
+        echo ""
+    fi
+}
+
+# Main run loop
+run_loop() {
+    local prompt="$1"
+    
+    init_ralph
+    check_opencode
+    check_dependencies
+    
+    log_info "Starting Ralph loop..."
+    log_info "Prompt: $(echo "$prompt" | head -c 100)..."
+    if [ -n "$PROVIDER" ]; then
+        log_info "Provider: $PROVIDER"
+    fi
+    if [ -n "$MODEL" ]; then
+        log_info "Model: $MODEL"
+    fi
+    log_info "Completion promise: $COMPLETION_PROMISE"
+    log_info "Max iterations: $MAX_ITERATIONS"
+    echo ""
+    
+    # Update state to running
+    update_state "running" 0 "$prompt" ""
+    
+    local iteration=0
+    local success=false
+    
+    while [ $iteration -lt $MAX_ITERATIONS ]; do
+        iteration=$((iteration + 1))
+        update_state "running" $iteration "$prompt" ""
+        
+        if run_iteration "$prompt" $iteration; then
+            success=true
+            break
+        fi
+        
+        # Check for struggle
+        if ! check_struggle; then
+            log_warning "Agent appears to be struggling. Consider adding context."
+        fi
+        
+        # Show progress - always show status during iterations
+        local current_iteration=$(jq '.iterations | length' "$HISTORY_FILE")
+        local last_duration=$(jq -r '.iterations[-1].duration' "$HISTORY_FILE" 2>/dev/null || echo "0")
+        log_info "Iteration $current_iteration complete | Duration: ${last_duration}s"
+    done
+    
+    # Update final state
+    update_state "completed" $iteration "$prompt" ""
+    
+    if [ "$success" = true ]; then
+        echo ""
+        log_success "✅ Ralph loop completed successfully!"
+        log_info "Completed in $iteration iteration(s)"
+    else
+        echo ""
+        log_warning "⚠️  Ralph loop reached max iterations ($MAX_ITERATIONS)"
+    fi
+    
+    # Final statistics
+    local total_time=$(jq '[.iterations[].duration] | add' "$HISTORY_FILE" 2>/dev/null || echo "0")
+    log_info "Total time: ${total_time}s"
+    log_info "Logs saved to: $LOG_DIR"
+    log_info "Progress saved to: $PROGRESS_FILE"
+    
+    return 0
+}
+
+# CLI interface
+main() {
+    # Parse arguments
+    local prompt=""
+    local show_help=false
+    local show_status_flag=false
+    local add_context_flag=""
+    local clear_context_flag=false
+    local reset_task_flag=""
+    local devplan_summary_flag=false
+    
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --help|-h)
+                show_help=true
+                shift
+                ;;
+            --status)
+                show_status_flag=true
+                shift
+                ;;
+            --add-context)
+                add_context_flag="$2"
+                shift 2
+                ;;
+            --clear-context)
+                clear_context_flag=true
+                shift
+                ;;
+            --max-iterations)
+                MAX_ITERATIONS="$2"
+                shift 2
+                ;;
+            --completion-promise)
+                COMPLETION_PROMISE="$2"
+                shift 2
+                ;;
+            --model)
+                MODEL="$2"
+                shift 2
+                ;;
+            --provider)
+                PROVIDER="$2"
+                shift 2
+                ;;
+            --list-models)
+                echo "Available models from OpenCode:"
+                opencode models
+                exit 0
+                ;;
+            --list-providers)
+                echo "Available providers:"
+                opencode models --help | grep -A 20 "Positionals:" || opencode models
+                exit 0
+                ;;
+            --devplan)
+                if [ -n "$2" ] && [[ "$2" != --* ]]; then
+                    DEVPATH="$2"
+                    shift 2
+                else
+                    DEVPATH="./devplan.md"
+                    shift
+                fi
+                ;;
+            --reset-task)
+                reset_task_flag="$2"
+                shift 2
+                ;;
+            --devplan-summary)
+                local devplan_summary_flag=true
+                shift
+                ;;
+            --verbose|-v)
+                VERBOSE=true
+                shift
+                ;;
+            -*)
+                log_error "Unknown option: $1"
+                exit 1
+                ;;
+            *)
+                prompt="$1"
+                shift
+                ;;
+        esac
+    done
+    
+    if [ "$show_help" = true ]; then
+        cat << EOF
+Ralph - Autonomous AI Coding Loop for OpenCode
+
+USAGE:
+    ralph "<prompt>" [options]
+    ralph --status
+    ralph --add-context "<hint>"
+    ralph --clear-context
+    ralph --devplan-summary
+
+OPTIONS:
+    --prompt-file, -f FILE    Read prompt from file
+    --max-iterations N        Stop after N iterations (default: 100)
+    --completion-promise T    Text that signals completion (default: COMPLETE)
+    --provider PROVIDER       Provider to use (e.g., anthropic, google)
+    --model MODEL            Model to use (e.g., claude-sonnet-4-20250514)
+    --list-models            List available models from OpenCode
+    --list-providers         List available providers
+    --devplan PATH           Work on devplan.md tasks iteratively (default: ./devplan.md)
+    --devplan-summary        Show summary of devplan tasks
+    --reset-task "TASK"      Reset a stalled task back to pending
+    --verbose, -v            Show detailed output
+    --status                 Show current loop status
+    --add-context HINT       Add context for next iteration
+    --clear-context          Clear pending context
+    --help, -h               Show this help message
+
+STALLED TASK DETECTION:
+    Ralph automatically detects when devplan tasks are stalling and marks them with [🔄].
+    Stalled tasks can be:
+    - Reviewed manually
+    - Retried by changing [🔄] back to [ ] in devplan.md
+    - Reset using: ralph --reset-task "task name" --devplan ./devplan.md
+
+EXAMPLES:
+    ralph "Create a hello.txt file. Output <promise>COMPLETE</promise> when done."
+    ralph "Build a REST API with tests." --provider anthropic --model claude-sonnet-4-20250514
+    ralph --list-models
+    ralph --devplan ./devplan.md --verbose  # Work on devplan tasks iteratively
+    ralph --devplan-summary                  # Show devplan task summary
+    ralph --reset-task "Implement X" --devplan ./devplan.md  # Reset stalled task
+    ralph --status
+
+For more information, visit: https://github.com/anomalyco/opencode
+EOF
+        exit 0
+    fi
+    
+    if [ "$show_status_flag" = true ]; then
+        init_ralph
+        show_status
+        exit 0
+    fi
+    
+    if [ -n "$add_context_flag" ]; then
+        init_ralph
+        add_context "$add_context_flag"
+        exit 0
+    fi
+    
+    if [ "$clear_context_flag" = true ]; then
+        rm -f "$CONTEXT_FILE"
+        log_info "Context cleared"
+        exit 0
+    fi
+    
+    if [ -n "$reset_task_flag" ]; then
+        init_ralph
+        reset_task_state "$DEVPATH" "$reset_task_flag"
+        exit 0
+    fi
+    
+    if [ "$devplan_summary_flag" = true ]; then
+        init_ralph
+        show_devplan_summary "$DEVPATH"
+        exit 0
+    fi
+    
+    if [ -n "$PROMPT_FILE" ]; then
+        if [ ! -f "$PROMPT_FILE" ]; then
+            log_error "Prompt file not found: $PROMPT_FILE"
+            exit 1
+        fi
+        prompt=$(cat "$PROMPT_FILE")
+    fi
+    
+    # Devplan mode - work on pending tasks from devplan.md
+    if [ -n "$DEVPATH" ] && [ "$DEVPATH" != "./devplan.md" ] || [ -f "./devplan.md" ]; then
+        local devfile="${DEVPATH:-./devplan.md}"
+        if [ -f "$devfile" ]; then
+            init_ralph
+            check_opencode
+            
+            cat << 'BANNER'
+╔═══════════════════════════════════════════════════════════════════╗
+║                                                                   ║
+║    ██████╗  █████╗ ██╗     ██████╗ ██╗  ██╗██╗   ██╗███████╗███████╗██╗   ██╗    ║
+║    ██╔══██╗██╔══██╗██║     ██╔══██╗██║  ██║██║   ██║██╔════╝██╔════╝╚██╗ ██╔╝    ║
+║    ██████╔╝███████║██║     ██████╔╝███████║██║   ██║███████╗███████╗ ╚████╔╝     ║
+║    ██╔══██╗██╔══██║██║     ██╔═══╝ ██╔══██║██║   ██║╚════██║╚════██║  ╚██╔╝      ║
+║    ██║  ██║██║  ██║███████╗██║     ██║  ██║╚██████╔╝███████║███████║   ██║       ║
+║    ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚══════╝   ╚═╝       ║
+║                                                                   ║
+║    ██████╗ ███████╗██╗   ██╗    ██████╗ ██╗      █████╗ ███╗   ██╗              ║
+║    ██╔══██╗██╔════╝██║   ██║    ██╔══██╗██║     ██╔══██╗████╗  ██║              ║
+║    ██║  ██║█████╗  ██║   ██║    ██████╔╝██║     ███████║██╔██╗ ██║              ║
+║    ██║  ██║██╔══╝  ╚██╗ ██╔╝    ██╔═══╝ ██║     ██╔══██║██║╚██╗██║              ║
+║    ██████╔╝███████╗ ╚████╔╝     ██║     ███████╗██║  ██║██║ ╚████║              ║
+║    ╚═════╝ ╚══════╝  ╚═══╝      ╚═╝     ╚══════╝╚═╝  ╚═╝╚═╝  ╚═══╝              ║
+║                                                                   ║
+╚═══════════════════════════════════════════════════════════════════╝
+BANNER
+            log_info "DevPlan file: $devfile"
+            echo ""
+            
+            # Show initial task counts
+            local counts=$(count_devplan_tasks "$devfile")
+            local pending_init=$(echo "$counts" | cut -d' ' -f1)
+            local in_progress_init=$(echo "$counts" | cut -d' ' -f2)
+            local completed_init=$(echo "$counts" | cut -d' ' -f3)
+            local needs_review_init=$(echo "$counts" | cut -d' ' -f4)
+            local total_init=$((pending_init + in_progress_init + completed_init + needs_review_init))
+            
+            log_info "📋 Initial Task Status:"
+            log_info "   Total: $total_init | Pending: $pending_init | In Progress: $in_progress_init | Complete: $completed_init | Needs Review: $needs_review_init"
+            echo ""
+            
+            if [ "$pending_init" -eq 0 ] && [ "$in_progress_init" -eq 0 ]; then
+                if [ "$needs_review_init" -gt 0 ]; then
+                    log_warning "All tasks are either complete or need review."
+                    log_info "To retry stalled tasks, use: ralph --reset-task \"task name\" --devplan $devfile"
+                else
+                    log_success "All tasks in devplan are already complete!"
+                fi
+                show_devplan_summary "$devfile"
+                exit 0
+            fi
+            
+            local task_count=0
+            local iteration=0
+            local max_tasks="${MAX_ITERATIONS:-100}"
+            local stalled_count=0
+            local completed_count=0
+            local consecutive_failures=0
+            local max_consecutive_failures=3
+            
+            # Main loop - continues until all tasks are complete or max iterations
+            while [ $task_count -lt $max_tasks ]; do
+                # Get next pending task
+                local task=$(get_next_pending_task "$devfile")
+                
+                if [ -z "$task" ]; then
+                    # Double-check: are there really no pending tasks?
+                    if ! has_pending_tasks "$devfile"; then
+                        log_success "🎉 All tasks in devplan.md are complete!"
+                        break
+                    fi
+                    # Edge case: might have tasks that are somehow not being detected
+                    log_warning "No pending task found but devplan has remaining items. Checking..."
+                    sleep 1
+                    continue
+                fi
+                
+                iteration=$((iteration + 1))
+                task_count=$((task_count + 1))
+                
+                # Show progress bar
+                local current_counts=$(count_devplan_tasks "$devfile")
+                local pending_now=$(echo "$current_counts" | cut -d' ' -f1)
+                local completed_now=$(echo "$current_counts" | cut -d' ' -f3)
+                local progress_pct=0
+                if [ "$total_init" -gt 0 ]; then
+                    progress_pct=$((completed_now * 100 / total_init))
+                fi
+                
+                echo ""
+                log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                log_info "📊 Progress: $completed_now/$total_init complete ($progress_pct%) | Pending: $pending_now"
+                log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                echo ""
+                
+                # Mark task as in progress
+                mark_task_in_progress "$devfile" "$task"
+                
+                # Check if we should batch this with additional simple tasks
+                local batch_tasks="$task"
+                local batch_count=1
+                local next_task_preview=$(get_next_pending_task "$devfile" | head -1)
+                
+                # Look ahead for simple tasks to batch (max 2 additional)
+                while [ $batch_count -lt 3 ] && should_batch_tasks "$task" "$next_task_preview"; do
+                    # Get the actual next pending task after current
+                    local temp_next=$(awk -v current="$task" '
+                        BEGIN { found_current=0 }
+                        /^[ ]*- \[ \]/ {
+                            if (found_current) {
+                                sub(/^[ ]*- \[ \] /, "")
+                                gsub(/^\s+|\s+$/, "")
+                                print
+                                exit
+                            }
+                        }
+                        $0 ~ current { found_current=1 }
+                    ' "$devfile")
+                    
+                    if [ -n "$temp_next" ] && should_batch_tasks "$task" "$temp_next"; then
+                        batch_tasks="$batch_tasks
+- $temp_next"
+                        batch_count=$((batch_count + 1))
+                        mark_task_in_progress "$devfile" "$temp_next"
+                        log_info "📦 Batching simple task: $temp_next"
+                    else
+                        break
+                    fi
+                    next_task_preview="$temp_next"
+                done
+                
+                if [ $batch_count -gt 1 ]; then
+                    log_info "📦 Batched $batch_count simple tasks together"
+                fi
+                
+                # Read handoff from previous Ralph if exists
+                local handoff_context=""
+                if has_handoff; then
+                    log_info "📖 Reading handoff from previous Ralph..."
+                    handoff_context=$(read_handoff)
+                fi
+                
+                # CRITICAL: Sync devplan to disk before creating handoff to ensure next task is correct
+                sync
+                
+                # Build comprehensive prompt with handoff context
+                local devplan_prompt="# Ralph Task Execution
+
+## CRITICAL: Fresh Context Mode
+You are a FRESH Ralph instance. Your context window is clean to ensure best code quality.
+Each task gets a fresh start to prevent context pollution.
+
+## Handoff from Previous Ralph
+$(if [ -n "$handoff_context" ]; then echo "$handoff_context"; else echo "(No previous handoff - this is a fresh start)"; fi)
+
+## Your Current Task(s)
+$batch_tasks
+
+## DevPlan Location
+$devfile
+
+## Instructions
+1. Read the handoff above for important context from the previous Ralph
+2. Complete the task(s) listed above thoroughly  
+3. Write high-quality, well-documented code
+4. After completing, update $devfile to mark task(s) as done:
+   - Change \`- [ ] task\` to \`- [✅] task\`
+5. When done, output \`<promise>COMPLETE</promise>\`
+
+## Quality Standards
+- Write clean, maintainable code
+- Add appropriate comments
+- Consider edge cases
+- Test your changes if applicable
+
+Begin work now."
+
+                # Run the task with fresh context
+                local result=0
+                if run_devplan_iteration "$devplan_prompt" $iteration "$devfile" "$task"; then
+                    # Mark all batched tasks as complete
+                    echo "$batch_tasks" | while IFS= read -r btask; do
+                        btask=$(echo "$btask" | sed 's/^- //')
+                        [ -n "$btask" ] && mark_task_complete "$devfile" "$btask"
+                    done
+                    mark_task_complete "$devfile" "$task"
+                    log_success "✅ Task completed: $task"
+                    completed_count=$((completed_count + batch_count))
+                    consecutive_failures=0
+                    
+                    # Archive old handoff and create new one for next Ralph
+                    archive_handoff
+                    local next_task=$(get_next_pending_task "$devfile")
+                    if [ -n "$next_task" ]; then
+                        create_handoff "$task" "$next_task" "$devfile" "Task completed successfully. Proceeding to next task."
+                    else
+                        # All done - create final handoff
+                        create_handoff "$task" "(ALL TASKS COMPLETE)" "$devfile" "All devplan tasks have been completed!"
+                    fi
+                else
+                    result=$?
+                    if [ "$result" -eq 2 ]; then
+                        # Task is stalled, marked for review
+                        stalled_count=$((stalled_count + 1))
+                        log_warning "🔄 Task marked for review (stalled): $task"
+                        consecutive_failures=$((consecutive_failures + 1))
+                        
+                        # Create handoff noting the stall
+                        archive_handoff
+                        local next_task=$(get_next_pending_task "$devfile")
+                        create_handoff "$task (STALLED)" "$next_task" "$devfile" "Previous task stalled. May need manual review. Error details in logs."
+                    else
+                        log_warning "⚠️  Task incomplete, will retry: $task"
+                        consecutive_failures=$((consecutive_failures + 1))
+                    fi
+                fi
+                
+                # Check for too many consecutive failures
+                if [ "$consecutive_failures" -ge "$max_consecutive_failures" ]; then
+                    log_warning "⚠️  $consecutive_failures consecutive failures. Consider reviewing the devplan or adding context."
+                    log_info "Use: ralph --add-context \"hint\" to provide guidance"
+                fi
+                
+                echo ""
+            done
+            
+            # Final summary
+            echo ""
+            log_info "╔══════════════════════════════════════════════════════════╗"
+            log_info "║              DevPlan Execution Complete                  ║"
+            log_info "╚══════════════════════════════════════════════════════════╝"
+            echo ""
+            
+            # Get final counts
+            local final_counts=$(count_devplan_tasks "$devfile")
+            local pending_final=$(echo "$final_counts" | cut -d' ' -f1)
+            local in_progress_final=$(echo "$final_counts" | cut -d' ' -f2)
+            local completed_final=$(echo "$final_counts" | cut -d' ' -f3)
+            local needs_review_final=$(echo "$final_counts" | cut -d' ' -f4)
+            
+            log_info "📋 Final Task Status:"
+            log_info "   ✅ Completed: $completed_final"
+            log_info "   ⏳ In Progress: $in_progress_final"
+            log_info "   🔄 Needs Review: $needs_review_final"
+            log_info "   [ ] Pending: $pending_final"
+            echo ""
+            log_info "📈 Session Stats:"
+            log_info "   Tasks processed: $task_count"
+            log_info "   Tasks completed this session: $completed_count"
+            log_info "   Tasks stalled: $stalled_count"
+            log_info "   Handoff file: $HANDOFF_FILE"
+            
+            # Show tasks that need review
+            local review_tasks=$(get_tasks_needing_review "$devfile")
+            if [ -n "$review_tasks" ]; then
+                echo ""
+                log_warning "🔄 Tasks needing review:"
+                echo "$review_tasks" | while read -r t; do
+                    [ -n "$t" ] && echo "   🔄 $t"
+                done
+                echo ""
+                log_info "To retry stalled tasks:"
+                log_info "   ralph --reset-task \"task name\" --devplan $devfile"
+            fi
+            
+            # Show blockers
+            if [ -f "$BLOCKERS_FILE" ] && [ -s "$BLOCKERS_FILE" ]; then
+                echo ""
+                log_warning "🚫 Active Blockers:"
+                cat "$BLOCKERS_FILE" | while read -r line; do
+                    echo "   $line"
+                done
+            fi
+            
+            echo ""
+            log_info "📁 Files updated:"
+            log_info "   DevPlan: $devfile"
+            log_info "   Handoff: $HANDOFF_FILE"
+            log_info "   Documentation: $DOCS_PATH"
+            log_info "   Progress log: $PROGRESS_FILE"
+            log_info "   Blockers: $BLOCKERS_FILE"
+            echo ""
+            
+            # Final status message
+            if [ "$pending_final" -eq 0 ] && [ "$in_progress_final" -eq 0 ] && [ "$needs_review_final" -eq 0 ]; then
+                log_success "🎉 All devplan tasks completed successfully!"
+            elif [ "$needs_review_final" -gt 0 ]; then
+                log_warning "Some tasks need manual review before continuing."
+            else
+                log_info "Some tasks remain. Run ralph --devplan $devfile to continue."
+            fi
+            
+            exit 0
+        fi
+    fi
+    
+    if [ -z "$prompt" ]; then
+        log_error "No prompt provided. Use: ralph \"<prompt>\""
+        exit 1
+    fi
+    
+    run_loop "$prompt"
+}
+
+# Run main function unless script is being sourced
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main "$@"
+fi
