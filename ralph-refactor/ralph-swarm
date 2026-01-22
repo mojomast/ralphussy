@@ -32,8 +32,8 @@ source "$__RALPH_SWARM_DIR__/lib/swarm_artifacts.sh"
 
 # Set default provider/model if not specified.
     # These are only used by the swarm analyzer (which calls `opencode run`).
-    RALPH_LLM_PROVIDER="${RALPH_LLM_PROVIDER:-${RALPH_PROVIDER:-}}"
-    RALPH_LLM_MODEL="${RALPH_LLM_MODEL:-${RALPH_MODEL:-}}"
+    RALPH_LLM_PROVIDER="${RALPH_LLM_PROVIDER:-${RALPH_PROVIDER:-zai-coding-plan}}"
+    RALPH_LLM_MODEL="${RALPH_LLM_MODEL:-${RALPH_MODEL:-glm-4.7}}"
 
 swarm_load_config() {
     local config_file="$RALPH_DIR/ralph.config"
