@@ -11,7 +11,7 @@ json_extract_text() {
         # This covers OpenCode (.part.messages[].text), OpenAI chat/completions,
         # Anthropic (.completion), Google (.candidates[].content), and other shapes.
         # Get last text message which contains completion marker
-        text=$(printf '%s' "$json" | jq -r ".[] | select(.type == \"text\") | .part.text] | .[-1] // \"\"" 2>/dev/null | tr -d '"') || text=
+        text=$(printf '%s' "$json" | jq -s -r '[.[] | select(.type == "text") | .part.text] | .[-1] // ""' 2>/dev/null | tr -d '"') || text=
     fi
 
     if [ -z "$text" ]; then

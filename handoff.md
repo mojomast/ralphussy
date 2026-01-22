@@ -953,22 +953,299 @@ Tested swarm resume on run `20260122_191946`:
 - ✅ Model Validation - ADDED (validates models against enabled-models.json)
 - ✅ OpenCode Timeout - ADDED (180s default, configurable via SWARM_TASK_TIMEOUT)
 - ✅ Orphaned Processes - FIXED (automatic cleanup on new runs)
+- ✅ JSON Text Extraction - FIXED (critical syntax error fixed)
+- ✅ Timeout Too Short - FIXED (increased from 180s to 600s)
 
-## Test Commands
+---
 
-```bash
-# Resume swarm with token counting fix
-RALPH_LLM_PROVIDER=zai-coding-plan RALPH_LLM_MODEL=glm-4.7 SWARM_OUTPUT_MODE=live ralph-refactor/ralph-swarm --resume 20260122_191946
+# Handoff: Swarm Run 20260122_213126 - Timeout Investigation
 
-# Check task status
-sqlite3 ~/.ralph/swarm.db "SELECT status, COUNT(*) FROM tasks WHERE run_id = '20260122_191946' GROUP BY status;"
+## Date
+2026-01-22
 
-# View worker logs
-tail -f ~/.ralph/swarm/runs/20260122_191946/worker-1/logs/*.log
+## Context
+After running swarm for 90 minutes with devplan.md (70 tasks), discovered critical issue with timeout being too short. Tasks were completing work and creating git commits but being marked as failed due to 180-second timeout limit.
+
+## What Happened
+
+### Run Summary
+- **Run ID:** 20260122_213126
+- **Duration:** 90 minutes (21:31:26 - 23:01)
+- **Workers:** 2 workers
+- **Tasks:** 70 total tasks from devplan.md
+- **Completed:** 19 tasks
+- **Failed:** 45 tasks (actually completed work!)
+- **Pending:** 4 tasks remaining
+
+### Critical Finding: Tasks Marked as Failed Actually Succeeded
+
+Despite 45 tasks being marked as "failed", workers created approximately **50 working git commits** with actual implementation work.
+
+**Worker 1 Commits (23 total):**
+- Terminal emulation: VT100 parser, xterm-256color
+- GPU rendering: Custom fonts, sub-pixel rendering
+- AI suggestions: Fuzzy search, context-aware suggestions, confidence scoring
+- Productivity: Command palette, split panes, history import/export
+- Plus 16 more commits for various features
+
+**Worker 2 Commits (27 total):**
+- Terminal: Resize handling, cursor positioning, scrollback buffer
+- Rendering: Ebiten engine, glyph rendering, font ligatures, compositor effects
+- AI: Command history, inline suggestions, offline cache
+- UI: Tab system, status bar, drag-and-drop, shell integration
+- Plus 18 more commits for various features
+
+### Root Cause Analysis
+
+**The 180-second timeout was killing tasks after 3 minutes, even though:**
+
+1. **Tasks were completing work** - Git commits show meaningful implementations
+2. **API calls were succeeding** - Token counts show large responses (40K→2K tokens)
+3. **Completion markers were present** - Tasks likely finished but opencode was slow to finalize
+
+**Evidence from logs:**
 ```
+Task 167: Optimize for 60fps+ rendering
+- Started: 21:48:27
+- Failed: 21:51:27 = EXACTLY 180 SECONDS
+- API output: JSON truncated mid-stream (step_start only)
+
+Task 168: Implement command history tracking
+- Started: 21:48:48
+- Failed: 21:51:48 = EXACTLY 180 SECONDS
+- BUT: Git commit "1902b0a: Implement command history tracking" exists
+```
+
+## Fix Applied
+
+### Increased Task Timeout
+
+**File:** `ralph-refactor/lib/swarm_worker.sh:308`
+
+**Change:**
+```bash
+# Before:
+local timeout_seconds="${SWARM_TASK_TIMEOUT:-180}"
+
+# After:
+local timeout_seconds="${SWARM_TASK_TIMEOUT:-600}"
+```
+
+**Rationale:**
+- 180 seconds (3 minutes) insufficient for complex implementation tasks
+- 600 seconds (10 minutes) allows time for:
+  - Code analysis
+  - File exploration
+  - Multi-step implementations
+  - Testing
+  - Git commit creation
+- Still prevents runaway tasks from hanging indefinitely
+
+## Resume Procedure
+
+### Current State After Cleanup
+- Workers stopped
+- Run directory cleaned (worktrees pruned)
+- Database record still exists (for inspection)
+- Git commits accessible in main repo for code review
+
+### Proper Resume Method
+
+**Option A: Fresh Run (RECOMMENDED)**
+```bash
+cd /home/mojo/projects/ralphussy/ralph-refactor
+./ralph-swarm --devplan ../devplan.md --workers 2
+```
+
+**Benefits:**
+- Clean state with 10-minute timeout
+- All 70 tasks will be processed with new timeout
+- Workers will skip already-completed work in repo
+- Previous work trees remain available for inspection
+
+**Option B: Resume Old Run**
+```bash
+cd /home/mojo/projects/ralphussy/ralph-refactor
+./ralph-swarm --devplan ../devplan.md --resume 20260122_213126 --workers 2
+```
+
+**This would:**
+- Continue with same run ID
+- Process remaining pending tasks (4 remaining)
+- Re-queue failed tasks (45 tasks to retry)
+- Use new 10-minute timeout
+
+## To Inspect Previous Work
+
+**Worker 1 commits:**
+```bash
+cd ~/.ralph/swarm/runs/20260122_213126/worker-1/repo
+git log --oneline
+```
+
+**Worker 2 commits:**
+```bash
+cd ~/.ralph/swarm/runs/20260122_213126/worker-2/repo
+git log --oneline
+```
+
+**Note:** Worktrees were pruned after cleanup. Commits remain accessible in main repo.
+
+## Recommendations
+
+1. **Always start with fresh run after timeout changes** - Ensures workers load new timeout value
+2. **Consider even longer timeout** - 10 minutes may still be insufficient for complex tasks
+3. **Better timeout management** - Could implement dynamic timeout based on task complexity
+4. **Preserve work on timeout** - Tasks completing work but timing out should be able to save state
 
 ## Files Modified
 
-1. `ralph-refactor/lib/swarm_worker.sh:329-333` - Fixed token aggregation to sum all events
-2. `ralph-refactor/lib/swarm_worker.sh:338-344` - Added debug warning for 0 token cases
+1. `ralph-refactor/lib/swarm_worker.sh:308` - Increased timeout from 180s to 600s
 
+---
+
+# Handoff: JSON Text Extraction Critical Bug Fix
+
+## Date
+2026-01-22
+
+## Critical Bug Discovered
+
+After investigating failed swarm tasks, discovered that the `json_extract_text()` function in `ralph-refactor/lib/json.sh` contained a **critical syntax error** in the jq command, causing ALL tasks to fail even when they completed successfully.
+
+## Root Cause
+
+**File:** `ralph-refactor/lib/json.sh:14`
+
+**Bug:** The jq command had syntax errors:
+```bash
+# BUGGY CODE (line 14):
+text=$(printf '%s' "$json" | jq -r ".[] | select(.type == \"text\") | .part.text] | .[-1] // \"\"" 2>/dev/null | tr -d '"') || text=
+```
+
+**Errors:**
+1. Extra `]` after `.part.text` (should be before `.[]`)
+2. Missing opening `[` before `.[]`
+3. Incorrect quotes (`\"text\"` and `\"\"`)
+4. Missing `-s` flag to read all JSON lines as an array
+
+**Impact:** Every swarm task that completed successfully with the `<promise>COMPLETE</promise>` marker was marked as FAILED because the function couldn't extract the completion marker.
+
+## Fix Applied
+
+**File:** `ralph-refactor/lib/json.sh:14`
+
+```bash
+# FIXED CODE:
+text=$(printf '%s' "$json" | jq -s -r '[.[] | select(.type == "text") | .part.text] | .[-1] // ""' 2>/dev/null | tr -d '"') || text=
+```
+
+**Changes:**
+1. Added `-s` flag to jq (read all lines as array)
+2. Fixed array syntax: `[.[] | ...]` (properly closed)
+3. Simplified quotes: single quotes around jq expression
+4. Extracts LAST text message (contains completion marker)
+
+## Example of Task That Should Have Succeeded
+
+**Task 1663:** "Initialize Go module and create project directory structure with cmd, pkg, internal, and web folders"
+
+**What the model actually did:**
+- Created directories: `pkg/`, `internal/`, `web/`
+- Added `.gitkeep` files
+- Created git commit with proper message
+- Output: `<promise>COMPLETE</promise>` (completion marker present!)
+- Token count: 42,220 → 1,665 (working correctly)
+
+**Result:** Marked as FAILED because `json_extract_text()` couldn't extract the completion marker due to syntax error.
+
+## Additional Prevention Measures
+
+### 1. Added Tests
+
+**File:** `ralph-refactor/tests/test_json.sh`
+
+Created comprehensive tests for `json_extract_text()`:
+- `test_extract_text_with_completion_marker()` - Tests extraction of `<promise>COMPLETE</promise>`
+- `test_extract_text_multiple_messages()` - Tests getting LAST message from multiple
+- `test_extract_text_empty_json()` - Tests edge case of empty JSON
+- `test_extract_text_from_real_output()` - Tests with actual swarm output
+
+Run tests: `./ralph-refactor/tests/test_json.sh`
+
+### 2. Enhanced Debug Output
+
+**File:** `ralph-refactor/lib/swarm_worker.sh:357-362`
+
+Added warning when text extraction fails but tokens were generated:
+
+```bash
+# Debug: Warn if text extraction failed but tokens were generated
+if [ -z "$text_output" ] && [ "$completion_tokens" -gt 0 ]; then
+    echo "[$(date)] DEBUG: Text extraction failed despite $completion_tokens completion tokens" 1>&2
+    echo "[$(date)] DEBUG: Full JSON saved to: ${repo_dir}/.swarm_text_debug_${task_id}.json" 1>&2
+    echo "$json_output" > "${repo_dir}/.swarm_text_debug_${task_id}.json"
+fi
+```
+
+This will catch future bugs early by saving the full JSON for investigation.
+
+## How to Prevent This in the Future
+
+1. **Always test jq commands** with actual output before committing
+   ```bash
+   echo "$json_output" | jq -s -r '[.[] | select(.type == "text") | .part.text] | .[-1]'
+   ```
+
+2. **Run tests after making changes**
+   ```bash
+   ./ralph-refactor/tests/test_json.sh
+   ```
+
+3. **Watch for the debug warning** - if you see "Text extraction failed despite X tokens", investigate immediately
+
+4. **Syntax check jq expressions**
+   ```bash
+   jq -n '<your-expression>'  # Validate syntax without input
+   ```
+
+## Files Modified
+
+1. `ralph-refactor/lib/json.sh:14` - Fixed critical jq syntax error
+2. `ralph-refactor/lib/swarm_worker.sh:357-362` - Added debug warning for text extraction failures
+3. `ralph-refactor/tests/test_json.sh` - Created comprehensive test suite
+
+## Test Results
+
+```bash
+$ ./ralph-refactor/tests/test_json.sh
+==========================================
+Running JSON Extraction Tests
+==========================================
+
+Testing json_extract_text with completion marker...
+✅ Extracted completion marker correctly
+Testing json_extract_text with multiple text messages...
+✅ Extracted last text message correctly
+Testing json_extract_text empty JSON...
+✅ Handled empty JSON correctly
+Testing json_extract_text from real swarm output...
+✅ Extracted completion marker from real output correctly
+
+==========================================
+Test Results: 0 failed
+==========================================
+```
+
+## Status
+
+**Previous Issues Status:**
+- ✅ Model Configuration - FIXED (defaults now use zai-coding-plan/glm-4.7)
+- ✅ Free Model 0 Tokens - FIXED (default changed from glm-4.7-free to glm-4.7)
+- ✅ Token Aggregation Bug - FIXED (summing all step_finish events)
+- ✅ Database Locking - IMPROVED (increased timeout, retries, WAL auto-checkpoint, reduced workers)
+- ✅ Model Validation - ADDED (validates models against enabled-models.json)
+- ✅ OpenCode Timeout - ADDED (180s default, configurable via SWARM_TASK_TIMEOUT)
+- ✅ Orphaned Processes - FIXED (automatic cleanup on new runs)
+- ✅ JSON Text Extraction - FIXED (critical syntax error fixed)
+ 

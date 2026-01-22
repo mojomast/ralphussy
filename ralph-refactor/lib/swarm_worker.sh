@@ -305,7 +305,7 @@ EOF
     echo "[$(date)] DEBUG: RALPH_LLM_PROVIDER=${RALPH_LLM_PROVIDER:-}, RALPH_LLM_MODEL=${RALPH_LLM_MODEL:-}"
     echo "[$(date)] DEBUG: Command: $opencode_cmd"
 
-    local timeout_seconds="${SWARM_TASK_TIMEOUT:-180}"
+    local timeout_seconds="${SWARM_TASK_TIMEOUT:-600}"
     local json_output
 
     if ! json_output=$(cd "$repo_dir" && timeout "$timeout_seconds" $opencode_cmd --format json "$prompt" 2>&1); then
@@ -353,7 +353,14 @@ EOF
 
     local text_output
     text_output=$(json_extract_text "$json_output" 2>/dev/null || true)
-    
+
+    # Debug: Warn if text extraction failed but tokens were generated
+    if [ -z "$text_output" ] && [ "$completion_tokens" -gt 0 ]; then
+        echo "[$(date)] DEBUG: Text extraction failed despite $completion_tokens completion tokens" 1>&2
+        echo "[$(date)] DEBUG: Full JSON saved to: ${repo_dir}/.swarm_text_debug_${task_id}.json" 1>&2
+        echo "$json_output" > "${repo_dir}/.swarm_text_debug_${task_id}.json"
+    fi
+
     # Check for completion using multiple patterns to handle model non-compliance
     # Some models may not output exact marker but use completion language
     local completed=false
