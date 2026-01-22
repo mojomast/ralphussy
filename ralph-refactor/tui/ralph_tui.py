@@ -109,6 +109,7 @@ class TUIConfig:
     default_workers: int = 4
 
     swarm_auto_merge: bool = False
+    swarm_auto_start: bool = False
     swarm_collect_artifacts: bool = True
 
     refresh_interval_sec: float = 2.0
@@ -404,6 +405,9 @@ class SettingsScreen(ModalScreen[TUIConfig]):
                     yield Static("Auto-merge", classes="label")
                     yield Switch(value=self._cfg.swarm_auto_merge, id="swarm-auto-merge")
                 with Horizontal(classes="row"):
+                    yield Static("Auto-start swarm", classes="label")
+                    yield Switch(value=self._cfg.swarm_auto_start, id="swarm-auto-start")
+                with Horizontal(classes="row"):
                     yield Static("Collect artifacts", classes="label")
                     yield Switch(value=self._cfg.swarm_collect_artifacts, id="swarm-artifacts")
 
@@ -468,6 +472,7 @@ class SettingsScreen(ModalScreen[TUIConfig]):
             swarm_model=str(swarm_model),
             default_workers=default_workers,
             swarm_auto_merge=self.query_one("#swarm-auto-merge", Switch).value,
+            swarm_auto_start=self.query_one("#swarm-auto-start", Switch).value,
             swarm_collect_artifacts=self.query_one("#swarm-artifacts", Switch).value,
             refresh_interval_sec=refresh_interval_sec,
             enable_file_watch=self.query_one("#ui-watch", Switch).value,
@@ -550,7 +555,7 @@ class SwarmDBReader:
         if not self.db_path.exists():
             return None
         try:
-            conn = sqlite3.connect(str(self.db_path), timeout=1.0)
+            conn = sqlite3.connect(str(self.db_path), timeout=10.0)
             conn.row_factory = sqlite3.Row
             return conn
         except sqlite3.Error:
@@ -1280,10 +1285,13 @@ class LogPane(Vertical):
 
         full_message = f"{timestamp} {prefix} {worker_tag}{message}"
 
+        # Strip Rich markup tags for display (user can copy plain text)
+        clean_msg = Text.from_markup(full_message).plain
+
         lines = log.text.split("\n")
         if len(lines) > self._max_lines:
             log.text = "\n".join(lines[-self._max_lines:])
-        log.text += f"{full_message}\n"
+        log.text += f"{clean_msg}\n"
         log.scroll_end(animate=False)
 
     def log_task_start(self, worker_id: str, task_text: str) -> None:
@@ -1348,10 +1356,11 @@ class FilePane(Vertical):
     }
     
     FilePane #file-preview {
-        height: 12;
+        height: 1fr;
         border-top: solid #9b59b6;
         background: $surface-darken-1;
         padding: 0 1;
+        overflow-y: scroll;
     }
     """
     
@@ -1407,7 +1416,7 @@ class FilePane(Vertical):
                 elif path.suffix.lower() == ".html":
                     lexer = "html"
 
-                preview.update(Syntax(content, lexer, theme="monokai", line_numbers=True, word_wrap=False))
+                preview.update(Syntax(content, lexer, theme="monokai", line_numbers=True, word_wrap=True))
             else:
                 preview.update(f"[dim]{path.name}[/dim] ({path.suffix or 'file'})")
         except Exception as e:
@@ -1445,8 +1454,20 @@ class RalphTUI(App):
         column-span: 1;
     }
 
-    /* Center column: stacked Workers + Log */
+    /* Center column: Log console (expanded) */
     #center-column {
+        row-span: 1;
+        column-span: 1;
+    }
+
+    #worker-container {
+        height: auto;
+        min-height: 5;
+        max-height: 24;
+    }
+
+    /* Right column: Workers (compact) + File browser (expanded) */
+    #right-column {
         row-span: 1;
         column-span: 1;
         layout: vertical;
@@ -1454,18 +1475,12 @@ class RalphTUI(App):
 
     #worker-container {
         height: auto;
-        min-height: 8;
-        max-height: 14;
+        min-height: 5;
+        max-height: 8;
     }
 
-    #log-container {
-        height: 1fr;
-    }
-
-    /* File browser - right column, expanded */
     #file-container {
-        row-span: 1;
-        column-span: 1;
+        height: 1fr;
     }
 
     /* Progress bar - full width bottom */
@@ -1525,6 +1540,14 @@ class RalphTUI(App):
         background: $surface;
     }
     
+    FilePane #file-preview {
+        height: 1fr;
+        border-top: solid #9b59b6;
+        background: $surface-darken-1;
+        padding: 0 1;
+        overflow-y: scroll;
+    }
+    
     ProgressPane {
         border-top: solid #f1c40f;
         background: $surface-darken-1;
@@ -1580,22 +1603,22 @@ class RalphTUI(App):
             ChatPane(id="chat-pane"),
             id="chat-container"
         )
-        # Center column: Workers (compact) + System Log (expanded)
+        # Center column: System Log (expanded)
+        yield Container(
+            LogPane(id="log-pane"),
+            id="center-column"
+        )
+        # Right column: Workers (compact) + File browser (expanded)
         yield Vertical(
             Container(
                 WorkerPane(id="worker-pane"),
                 id="worker-container"
             ),
             Container(
-                LogPane(id="log-pane"),
-                id="log-container"
+                FilePane(id="file-pane"),
+                id="file-container"
             ),
-            id="center-column"
-        )
-        # Right column: File browser (expanded)
-        yield Container(
-            FilePane(id="file-pane"),
-            id="file-container"
+            id="right-column"
         )
         # Bottom: Progress bar
         yield Container(
@@ -1875,7 +1898,7 @@ class RalphTUI(App):
 [bold cyan]Ralph Operations:[/bold cyan]
   /devplan [file] Run Ralph in devplan mode
   /mode <name>    Switch chat mode (orchestrator|ralph)
-  /swarm ...      Swarm control (start/status/logs/stop/reiterate/resume)
+  /swarm ...      Swarm control (start/status/logs/stop/reiterate/resume/reset)
   /reiterate N    Force worker N to re-queue current task
   /resume RUN_ID  Resume a previous swarm run
   /status         Show current status
@@ -2034,7 +2057,7 @@ class RalphTUI(App):
                 db_path = SWARM_DB
                 if db_path.exists():
                     import sqlite3
-                    conn = sqlite3.connect(str(db_path), timeout=1.0)
+                    conn = sqlite3.connect(str(db_path), timeout=10.0)
                     cursor = conn.execute(
                         "SELECT COUNT(*) FROM worker_registry WHERE last_heartbeat >= datetime('now', '-60 seconds')"
                     )
@@ -2272,6 +2295,11 @@ class RalphTUI(App):
                 if self.active_process_id == pid:
                     self.active_process_id = None
 
+            # Resume database refresh timer
+            if self.refresh_timer:
+                self.refresh_timer.stop()
+            self.refresh_timer = self.set_interval(self.config.refresh_interval_sec, self.refresh_status)
+
     async def _read_orchestrator_output(self, proc: subprocess.Popen, chat_pane: ChatPane) -> None:
         """Read opencode output without flooding the chat.
 
@@ -2463,8 +2491,16 @@ class RalphTUI(App):
             cmd = [str(ralph_swarm), "--resume", run_id]
             self.spawn_process("swarm-resume", cmd, cwd, env, chat_pane)
             return
+        if op == "reset":
+            # /swarm reset [RUN_ID] - resets a run to start fresh with same devplan
+            run_id = rest.strip()
+            cmd = [str(ralph_swarm), "--reset"]
+            if run_id:
+                cmd.append(run_id)
+            self.spawn_process("swarm-reset", cmd, cwd, env, chat_pane)
+            return
 
-        chat_pane.log_message("Usage: /swarm start|status|logs|stop|inspect|cleanup|reiterate|resume", "error")
+        chat_pane.log_message("Usage: /swarm start|status|logs|stop|inspect|cleanup|reiterate|resume|reset", "error")
 
     def force_reiterate(self, args: str, chat_pane: ChatPane) -> None:
         # /reiterate N [RUN_ID]
@@ -2790,7 +2826,7 @@ class RalphTUI(App):
                 return
 
             import sqlite3
-            conn = sqlite3.connect(str(db_path), timeout=1.0)
+            conn = sqlite3.connect(str(db_path), timeout=10.0)
 
             # Get active workers
             cursor = conn.execute(
