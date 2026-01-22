@@ -1068,8 +1068,6 @@ class LogPane(Vertical):
 
     LogPane #system-log {
         height: 1fr;
-        font-family: monospace;
-        font-size: 11;
     }
     """
 
