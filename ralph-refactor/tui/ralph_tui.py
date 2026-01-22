@@ -777,6 +777,9 @@ class ChatPane(Vertical):
             "/focus ",
             "/status",
             "/stop",
+            "/emergency-stop",
+            "/system",
+            "/resume",
             "/logs",
         ]
 
@@ -794,7 +797,7 @@ class ChatPane(Vertical):
         if prefix.startswith("/swarm "):
             base = "/swarm "
             rest = prefix[len(base):]
-            sub = ["start", "status", "stop", "logs", "inspect", "cleanup", "reiterate"]
+            sub = ["start", "status", "stop", "logs", "inspect", "cleanup", "reiterate", "resume"]
             return [base + s + (" " if s in {"logs", "reiterate"} else "") for s in sub if (s + " ").startswith(rest) or s.startswith(rest)]
 
         return [c for c in commands if c.startswith(prefix)]
@@ -867,24 +870,24 @@ class ChatPane(Vertical):
 
 class WorkerPane(Vertical):
     """Worker status pane showing swarm activity."""
-    
+
     DEFAULT_CSS = """
     WorkerPane {
         height: 100%;
         border: solid blue;
     }
-    
+
     WorkerPane #worker-header {
         height: 3;
         background: $surface;
         padding: 1;
     }
-    
+
     WorkerPane #worker-table {
         height: 1fr;
     }
     """
-    
+
     class WorkerSelected(Message):
         """Message when a worker is selected from the table."""
         def __init__(self, run_id: str, worker_num: int):
@@ -895,48 +898,72 @@ class WorkerPane(Vertical):
     def compose(self) -> ComposeResult:
         yield Static("[bold]Workers[/bold] (Click ID for logs)", id="worker-header")
         yield DataTable(id="worker-table", cursor_type="row")
-    
+
     def on_mount(self) -> None:
         """Initialize worker table."""
         table = self.query_one("#worker-table", DataTable)
-        table.add_columns("ID", "Status", "Task", "Branch", "RunID")
-    
+        table.add_columns("ID", "Status", "Current Task", "Branch", "RunID")
+
     def update_workers(self, workers: List[Dict[str, Any]]) -> None:
         """Update worker table with current workers."""
         table = self.query_one("#worker-table", DataTable)
         table.clear()
-        
+
         for worker in workers:
             worker_num = worker.get("worker_num", "?")
             status = worker.get("status", "unknown")
             task_id = worker.get("current_task_id", "-")
-            task_text = worker.get("current_task_text", "") # Added in DB later maybe? Or we need to fetch
+            task_text = worker.get("current_task_text", "")
             branch = worker.get("branch_name", "-")
             run_id = worker.get("run_id", "")
-            
-            # Colorize status
-            status_display = status
+            last_heartbeat = worker.get("last_heartbeat", "")
+
+            # Colorize status with enhanced display
             if status == "idle":
                 status_display = "[yellow]idle[/yellow]"
             elif status == "working":
-                status_display = "[green]working[/green]"
+                # Show as working with activity indicator
+                status_display = "[green]● working[/green]"
             elif status == "error":
-                status_display = "[red]error[/red]"
-            
-            # Truncate task text if available, otherwise use ID
-            task_display = str(task_id)
+                status_display = "[red]● error[/red]"
+            elif status == "stuck":
+                status_display = "[yellow]⏳ stuck[/yellow]"
+            else:
+                status_display = f"[dim]{status}[/dim]"
+
+            # Enhanced task display
             if task_text:
-                task_display = f"{task_id}: {task_text[:30]}..."
-            elif task_id and task_id != "-":
-                 # If we don't have text in the worker record, maybe just show ID
-                 pass
+                # Truncate task text but keep more context
+                if len(task_text) > 40:
+                    task_display = f"{task_text[:40]}..."
+                else:
+                    task_display = task_text
+                # Add status indicator based on worker state
+                if status == "working":
+                    task_display = f"[green]→[/green] {task_display}"
+                elif status == "error":
+                    task_display = f"[red]![/red] {task_display}"
+                elif status == "stuck":
+                    task_display = f"[yellow]?[/yellow] {task_display}"
+            elif task_id and task_id != "-" and task_id != "None":
+                # No task text but has task ID - show brief
+                task_display = f"[dim]Task #{task_id}[/dim]"
+            else:
+                task_display = "[dim]-[/dim]"
+
+            # Shorten run_id for display
+            run_display = run_id[:8] if run_id else "-"
+            # Shorten branch name
+            branch_short = branch.split("/")[-1] if branch else "-"
+            if len(branch_short) > 12:
+                branch_short = branch_short[:12] + "..."
 
             table.add_row(
                 str(worker_num),
                 status_display,
                 task_display,
-                branch[:15] if branch else "-",
-                str(run_id),
+                branch_short,
+                run_display,
                 key=f"{run_id}|{worker_num}"
             )
 
@@ -1021,10 +1048,106 @@ class ProgressPane(Vertical):
             progress_bar.update(progress=0)
     
     def add_task_update(self, task_text: str, status: str) -> None:
-        # We no longer have a log in the single-line progress pane
-        # Task updates should go to the main chat log instead
         pass
 
+
+class LogPane(Vertical):
+    """Non-interactive system log pane for swarm/agent process details."""
+
+    DEFAULT_CSS = """
+    LogPane {
+        height: 100%;
+        border: solid cyan;
+    }
+
+    LogPane #log-header {
+        height: 3;
+        background: $surface;
+        padding: 1;
+    }
+
+    LogPane #system-log {
+        height: 1fr;
+        font-family: monospace;
+        font-size: 11;
+    }
+    """
+
+    def __init__(self, **kwargs: Any):
+        super().__init__(**kwargs)
+        self._max_lines = 1000
+        self._log_levels = {
+            "info": "[blue]I[/blue]",
+            "success": "[green]✓[/green]",
+            "warning": "[yellow]⚠[/yellow]",
+            "error": "[red]✗[/red]",
+            "task": "[magenta]→[/magenta]",
+            "tool": "[cyan]◇[/cyan]",
+            "file": "[green]◆[/green]",
+            "cmd": "[yellow]★[/yellow]",
+            "completed": "[green]✅[/green]",
+            "failed": "[red]❌[/failed]",
+            "stuck": "[yellow]⏳[/yellow]",
+        }
+
+    def compose(self) -> ComposeResult:
+        yield Static("[bold]System Log[/bold]", id="log-header")
+        yield TextArea(id="system-log", read_only=True)
+
+    def write_log(self, message: str, level: str = "info", worker_id: Optional[str] = None) -> None:
+        """Write a log entry to the pane."""
+        log = self.query_one("#system-log", TextArea)
+        timestamp = datetime.now().strftime("%H:%M:%S")
+
+        prefix = self._log_levels.get(level, "[dim]?[/dim]")
+        worker_tag = f"[dim][{worker_id}][/dim] " if worker_id else ""
+
+        full_message = f"{timestamp} {prefix} {worker_tag}{message}"
+
+        lines = log.text.split("\n")
+        if len(lines) > self._max_lines:
+            log.text = "\n".join(lines[-self._max_lines:])
+        log.text += f"{full_message}\n"
+        log.scroll_end(animate=False)
+
+    def log_task_start(self, worker_id: str, task_text: str) -> None:
+        """Log task start with task flair."""
+        short_task = task_text[:60] + "..." if len(task_text) > 60 else task_text
+        self.write_log(f"Starting task: {short_task}", "task", worker_id)
+
+    def log_tool_call(self, worker_id: str, tool_name: str, args: str) -> None:
+        """Log tool call with tool flair."""
+        short_args = args[:40] + "..." if len(args) > 40 else args
+        self.write_log(f"Tool: {tool_name}({short_args})", "tool", worker_id)
+
+    def log_file_edit(self, worker_id: str, file_path: str, action: str = "edit") -> None:
+        """Log file edit with file flair."""
+        self.write_log(f"File {action}: {file_path}", "file", worker_id)
+
+    def log_command(self, worker_id: str, cmd: str) -> None:
+        """Log command execution with cmd flair."""
+        short_cmd = cmd[:50] + "..." if len(cmd) > 50 else cmd
+        self.write_log(f"Cmd: {short_cmd}", "cmd", worker_id)
+
+    def log_completed(self, worker_id: str, task_text: str) -> None:
+        """Log task completion with completed flair."""
+        short_task = task_text[:50] + "..." if len(task_text) > 50 else task_text
+        self.write_log(f"COMPLETED: {short_task}", "completed", worker_id)
+
+    def log_failed(self, worker_id: str, task_text: str, error: str) -> None:
+        """Log task failure with failed flair."""
+        short_task = task_text[:50] + "..." if len(task_text) > 50 else task_text
+        self.write_log(f"FAILED: {short_task} - {error}", "failed", worker_id)
+
+    def log_stuck(self, worker_id: str, task_text: str, duration: int) -> None:
+        """Log stuck task with stuck flair."""
+        short_task = task_text[:45] + "..." if len(task_text) > 45 else task_text
+        self.write_log(f"STUCK ({duration}s): {short_task}", "stuck", worker_id)
+
+    def clear(self) -> None:
+        """Clear the log."""
+        log = self.query_one("#system-log", TextArea)
+        log.text = ""
 
 
 class FilePane(Vertical):
@@ -1127,35 +1250,40 @@ class FilePane(Vertical):
 
 class RalphTUI(App):
     """Main Ralph TUI Application."""
-    
+
     CSS = """
     Screen {
         layout: grid;
-        grid-size: 2 2;
-        grid-rows: 1fr 1fr;
-        grid-columns: 2fr 1fr;
+        grid-size: 3 2;
+        grid-rows: 1.2fr 0.8fr;
+        grid-columns: 1fr 2fr 1fr;
     }
-    
-    #left-top {
+
+    #log-pane {
         row-span: 1;
         column-span: 1;
     }
-    
-    #right-top {
+
+    #chat-pane {
         row-span: 1;
         column-span: 1;
     }
-    
-    #left-bottom {
+
+    #worker-pane {
         row-span: 1;
         column-span: 1;
     }
-    
-    #right-bottom {
+
+    #progress-pane {
         row-span: 1;
         column-span: 1;
     }
-    
+
+    #file-pane {
+        row-span: 1;
+        column-span: 1;
+    }
+
     .pane-title {
         text-style: bold;
         background: $surface;
@@ -1208,20 +1336,24 @@ class RalphTUI(App):
     def compose(self) -> ComposeResult:
         yield Header()
         yield Container(
+            LogPane(id="log-pane"),
+            id="log-pane"
+        )
+        yield Container(
             ChatPane(id="chat-pane"),
-            id="left-top"
+            id="chat-pane"
         )
         yield Container(
             WorkerPane(id="worker-pane"),
-            id="right-top"
+            id="worker-pane"
         )
         yield Container(
             ProgressPane(id="progress-pane"),
-            id="left-bottom"
+            id="progress-pane"
         )
         yield Container(
             FilePane(id="file-pane"),
-            id="right-bottom"
+            id="file-pane"
         )
         yield Footer()
     
@@ -1278,31 +1410,53 @@ class RalphTUI(App):
         progress_pane = self.query_one("#progress-pane", ProgressPane)
         progress_pane.update_progress(run_info, stats, total_cost)
 
+        # Get LogPane for system logging
+        try:
+            log_pane = self.query_one("#log-pane", LogPane)
+        except Exception:
+            log_pane = None
+
         # Task completion notifications
         if self._last_run_id != run_id:
             # New run detected, reset tracking
             self._last_run_id = run_id
             self._last_task_stats = {}
-        
+
+            # Log new run to LogPane
+            if log_pane:
+                log_pane.write_log(f"New swarm run started: {run_id[:12]}...", "info")
+
         # We need to fetch tasks to check for status changes
         current_tasks = self.db_reader.get_run_tasks(run_id)
         chat_pane = self.query_one("#chat-pane", ChatPane)
-        
+
         for task in current_tasks:
             t_id = str(task.get("id"))
             t_status = task.get("status")
             t_text = task.get("task_text", "")
-            
+            worker_id = task.get("worker_id", "")
+            error_msg = task.get("error_message", "")
+
             # If we've seen this task before and status changed
             if t_id in self._last_task_stats:
                 old_status = self._last_task_stats[t_id]
                 if old_status != t_status:
-                    if t_status == "completed":
-                        chat_pane.log_message(f"[green]Task Completed:[/green] {t_text[:60]}...", "system")
-                    elif t_status == "failed":
-                        err = task.get("error_message", "Unknown error")
-                        chat_pane.log_message(f"[red]Task Failed:[/red] {t_text[:60]}... ({err})", "error")
-            
+                    # Log to LogPane with flair
+                    if log_pane:
+                        worker_tag = f"W{worker_id}" if worker_id else ""
+
+                        if t_status == "completed":
+                            log_pane.log_completed(worker_tag, t_text)
+                            chat_pane.log_message(f"[green]Task Completed:[/green] {t_text[:60]}...", "system")
+                        elif t_status == "failed":
+                            log_pane.log_failed(worker_tag, t_text, error_msg or "Unknown error")
+                            chat_pane.log_message(f"[red]Task Failed:[/red] {t_text[:60]}... ({error_msg})", "error")
+                        elif t_status == "in_progress" and old_status == "pending":
+                            log_pane.log_task_start(worker_tag, t_text)
+                        elif old_status == "in_progress" and t_status == "pending":
+                            # Task was interrupted
+                            log_pane.write_log(f"Task interrupted: {t_text[:50]}...", "warning", worker_tag)
+
             # Update tracked status
             self._last_task_stats[t_id] = str(t_status)
     
@@ -1341,6 +1495,9 @@ class RalphTUI(App):
             "/focus ",
             "/status",
             "/stop",
+            "/emergency-stop",
+            "/system",
+            "/resume",
             "/logs",
         ]
 
@@ -1358,7 +1515,7 @@ class RalphTUI(App):
         if prefix.startswith("/swarm "):
             base = "/swarm "
             rest = prefix[len(base):]
-            sub = ["start", "status", "stop", "logs", "inspect", "cleanup", "reiterate"]
+            sub = ["start", "status", "stop", "logs", "inspect", "cleanup", "reiterate", "resume"]
             return [base + s + (" " if s in {"logs", "reiterate"} else "") for s in sub if (s + " ").startswith(rest) or s.startswith(rest)]
 
         return [c for c in commands if c.startswith(prefix)]
@@ -1438,7 +1595,16 @@ class RalphTUI(App):
         
         elif cmd == "/stop":
             self.stop_ralph(chat_pane)
-        
+
+        elif cmd == "/emergency-stop":
+            self.emergency_stop_swarm(chat_pane)
+
+        elif cmd == "/system":
+            self.show_system_stats(chat_pane)
+
+        elif cmd == "/resume":
+            self.resume_run(args, chat_pane)
+
         elif cmd == "/logs":
             self.show_logs(chat_pane)
         
@@ -1458,10 +1624,13 @@ class RalphTUI(App):
 [bold cyan]Ralph Operations:[/bold cyan]
   /devplan [file] Run Ralph in devplan mode
   /mode <name>    Switch chat mode (orchestrator|ralph)
-  /swarm ...      Swarm control (start/status/logs/stop/reiterate)
+  /swarm ...      Swarm control (start/status/logs/stop/reiterate/resume)
   /reiterate N    Force worker N to re-queue current task
+  /resume RUN_ID  Resume a previous swarm run
   /status         Show current status
   /stop           Stop current Ralph run
+  /emergency-stop Kill all swarm workers immediately (DANGER)
+  /system         Show system-wide swarm statistics
   /logs           Show recent logs
   /report [RUN_ID] Export swarm run report to markdown
   /cancel         Cancel a pending selection prompt
@@ -1586,6 +1755,64 @@ class RalphTUI(App):
             else:
                 devplan_path = raw
 
+        # Validate worker count against limits
+        try:
+            workers_int = int(worker_count)
+            if workers_int < 1:
+                chat_pane.log_message("Worker count must be at least 1", "error")
+                return
+            # Check against configured maximum
+            max_workers = 8  # Default from ralph.config
+            config_path = RALPH_DIR / "ralph.config"
+            try:
+                if config_path.exists():
+                    for line in config_path.read_text().splitlines():
+                        if line.startswith("SWARM_MAX_WORKERS="):
+                            max_workers = int(line.split("=", 1)[1].strip())
+                            break
+            except Exception:
+                pass
+
+            if workers_int > max_workers:
+                chat_pane.log_message(f"Worker count {workers_int} exceeds maximum allowed ({max_workers})", "error")
+                chat_pane.log_message(f"Set SWARM_MAX_WORKERS in {RALPH_DIR}/ralph.config to increase this limit", "system")
+                return
+
+            # Check total system workers
+            try:
+                db_path = SWARM_DB
+                if db_path.exists():
+                    import sqlite3
+                    conn = sqlite3.connect(str(db_path), timeout=1.0)
+                    cursor = conn.execute(
+                        "SELECT COUNT(*) FROM worker_registry WHERE last_heartbeat >= datetime('now', '-60 seconds')"
+                    )
+                    active_workers = cursor.fetchone()[0]
+                    conn.close()
+
+                    max_total = 16  # Default
+                    try:
+                        for line in config_path.read_text().splitlines():
+                            if line.startswith("SWARM_MAX_TOTAL_WORKERS="):
+                                max_total = int(line.split("=", 1)[1].strip())
+                                break
+                    except Exception:
+                        pass
+
+                    if active_workers + workers_int > max_total:
+                        chat_pane.log_message(
+                            f"Cannot spawn {workers_int} workers: would exceed system limit of {max_total} "
+                            f"(currently {active_workers} active)",
+                            "error"
+                        )
+                        return
+            except Exception as e:
+                chat_pane.log_message(f"Warning: Could not check system limits: {e}", "system")
+
+        except ValueError:
+            chat_pane.log_message("Invalid worker count", "error")
+            return
+
         if not devplan_path:
             self._prompt_for_swarm_devplan(worker_count, chat_pane)
             return
@@ -1597,6 +1824,7 @@ class RalphTUI(App):
             return
 
         chat_pane.log_message(f"Running swarm mode: {devplan}", "system")
+        chat_pane.log_message(f"Workers: {worker_count} (max per-run: {max_workers})", "system")
         
         # Set up environment
         env = os.environ.copy()
@@ -1720,6 +1948,15 @@ class RalphTUI(App):
         self.process_names[pid] = name
         self.active_process_id = pid
         chat_pane.log_message(f"Started {name} (PID: {pid})", "system")
+
+        # Also log to LogPane
+        try:
+            log_pane = self.query_one("#log-pane", LogPane)
+            short_cmd = " ".join(cmd[:3]) + (" ..." if len(cmd) > 3 else "")
+            log_pane.write_log(f"[{name}] PID:{pid} - {short_cmd}", "info")
+        except Exception:
+            pass
+
         asyncio.create_task(self.read_named_process_output(pid, chat_pane))
         return pid
 
@@ -1767,6 +2004,17 @@ class RalphTUI(App):
             rc = proc.poll()
             if rc is not None:
                 chat_pane.log_message(f"{name} exited with code {rc}", "system")
+
+                # Also log to LogPane
+                try:
+                    log_pane = self.query_one("#log-pane", LogPane)
+                    if rc == 0:
+                        log_pane.write_log(f"[{name}] Exit: 0 (success)", "success")
+                    else:
+                        log_pane.write_log(f"[{name}] Exit: {rc} (failed)", "error")
+                except Exception:
+                    pass
+
             with suppress(Exception):
                 self.processes.pop(pid, None)
                 self.process_names.pop(pid, None)
@@ -1955,8 +2203,17 @@ class RalphTUI(App):
                 cmd.extend(rest.split())
             self.spawn_process("swarm-reiterate", cmd, cwd, env, chat_pane)
             return
+        if op == "resume":
+            # /swarm resume RUN_ID
+            run_id = rest.strip()
+            if not run_id:
+                chat_pane.log_message("Usage: /swarm resume <RUN_ID>", "error")
+                return
+            cmd = [str(ralph_swarm), "--resume", run_id]
+            self.spawn_process("swarm-resume", cmd, cwd, env, chat_pane)
+            return
 
-        chat_pane.log_message("Usage: /swarm start|status|logs|stop|inspect|cleanup|reiterate", "error")
+        chat_pane.log_message("Usage: /swarm start|status|logs|stop|inspect|cleanup|reiterate|resume", "error")
 
     def force_reiterate(self, args: str, chat_pane: ChatPane) -> None:
         # /reiterate N [RUN_ID]
@@ -1979,6 +2236,45 @@ class RalphTUI(App):
             cmd.append(run_id)
         cmd.extend(["--worker", worker])
         self.spawn_process("swarm-reiterate", cmd, self.project_manager.current_project, env, chat_pane)
+
+    def resume_run(self, args: str, chat_pane: ChatPane) -> None:
+        """Resume a previous swarm run."""
+        run_id = args.strip()
+        if not run_id:
+            chat_pane.log_message("Usage: /resume <RUN_ID>", "error")
+            chat_pane.log_message("Use /system to see available runs", "system")
+            return
+
+        ralph_swarm = RALPH_REFACTOR_DIR / "ralph-swarm"
+        if not self.project_manager.current_project:
+            chat_pane.log_message("No project open. Use /new or /open first.", "error")
+            return
+
+        # Verify the run exists
+        run_info = self.db_reader.get_run_info(run_id)
+        if not run_info:
+            chat_pane.log_message(f"Run not found: {run_id}", "error")
+            return
+
+        status = run_info.get("status", "unknown")
+        source_path = run_info.get("source_path", "")
+
+        chat_pane.log_message(f"Resuming run: {run_id}", "system")
+        chat_pane.log_message(f"  Status: {status}", "system")
+        chat_pane.log_message(f"  Devplan: {source_path}", "system")
+
+        if status == "completed":
+            chat_pane.log_message("This run is already completed. Use /swarm start to start a new run.", "warning")
+            return
+
+        env = os.environ.copy()
+        env["RALPH_DIR"] = str(RALPH_DIR)
+        env["RALPH_LLM_PROVIDER"] = self.config.swarm_provider
+        env["RALPH_LLM_MODEL"] = self.config.swarm_model
+        env["SWARM_COLLECT_ARTIFACTS"] = "true" if self.config.swarm_collect_artifacts else "false"
+
+        cmd = [str(ralph_swarm), "--resume", run_id]
+        self.spawn_process(f"swarm-resume({run_id[:8]})", cmd, self.project_manager.current_project, env, chat_pane)
 
     def export_run_report(self, args: str, chat_pane: ChatPane) -> None:
         if not self.project_manager.current_project:
@@ -2196,6 +2492,98 @@ class RalphTUI(App):
                 chat_pane.log_message("Ralph killed.", "system")
         else:
             chat_pane.log_message("No Ralph process running.", "system")
+
+    def emergency_stop_swarm(self, chat_pane: ChatPane) -> None:
+        """Emergency stop - kill all swarm workers immediately."""
+        chat_pane.log_message("[bold red]EMERGENCY STOP[/bold red] - Killing all swarm workers...", "error")
+
+        # Kill all managed processes
+        killed_count = 0
+        for pid_str, proc in list(self.processes.items()):
+            try:
+                if proc.poll() is None:
+                    proc.kill()
+                    killed_count += 1
+                    chat_pane.log_message(f"Killed process {pid_str} ({self.process_names.get(pid_str, 'unknown')})", "error")
+            except Exception:
+                pass
+
+        # Also try to kill via ralph-swarm emergency-stop
+        try:
+            ralph_swarm = RALPH_REFACTOR_DIR / "ralph-swarm"
+            if ralph_swarm.exists():
+                result = subprocess.run(
+                    [str(ralph_swarm), "--emergency-stop"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                if result.returncode == 0:
+                    chat_pane.log_message("ran ralph-swarm --emergency-stop", "system")
+        except Exception as e:
+            chat_pane.log_message(f"Could not run emergency-stop: {e}", "error")
+
+        # Clear process tracking
+        self.processes.clear()
+        self.process_names.clear()
+        self.active_process_id = None
+
+        chat_pane.log_message(f"Emergency stop complete. Killed {killed_count} processes.", "system")
+
+    def show_system_stats(self, chat_pane: ChatPane) -> None:
+        """Show system-wide swarm statistics."""
+        try:
+            db_path = SWARM_DB
+            if not db_path.exists():
+                chat_pane.log_message("No swarm database found.", "system")
+                return
+
+            import sqlite3
+            conn = sqlite3.connect(str(db_path), timeout=1.0)
+
+            # Get active workers
+            cursor = conn.execute(
+                "SELECT COUNT(*) FROM worker_registry WHERE last_heartbeat >= datetime('now', '-60 seconds')"
+            )
+            active_workers = cursor.fetchone()[0]
+
+            # Get running runs
+            cursor = conn.execute("SELECT COUNT(*) FROM swarm_runs WHERE status = 'running'")
+            running_runs = cursor.fetchone()[0]
+
+            # Get pending tasks
+            cursor = conn.execute("SELECT COUNT(*) FROM tasks WHERE status = 'pending'")
+            pending_tasks = cursor.fetchone()[0]
+
+            # Get active tasks
+            cursor = conn.execute("SELECT COUNT(*) FROM tasks WHERE status = 'in_progress'")
+            active_tasks = cursor.fetchone()[0]
+
+            conn.close()
+
+            # Read limits from config
+            max_workers = 8
+            max_total = 16
+            config_path = RALPH_DIR / "ralph.config"
+            if config_path.exists():
+                for line in config_path.read_text().splitlines():
+                    if line.startswith("SWARM_MAX_WORKERS="):
+                        max_workers = int(line.split("=", 1)[1].strip())
+                    elif line.startswith("SWARM_MAX_TOTAL_WORKERS="):
+                        max_total = int(line.split("=", 1)[1].strip())
+
+            stats_msg = f"""[bold]System Statistics:[/bold]
+[cyan]Active Workers:[/cyan] {active_workers} / {max_total} (system limit)
+[cyan]Running Runs:[/cyan] {running_runs}
+[cyan]Pending Tasks:[/cyan] {pending_tasks}
+[cyan]Active Tasks:[/cyan] {active_tasks}
+[cyan]Max Workers/Run:[/cyan] {max_workers}
+[cyan]Max Total Workers:[/cyan] {max_total}"""
+
+            chat_pane.log_message(stats_msg, "system")
+
+        except Exception as e:
+            chat_pane.log_message(f"Error getting system stats: {e}", "error")
     
     def show_logs(self, chat_pane: ChatPane) -> None:
         """Show recent logs."""

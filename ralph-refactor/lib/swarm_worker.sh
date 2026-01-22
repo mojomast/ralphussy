@@ -1,5 +1,36 @@
 #!/usr/bin/env bash
 
+swarm_worker_apply_limits() {
+    local max_procs="${SWARM_MAX_PROCESSES_PER_WORKER:-50}"
+    local max_memory_mb="${SWARM_MAX_MEMORY_MB:-1024}"
+    local max_cpu_seconds="${SWARM_MAX_CPU_SECONDS:-3600}"
+
+    # Apply process limit (max processes per user)
+    if [ "$max_procs" -gt 0 ] 2>/dev/null; then
+        ulimit -u "$max_procs" 2>/dev/null || true
+    fi
+
+    # Apply memory limit (in kilobytes)
+    if [ "$max_memory_mb" -gt 0 ] 2>/dev/null; then
+        local max_memory_kb=$((max_memory_mb * 1024))
+        ulimit -v "$max_memory_kb" 2>/dev/null || true
+        ulimit -m "$max_memory_kb" 2>/dev/null || true
+    fi
+
+    # Apply CPU time limit (in seconds)
+    if [ "$max_cpu_seconds" -gt 0 ] 2>/dev/null; then
+        ulimit -t "$max_cpu_seconds" 2>/dev/null || true
+    fi
+
+    # Apply file descriptor limit
+    ulimit -n 1024 2>/dev/null || true
+
+    # Apply core dump size limit (disable core dumps for security)
+    ulimit -c 0 2>/dev/null || true
+
+    echo "[$(date)] Resource limits applied: procs=$max_procs, memory=${max_memory_mb}MB, cpu=${max_cpu_seconds}s"
+}
+
 swarm_worker_create_isolated_devplan() {
     local run_id="$1"
     local worker_num="$2"
@@ -45,6 +76,19 @@ swarm_worker_spawn() {
     if [ -z "$repo_root" ]; then
         repo_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
     fi
+    # If no git repo found, initialize one in current dir if .git doesn't exist
+    if [ -z "$repo_root" ]; then
+        if [ ! -d ".git" ]; then
+             echo "Initializing new git repository for swarm..."
+             git init >/dev/null
+             git add . >/dev/null 2>&1 || true
+             git commit -m "Initial commit by swarm" >/dev/null 2>&1 || true
+             repo_root=$(pwd)
+        else
+             repo_root=$(pwd)
+        fi
+    fi
+    
     if [ -z "$repo_root" ]; then
         echo "Error: swarm workers must run inside a git repository" 1>&2
         return 1
@@ -76,6 +120,9 @@ swarm_worker_spawn() {
     (
         cd "$repo_dir" || exit 1
 
+        # Apply resource limits first
+        swarm_worker_apply_limits
+
         echo "[$(date)] Worker $worker_num started (PID: $$, ID: $worker_id)"
         echo "[$(date)] Run ID: $run_id"
         echo "[$(date)] Worker directory: $worker_dir"
@@ -98,6 +145,11 @@ swarm_worker_spawn() {
     swarm_db_update_worker_pid "$worker_id" "$worker_pid" 2>/dev/null || true
     swarm_db_worker_heartbeat "$worker_id"
 
+    # Register in global worker registry
+    if command -v swarm_db_register_worker_global >/dev/null 2>&1; then
+        swarm_db_register_worker_global "$worker_id" "$run_id" "$worker_num" "$worker_pid" >/dev/null || true
+    fi
+
     echo "Worker $worker_num spawned successfully (PID: $worker_pid, ID: $worker_id)"
     echo "$worker_id"
 }
@@ -116,6 +168,10 @@ swarm_worker_main_loop() {
 
         if [ -z "$current_task" ]; then
             sleep 2
+            # Update global heartbeat periodically
+            if command -v swarm_db_heartbeat_worker_global >/dev/null 2>&1; then
+                swarm_db_heartbeat_worker_global "$worker_id" >/dev/null 2>&1 || true
+            fi
             continue
         fi
 
@@ -130,6 +186,11 @@ swarm_worker_main_loop() {
 
         swarm_db_worker_heartbeat "$worker_id"
 
+        # Update global heartbeat before task execution
+        if command -v swarm_db_heartbeat_worker_global >/dev/null 2>&1; then
+            swarm_db_heartbeat_worker_global "$worker_id" >/dev/null 2>&1 || true
+        fi
+
         if swarm_worker_execute_task "$run_id" "$worker_num" "$task_id" "$task_text" "$estimated_files" "$devplan_line" "$devplan_path" "$ralph_path" "$log_file"; then
             swarm_db_complete_task "$task_id" "$estimated_files" "$worker_id"
             echo "[$(date)] Task $task_id completed successfully"
@@ -140,6 +201,11 @@ swarm_worker_main_loop() {
         fi
 
         swarm_db_worker_heartbeat "$worker_id"
+
+        # Update global heartbeat after task completion
+        if command -v swarm_db_heartbeat_worker_global >/dev/null 2>&1; then
+            swarm_db_heartbeat_worker_global "$worker_id" >/dev/null 2>&1 || true
+        fi
     done
 }
 
@@ -187,11 +253,21 @@ EOF
     echo "[$(date)] Running OpenCode for task $task_id"
 
     local opencode_cmd="opencode run"
-    if [ -n "${RALPH_LLM_PROVIDER:-}" ]; then
-        opencode_cmd="$opencode_cmd --provider ${RALPH_LLM_PROVIDER}"
-    fi
+    local full_model=""
+
+    # Construct model argument in "provider/model" format if needed
     if [ -n "${RALPH_LLM_MODEL:-}" ]; then
-        opencode_cmd="$opencode_cmd --model ${RALPH_LLM_MODEL}"
+        if [[ "${RALPH_LLM_MODEL}" == *"/"* ]]; then
+            full_model="${RALPH_LLM_MODEL}"
+        elif [ -n "${RALPH_LLM_PROVIDER:-}" ]; then
+            full_model="${RALPH_LLM_PROVIDER}/${RALPH_LLM_MODEL}"
+        else
+            full_model="${RALPH_LLM_MODEL}"
+        fi
+    fi
+
+    if [ -n "$full_model" ]; then
+        opencode_cmd="$opencode_cmd --model $full_model"
     fi
 
     local json_output
@@ -271,6 +347,14 @@ swarm_worker_cleanup() {
     local worker_num="$2"
 
     echo "[$(date)] Cleaning up worker $worker_num for run $run_id"
+
+    local worker_id
+    worker_id=$(sqlite3 "$RALPH_DIR/swarm.db" "SELECT id FROM workers WHERE run_id = '$run_id' AND worker_num = $worker_num ORDER BY id DESC LIMIT 1;" 2>/dev/null || true)
+
+    # Unregister from global registry
+    if [ -n "$worker_id" ] && command -v swarm_db_unregister_worker >/dev/null 2>&1; then
+        swarm_db_unregister_worker "$worker_id" >/dev/null 2>&1 || true
+    fi
 
     local worker_dir="$RALPH_DIR/swarm/runs/$run_id/worker-$worker_num"
     if [ -d "$worker_dir" ]; then

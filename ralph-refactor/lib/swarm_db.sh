@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS swarm_runs (
     status TEXT DEFAULT 'running',
     source_type TEXT,
     source_path TEXT,
+    source_hash TEXT,
     source_prompt TEXT,
     worker_count INTEGER,
     total_tasks INTEGER DEFAULT 0,
@@ -60,6 +61,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     id INTEGER PRIMARY KEY,
     run_id TEXT NOT NULL,
     task_text TEXT NOT NULL,
+    task_hash TEXT,
     status TEXT DEFAULT 'pending',
     worker_id INTEGER,
     priority INTEGER DEFAULT 0,
@@ -119,9 +121,54 @@ CREATE TABLE IF NOT EXISTS workers (
      FOREIGN KEY (task_id) REFERENCES tasks(id)
  );
 
- CREATE INDEX IF NOT EXISTS idx_task_costs_run_id ON task_costs(run_id);
- CREATE INDEX IF NOT EXISTS idx_task_costs_task_id ON task_costs(task_id);
+  CREATE INDEX IF NOT EXISTS idx_task_costs_run_id ON task_costs(run_id);
+  CREATE INDEX IF NOT EXISTS idx_task_costs_task_id ON task_costs(task_id);
+
+  -- System configuration table for swarm limits
+  CREATE TABLE IF NOT EXISTS swarm_config (
+      key TEXT PRIMARY KEY,
+      value TEXT,
+      updated_at TEXT
+  );
+
+  -- Worker registry for tracking all active workers system-wide
+  CREATE TABLE IF NOT EXISTS worker_registry (
+      id INTEGER PRIMARY KEY,
+      worker_id INTEGER NOT NULL,
+      run_id TEXT NOT NULL,
+      worker_num INTEGER NOT NULL,
+      pid INTEGER NOT NULL,
+      started_at TEXT,
+      last_heartbeat TEXT,
+      FOREIGN KEY (worker_id) REFERENCES workers(id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_worker_registry_pid ON worker_registry(pid);
+  CREATE INDEX IF NOT EXISTS idx_worker_registry_run_id ON worker_registry(run_id);
+  CREATE INDEX IF NOT EXISTS idx_worker_registry_active ON worker_registry(last_heartbeat);
+
+  -- Completed tasks tracking for cross-run resume functionality
+  -- Stores hashes of tasks that have been successfully completed
+  CREATE TABLE IF NOT EXISTS completed_tasks (
+      id INTEGER PRIMARY KEY,
+      task_hash TEXT UNIQUE NOT NULL,
+      task_text TEXT,
+      source_hash TEXT,
+      completed_at TEXT,
+      run_id TEXT
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_completed_tasks_hash ON completed_tasks(task_hash);
+  CREATE INDEX IF NOT EXISTS idx_completed_tasks_source ON completed_tasks(source_hash);
  EOF
+
+    # Set default configuration values
+    sqlite3 "$db_path" "INSERT OR IGNORE INTO swarm_config (key, value, updated_at) VALUES ('swarm_max_workers', '${SWARM_MAX_WORKERS:-8}', datetime('now'));"
+    sqlite3 "$db_path" "INSERT OR IGNORE INTO swarm_config (key, value, updated_at) VALUES ('swarm_spawn_delay', '${SWARM_SPAWN_DELAY:-1}', datetime('now'));"
+    sqlite3 "$db_path" "INSERT OR IGNORE INTO swarm_config (key, value, updated_at) VALUES ('swarm_max_total_workers', '${SWARM_MAX_TOTAL_WORKERS:-16}', datetime('now'));"
+    sqlite3 "$db_path" "INSERT OR IGNORE INTO swarm_config (key, value, updated_at) VALUES ('swarm_max_processes_per_worker', '${SWARM_MAX_PROCESSES_PER_WORKER:-50}', datetime('now'));"
+    sqlite3 "$db_path" "INSERT OR IGNORE INTO swarm_config (key, value, updated_at) VALUES ('swarm_max_memory_mb', '${SWARM_MAX_MEMORY_MB:-1024}', datetime('now'));"
+    sqlite3 "$db_path" "INSERT OR IGNORE INTO swarm_config (key, value, updated_at) VALUES ('swarm_max_cpu_seconds', '${SWARM_MAX_CPU_SECONDS:-3600}', datetime('now'));"
 
     echo "Database initialized at: $db_path"
 }
@@ -206,18 +253,19 @@ swarm_db_start_run() {
     local db_path="$RALPH_DIR/swarm.db"
     local source_type="$1"
     local source_path="$2"
-    local source_prompt="$3"
-    local worker_count="$4"
+    local source_hash="$3"
+    local source_prompt="$4"
+    local worker_count="$5"
 
     local run_id
     run_id=$(date +%Y%m%d_%H%M%S)
 
     sqlite3 "$db_path" <<EOF
 INSERT INTO swarm_runs (
-    run_id, status, source_type, source_path, source_prompt,
+    run_id, status, source_type, source_path, source_hash, source_prompt,
     worker_count, total_tasks, started_at
 ) VALUES (
-    '$run_id', 'running', '$source_type', '$source_path', '$source_prompt',
+    '$run_id', 'running', '$source_type', '$source_path', '$source_hash', '$source_prompt',
     $worker_count, 0, datetime('now')
 );
 EOF
@@ -316,18 +364,32 @@ swarm_db_complete_task() {
     local actual_files="$2"
     local worker_id="$3"
 
+    # Get task info before marking complete
+    local task_text task_hash run_id source_hash
+    task_text=$(sqlite3 "$db_path" "SELECT task_text FROM tasks WHERE id = $task_id;")
+    run_id=$(sqlite3 "$db_path" "SELECT run_id FROM tasks WHERE id = $task_id;")
+    source_hash=$(sqlite3 "$db_path" "SELECT source_hash FROM swarm_runs WHERE run_id = '$run_id';")
+
+    # Generate task hash for deduplication
+    task_hash=$(printf '%s' "$task_text" | sha256sum | cut -d' ' -f1)
+
     sqlite3 "$db_path" <<EOF
 BEGIN TRANSACTION;
 
 UPDATE tasks
 SET status = 'completed',
     completed_at = datetime('now'),
-    actual_files = '$actual_files'
+    actual_files = '$actual_files',
+    task_hash = '$task_hash'
 WHERE id = $task_id AND worker_id = $worker_id;
 
 UPDATE swarm_runs
 SET completed_tasks = completed_tasks + 1
 WHERE run_id = (SELECT run_id FROM tasks WHERE id = $task_id);
+
+-- Record in completed_tasks table for cross-run resume
+INSERT OR IGNORE INTO completed_tasks (task_hash, task_text, source_hash, completed_at, run_id)
+VALUES ('$task_hash', '$task_text', '$source_hash', datetime('now'), '$run_id');
 
 COMMIT;
 EOF
@@ -662,5 +724,312 @@ SELECT status, COUNT(*) as count
 FROM tasks
 WHERE run_id = '$run_id'
 GROUP BY status;
+EOF
+}
+
+swarm_db_get_config() {
+    local db_path="$RALPH_DIR/swarm.db"
+    local key="$1"
+
+    sqlite3 "$db_path" "SELECT value FROM swarm_config WHERE key = '$key';" 2>/dev/null || echo ""
+}
+
+swarm_db_set_config() {
+    local db_path="$RALPH_DIR/swarm.db"
+    local key="$1"
+    local value="$2"
+
+    sqlite3 "$db_path" "UPDATE swarm_config SET value = '$value', updated_at = datetime('now') WHERE key = '$key';"
+}
+
+swarm_db_register_worker_global() {
+    local db_path="$RALPH_DIR/swarm.db"
+    local worker_id="$1"
+    local run_id="$2"
+    local worker_num="$3"
+    local pid="$4"
+
+    local registry_id
+    registry_id=$(sqlite3 "$db_path" <<EOF
+INSERT INTO worker_registry (
+    worker_id, run_id, worker_num, pid, started_at, last_heartbeat
+) VALUES (
+    $worker_id, '$run_id', $worker_num, $pid, datetime('now'), datetime('now')
+);
+SELECT last_insert_rowid();
+EOF
+)
+
+    echo "$registry_id"
+}
+
+swarm_db_unregister_worker() {
+    local db_path="$RALPH_DIR/swarm.db"
+    local worker_id="$1"
+
+    sqlite3 "$db_path" "DELETE FROM worker_registry WHERE worker_id = $worker_id;"
+}
+
+swarm_db_get_active_worker_count() {
+    local db_path="$RALPH_DIR/swarm.db"
+
+    local count
+    count=$(sqlite3 "$db_path" <<EOF
+SELECT COUNT(*) FROM worker_registry
+WHERE last_heartbeat >= datetime('now', '-60 seconds');
+EOF
+)
+
+    echo "${count:-0}"
+}
+
+swarm_db_get_all_active_workers() {
+    local db_path="$RALPH_DIR/swarm.db"
+
+    sqlite3 "$db_path" <<EOF
+SELECT wr.*, w.status as worker_status
+FROM worker_registry wr
+JOIN workers w ON wr.worker_id = w.id
+WHERE wr.last_heartbeat >= datetime('now', '-60 seconds')
+ORDER BY wr.started_at;
+EOF
+}
+
+swarm_db_heartbeat_worker_global() {
+    local db_path="$RALPH_DIR/swarm.db"
+    local worker_id="$1"
+
+    sqlite3 "$db_path" "UPDATE worker_registry SET last_heartbeat = datetime('now') WHERE worker_id = $worker_id;"
+}
+
+swarm_db_cleanup_stale_registry_entries() {
+    local db_path="$RALPH_DIR/swarm.db"
+    local threshold_seconds="${1:-120}"
+
+    # Find stale entries (no heartbeat for threshold_seconds)
+    local stale_entries
+    stale_entries=$(sqlite3 "$db_path" <<EOF
+SELECT id, worker_id FROM worker_registry
+WHERE last_heartbeat < datetime('now', '-$threshold_seconds seconds');
+EOF
+)
+
+    if [ -z "$stale_entries" ] || [ "$stale_entries" = "" ]; then
+        return 0
+    fi
+
+    local old_ifs="$IFS"
+    IFS='|' read -ra entries <<< "$stale_entries"
+    IFS="$old_ifs"
+
+    for entry in "${entries[@]}"; do
+        local entry_id worker_id
+        entry_id=$(echo "$entry" | cut -d'|' -f1)
+        worker_id=$(echo "$entry" | cut -d'|' -f2)
+
+        if [ -n "$entry_id" ]; then
+            echo "Removing stale worker registry entry: $entry_id (worker $worker_id)"
+            sqlite3 "$db_path" "DELETE FROM worker_registry WHERE id = $entry_id;"
+        fi
+    done
+}
+
+swarm_db_get_system_stats() {
+    local db_path="$RALPH_DIR/swarm.db"
+
+    sqlite3 "$db_path" <<EOF
+SELECT
+    (SELECT COUNT(*) FROM worker_registry WHERE last_heartbeat >= datetime('now', '-60 seconds')) as active_workers,
+    (SELECT COUNT(*) FROM swarm_runs WHERE status = 'running') as running_runs,
+    (SELECT COUNT(*) FROM tasks WHERE status = 'pending') as pending_tasks,
+    (SELECT COUNT(*) FROM tasks WHERE status = 'in_progress') as active_tasks;
+EOF
+}
+
+swarm_db_get_source_hash() {
+    local db_path="$RALPH_DIR/swarm.db"
+    local devplan_path="$1"
+
+    if [ -f "$devplan_path" ]; then
+        sha256sum "$devplan_path" 2>/dev/null | cut -d' ' -f1 || echo ""
+    else
+        echo ""
+    fi
+}
+
+swarm_db_find_existing_run() {
+    local db_path="$RALPH_DIR/swarm.db"
+    local source_hash="$1"
+
+    if [ -z "$source_hash" ]; then
+        echo ""
+        return 1
+    fi
+
+    sqlite3 "$db_path" "SELECT run_id FROM swarm_runs WHERE source_hash = '$source_hash' AND status = 'running' ORDER BY id DESC LIMIT 1;"
+}
+
+swarm_db_get_run_by_source() {
+    local db_path="$RALPH_DIR/swarm.db"
+    local source_hash="$1"
+
+    if [ -z "$source_hash" ]; then
+        echo ""
+        return 1
+    fi
+
+    sqlite3 "$db_path" "SELECT run_id, status, completed_tasks, total_tasks FROM swarm_runs WHERE source_hash = '$source_hash' ORDER BY id DESC LIMIT 1;"
+}
+
+swarm_db_is_task_completed() {
+    local db_path="$RALPH_DIR/swarm.db"
+    local task_hash="$1"
+
+    if [ -z "$task_hash" ]; then
+        echo "no"
+        return 1
+    fi
+
+    local result
+    result=$(sqlite3 "$db_path" "SELECT 1 FROM completed_tasks WHERE task_hash = '$task_hash' LIMIT 1;")
+
+    if [ -n "$result" ]; then
+        echo "yes"
+    else
+        echo "no"
+    fi
+}
+
+swarm_db_get_completed_task_hashes() {
+    local db_path="$RALPH_DIR/swarm.db"
+    local source_hash="$1"
+
+    if [ -z "$source_hash" ]; then
+        sqlite3 "$db_path" "SELECT task_hash FROM completed_tasks;"
+    else
+        sqlite3 "$db_path" "SELECT task_hash FROM completed_tasks WHERE source_hash = '$source_hash';"
+    fi
+}
+
+swarm_db_get_incomplete_tasks() {
+    local db_path="$RALPH_DIR/swarm.db"
+    local run_id="$1"
+
+    sqlite3 "$db_path" <<EOF
+SELECT id, task_text, priority, estimated_files, devplan_line
+FROM tasks
+WHERE run_id = '$run_id' AND status IN ('pending', 'in_progress')
+ORDER BY priority ASC, id ASC;
+EOF
+}
+
+swarm_db_get_completed_task_count_for_source() {
+    local db_path="$RALPH_DIR/swarm.db"
+    local source_hash="$1"
+
+    if [ -z "$source_hash" ]; then
+        echo "0"
+        return 1
+    fi
+
+    local count
+    count=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM completed_tasks WHERE source_hash = '$source_hash';")
+    echo "${count:-0}"
+}
+
+swarm_db_get_total_tasks_for_source() {
+    local db_path="$RALPH_DIR/swarm.db"
+    local source_hash="$1"
+
+    if [ -z "$source_hash" ]; then
+        echo "0"
+        return 1
+    fi
+
+    local count
+    count=$(sqlite3 "$db_path" "SELECT total_tasks FROM swarm_runs WHERE source_hash = '$source_hash' ORDER BY id DESC LIMIT 1;")
+    echo "${count:-0}"
+}
+
+swarm_db_get_latest_run_for_source() {
+    local db_path="$RALPH_DIR/swarm.db"
+    local source_hash="$1"
+
+    if [ -z "$source_hash" ]; then
+        echo ""
+        return 1
+    fi
+
+    sqlite3 "$db_path" "SELECT run_id FROM swarm_runs WHERE source_hash = '$source_hash' ORDER BY id DESC LIMIT 1;"
+}
+
+swarm_db_resume_run() {
+    local db_path="$RALPH_DIR/swarm.db"
+    local run_id="$1"
+
+    # Check if run exists and is running
+    local status
+    status=$(sqlite3 "$db_path" "SELECT status FROM swarm_runs WHERE run_id = '$run_id';")
+
+    if [ -z "$status" ]; then
+        echo "Run not found: $run_id"
+        return 1
+    fi
+
+    if [ "$status" = "completed" ]; then
+        echo "Run already completed: $run_id"
+        return 1
+    fi
+
+    # Check for pending tasks
+    local pending
+    pending=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM tasks WHERE run_id = '$run_id' AND status = 'pending';")
+
+    if [ "$pending" = "0" ]; then
+        local in_progress
+        in_progress=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM tasks WHERE run_id = '$run_id' AND status = 'in_progress';")
+        if [ "$in_progress" = "0" ]; then
+            echo "Run has no remaining tasks: $run_id"
+            return 1
+        fi
+    fi
+
+    # Resume the run by marking it as running again if it was interrupted
+    if [ "$status" = "interrupted" ] || [ "$status" = "running" ]; then
+        sqlite3 "$db_path" "UPDATE swarm_runs SET status = 'running', completed_at = NULL WHERE run_id = '$run_id';"
+    fi
+
+    echo "$run_id"
+}
+
+swarm_db_mark_run_interrupted() {
+    local db_path="$RALPH_DIR/swarm.db"
+    local run_id="$1"
+
+    sqlite3 "$db_path" "UPDATE swarm_runs SET status = 'interrupted' WHERE run_id = '$run_id';"
+}
+
+swarm_db_resume_status() {
+    local db_path="$RALPH_DIR/swarm.db"
+    local run_id="$1"
+
+    if [ -z "$run_id" ]; then
+        echo "Error: run_id required"
+        return 1
+    fi
+
+    sqlite3 "$db_path" <<EOF
+SELECT
+    sr.run_id,
+    sr.status,
+    sr.source_path,
+    sr.total_tasks,
+    sr.completed_tasks,
+    sr.failed_tasks,
+    (SELECT COUNT(*) FROM tasks WHERE run_id = '$run_id' AND status = 'pending') as pending,
+    (SELECT COUNT(*) FROM tasks WHERE run_id = '$run_id' AND status = 'in_progress') as in_progress,
+    datetime(sr.started_at) as started_at
+FROM swarm_runs sr
+WHERE sr.run_id = '$run_id';
 EOF
 }

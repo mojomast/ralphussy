@@ -31,9 +31,95 @@ source "$__RALPH_SWARM_DIR__/lib/swarm_display.sh"
 source "$__RALPH_SWARM_DIR__/lib/swarm_artifacts.sh"
 
 # Set default provider/model if not specified.
-# These are only used by the swarm analyzer (which calls `opencode run`).
-RALPH_LLM_PROVIDER="${RALPH_LLM_PROVIDER:-${RALPH_PROVIDER:-opencode}}"
-RALPH_LLM_MODEL="${RALPH_LLM_MODEL:-${RALPH_MODEL:-opencode/claude-sonnet-4-5}}"
+    # These are only used by the swarm analyzer (which calls `opencode run`).
+    RALPH_LLM_PROVIDER="${RALPH_LLM_PROVIDER:-${RALPH_PROVIDER:-}}"
+    RALPH_LLM_MODEL="${RALPH_LLM_MODEL:-${RALPH_MODEL:-}}"
+
+swarm_load_config() {
+    local config_file="$RALPH_DIR/ralph.config"
+
+    if [ -f "$config_file" ]; then
+        while IFS='=' read -r key value; do
+            # Skip comments and empty lines
+            [[ "$key" =~ ^#.*$ ]] && continue
+            [[ -z "$key" ]] && continue
+            [[ -z "$value" ]] && continue
+
+            # Trim whitespace
+            key=$(echo "$key" | tr -d '[:space:]')
+            value=$(echo "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+            # Only set if not already set in environment
+            local env_key="${key}"
+            if [ -z "${!env_key:-}" ]; then
+                export "$key"="$value"
+            fi
+        done < "$config_file"
+    fi
+
+    # Set defaults if not loaded
+    SWARM_MAX_WORKERS="${SWARM_MAX_WORKERS:-8}"
+    SWARM_SPAWN_DELAY="${SWARM_SPAWN_DELAY:-1}"
+    SWARM_MAX_TOTAL_WORKERS="${SWARM_MAX_TOTAL_WORKERS:-16}"
+    SWARM_MAX_PROCESSES_PER_WORKER="${SWARM_MAX_PROCESSES_PER_WORKER:-50}"
+    SWARM_MAX_MEMORY_MB="${SWARM_MAX_MEMORY_MB:-1024}"
+    SWARM_MAX_CPU_SECONDS="${SWARM_MAX_CPU_SECONDS:-3600}"
+}
+
+swarm_check_limits() {
+    local requested_workers="$1"
+    local max_workers="${SWARM_MAX_WORKERS:-8}"
+    local max_total="${SWARM_MAX_TOTAL_WORKERS:-16}"
+
+    # Check per-run limit
+    if [ "$requested_workers" -gt "$max_workers" ]; then
+        echo "ERROR: Requested $requested_workers workers exceeds maximum allowed per run ($max_workers)"
+        echo "Set SWARM_MAX_WORKERS environment variable to increase this limit (not recommended)"
+        return 1
+    fi
+
+    # Check system-wide limit
+    local current_total
+    current_total=$(swarm_db_get_active_worker_count 2>/dev/null || echo "0")
+
+    local potential_total=$((current_total + requested_workers))
+    if [ "$potential_total" -gt "$max_total" ]; then
+        echo "ERROR: Requested $requested_workers workers would exceed system-wide limit of $max_total"
+        echo "Current active workers: $current_total"
+        echo "Set SWARM_MAX_TOTAL_WORKERS environment variable to increase this limit (not recommended)"
+        return 1
+    fi
+
+    echo "Limit check passed: $requested_workers workers (current total: $current_total, max: $max_total)"
+    return 0
+}
+
+swarm_emergency_stop() {
+    echo "EMERGENCY STOP - Killing all swarm workers..."
+
+    # Kill all processes in the process group
+    local pgid=$$
+    if command -v pgrep >/dev/null 2>&1; then
+        # Find all swarm worker processes
+        pgrep -f "swarm_worker" 2>/dev/null | while read -r pid; do
+            echo "Killing worker process: $pid"
+            kill "$pid" 2>/dev/null || true
+        done
+    fi
+
+    # Kill all workers in database
+    swarm_db_get_all_active_workers 2>/dev/null | while IFS='|' read -r id run_id worker_num pid branch_name status current_task_id started_at last_heartbeat worker_status; do
+        [ -z "$pid" ] && continue
+        echo "Killing worker $worker_num (PID: $pid)..."
+        kill "$pid" 2>/dev/null || true
+        kill -9 "$pid" 2>/dev/null || true
+    done
+
+    # Clean up registry
+    swarm_db_cleanup_stale_registry_entries 1 >/dev/null 2>&1 || true
+
+    echo "Emergency stop complete"
+}
 
 swarm_orchestrator_start() {
     local run_id="$1"
@@ -43,12 +129,53 @@ swarm_orchestrator_start() {
     local worker_count="$5"
     local timeout_seconds="${6:-3600}"
     local verbose="${7:-false}"
+    local resume_from="${8:-}"
+
+    # Load configuration
+    swarm_load_config
 
     echo "Starting swarm run..."
     echo "Run ID: $run_id"
     echo "Mode: $mode"
     echo "Workers: $worker_count"
     echo "Timeout: $timeout_seconds seconds"
+
+    # Validate worker count before proceeding
+    if ! swarm_check_limits "$worker_count"; then
+        return 1
+    fi
+
+    # Calculate source hash for devplan mode
+    local source_hash=""
+    if [ "$mode" = "devplan" ] && [ -f "$devplan_path" ]; then
+        source_hash=$(sha256sum "$devplan_path" 2>/dev/null | cut -d' ' -f1)
+        echo "Devplan hash: $source_hash"
+
+        # Check for existing run with same devplan
+        if [ -z "$resume_from" ]; then
+            local existing_run
+            existing_run=$(swarm_db_find_existing_run "$source_hash")
+            if [ -n "$existing_run" ]; then
+                echo ""
+                echo "Found existing run for this devplan: $existing_run"
+                echo "Use --resume $existing_run to continue, or --cleanup to remove old run"
+                swarm_orchestrator_status "$existing_run"
+                return 1
+            fi
+        else
+            # Resume mode - check the run exists
+            local resume_status
+            resume_status=$(swarm_db_resume_status "$resume_from")
+            if [ -z "$resume_status" ]; then
+                echo "Error: Resume run not found: $resume_from"
+                return 1
+            fi
+            echo ""
+            echo "Resuming run: $resume_from"
+            echo "$resume_status"
+            echo ""
+        fi
+    fi
 
     local task_list_file
     task_list_file=$(mktemp)
@@ -98,9 +225,23 @@ PY
     echo "Found $task_count tasks"
 
     local run_id_result
-    run_id_result=$(swarm_db_start_run "$mode" "$devplan_path" "$prompt_text" "$worker_count")
 
-    if [ $? -ne 0 ]; then
+    # If resuming, use the existing run_id
+    if [ -n "$resume_from" ]; then
+        run_id_result="$resume_from"
+        # Resume the run
+        swarm_db_resume_run "$run_id_result" >/dev/null
+
+        # Get completed task hashes to skip
+        local completed_hashes
+        completed_hashes=$(swarm_db_get_completed_task_hashes "$source_hash")
+    else
+        # Start new run with source_hash
+        run_id_result=$(swarm_db_start_run "$mode" "$devplan_path" "$source_hash" "$prompt_text" "$worker_count")
+        completed_hashes=""
+    fi
+
+    if [ $? -ne 0 ] || [ -z "$run_id_result" ]; then
         echo "Error: Failed to start run"
         rm -f "$task_list_file"
         return 1
@@ -130,31 +271,44 @@ for item in data:
         'task_b64': base64.b64encode(task.encode('utf-8')).decode('ascii'),
         'line': line,
         'priority': priority,
+        'task': task,
     }
     sys.stdout.write(json.dumps(payload) + "\n")
 PY
         [ -z "$task_json" ] && continue
 
-        local task_b64 devplan_line priority
+        local task_b64 devplan_line priority task_text task_hash skip_task
         if command -v jq >/dev/null 2>&1; then
             task_b64=$(printf '%s' "$task_json" | jq -r '.task_b64')
             devplan_line=$(printf '%s' "$task_json" | jq -r '.line // "null"')
             priority=$(printf '%s' "$task_json" | jq -r '.priority // empty')
+            task_text=$(printf '%s' "$task_json" | jq -r '.task')
         else
             task_b64=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("task_b64",""))' <<<"$task_json")
             devplan_line=$(python3 -c 'import json,sys; v=json.load(sys.stdin).get("line", None); print("null" if v is None else v)' <<<"$task_json")
             priority=$(python3 -c 'import json,sys; v=json.load(sys.stdin).get("priority", None); print("" if v is None else v)' <<<"$task_json")
+            task_text=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("task",""))' <<<"$task_json")
         fi
-
-        local task_text
-        task_text=$(python3 -c 'import base64,sys; print(base64.b64decode(sys.argv[1]).decode("utf-8", "replace"))' "$task_b64")
 
         if [ -z "$priority" ]; then
             priority="$current_priority"
         fi
 
-        task_id=$(swarm_db_add_task "$run_id_result" "$task_text" "[]" "$devplan_line" "$priority")
-        echo "Added task $task_id: $task_text"
+        # Check if task is already completed (for resume mode)
+        skip_task="no"
+        if [ -n "$completed_hashes" ]; then
+            task_hash=$(printf '%s' "$task_text" | sha256sum | cut -d' ' -f1)
+            if echo "$completed_hashes" | grep -q "$task_hash"; then
+                skip_task="yes"
+            fi
+        fi
+
+        if [ "$skip_task" = "yes" ]; then
+            echo "Skipping already completed task: ${task_text:0:50}..."
+        else
+            task_id=$(swarm_db_add_task "$run_id_result" "$task_text" "[]" "$devplan_line" "$priority")
+            echo "Added task $task_id: $task_text"
+        fi
 
         current_priority=$((current_priority + 1))
     done
@@ -165,8 +319,17 @@ PY
     # Spawn N workers (worker_num=1..N) using the ralph entrypoint.
     # NOTE: swarm_worker_spawn currently expects a single worker number.
     local worker_num
+    local spawn_delay="${SWARM_SPAWN_DELAY:-1}"
+
     for worker_num in $(seq 1 "$worker_count"); do
+        echo "Spawning worker $worker_num of $worker_count..."
         swarm_worker_spawn "$run_id_result" "$worker_num" "main" "$__RALPH_SWARM_DIR__/ralph" "/tmp/swarm.log" >/dev/null
+
+        # Add delay between spawns to prevent resource spikes
+        if [ "$worker_num" -lt "$worker_count" ] && [ "$spawn_delay" -gt 0 ]; then
+            echo "Waiting ${spawn_delay}s before spawning next worker..."
+            sleep "$spawn_delay"
+        fi
     done
 
     if [ $? -ne 0 ]; then
@@ -403,27 +566,35 @@ swarm_usage() {
  ralph-swarm - Parallel task runner for Ralph
 
  USAGE:
-   ralph-refactor/ralph-swarm --devplan PATH [--workers N] [--timeout SECONDS] [--verbose]
-   ralph-refactor/ralph-swarm "<prompt>" [--workers N] [--timeout SECONDS] [--verbose]
-   ralph-refactor/ralph-swarm --analyze PATH [--verbose]
-   ralph-refactor/ralph-swarm --status [RUN_ID]
-   ralph-refactor/ralph-swarm --logs [RUN_ID] [--worker N] [--lines N]
-   ralph-refactor/ralph-swarm --stop [RUN_ID]
-   ralph-refactor/ralph-swarm --reiterate [RUN_ID] --worker N
-   ralph-refactor/ralph-swarm --cleanup [RUN_ID]
-  ralph-refactor/ralph-swarm --interactive|-i   Start interactive configuration prompts
-  ralph-refactor/ralph-swarm --inspect [RUN_ID]   Show artifacts and quick info for a run
+    ralph-refactor/ralph-swarm --devplan PATH [--workers N] [--timeout SECONDS] [--verbose]
+    ralph-refactor/ralph-swarm "<prompt>" [--workers N] [--timeout SECONDS] [--verbose]
+    ralph-refactor/ralph-swarm --analyze PATH [--verbose]
+    ralph-refactor/ralph-swarm --status [RUN_ID]
+    ralph-refactor/ralph-swarm --logs [RUN_ID] [--worker N] [--lines N]
+    ralph-refactor/ralph-swarm --stop [RUN_ID]
+    ralph-refactor/ralph-swarm --reiterate [RUN_ID] --worker N
+    ralph-refactor/ralph-swarm --cleanup [RUN_ID]
+    ralph-refactor/ralph-swarm --resume RUN_ID    Resume a previous swarm run
+    ralph-refactor/ralph-swarm --interactive|-i   Start interactive configuration prompts
+    ralph-refactor/ralph-swarm --inspect [RUN_ID]   Show artifacts and quick info for a run
+    ralph-refactor/ralph-swarm --emergency-stop   Kill all running swarm workers immediately
 
  ENV:
-   RALPH_DIR            State directory (default: ~/.ralph)
-   RALPH_LLM_PROVIDER   Provider for analyzer (default: opencode)
-   RALPH_LLM_MODEL      Model for analyzer (default: opencode/claude-sonnet-4-5)
-   SWARM_COLLECT_ARTIFACTS  If true, collect artifacts after run (or use --collect-artifacts)
-   SWARM_ARTIFACTS_DIR      Base folder for artifacts. Use %RUN_ID% to place run id in path.
+    RALPH_DIR            State directory (default: ~/.ralph)
+    RALPH_LLM_PROVIDER   Provider for analyzer (default: opencode)
+    RALPH_LLM_MODEL      Model for analyzer (default: opencode/claude-sonnet-4-5)
+    SWARM_MAX_WORKERS    Maximum workers per run (default: 8)
+    SWARM_SPAWN_DELAY    Seconds between worker spawns (default: 1)
+    SWARM_MAX_TOTAL_WORKERS  Max concurrent workers system-wide (default: 16)
+    SWARM_COLLECT_ARTIFACTS  If true, collect artifacts after run (or use --collect-artifacts)
+    SWARM_ARTIFACTS_DIR      Base folder for artifacts. Use %RUN_ID% to place run id in path
 
  NOTES:
-   - The analyzer uses OpenCode CLI: `opencode run --format json`.
-   - This script expects `opencode` to be installed and accessible in PATH.
+    - The analyzer uses OpenCode CLI: `opencode run --format json`.
+    - This script expects `opencode` to be installed and accessible in PATH.
+    - Use --resume RUN_ID to continue a previously interrupted swarm run
+    - Use --emergency-stop to kill all running workers in case of runaway spawning.
+    - Devplan runs are automatically detected - if same devplan exists, you'll be prompted to resume.
 EOF
 }
 
@@ -555,6 +726,20 @@ main() {
                 else
                     shift
                 fi
+                ;;
+            --resume|-r)
+                action="resume"
+                if [ -n "${2:-}" ] && [ "${2#--}" = "${2}" ]; then
+                    run_id="$2"
+                    shift 2
+                else
+                    echo "Error: --resume requires a run_id" 1>&2
+                    exit 1
+                fi
+                ;;
+            --emergency-stop|--kill-all)
+                action="emergency_stop"
+                shift
                 ;;
             -* )
                 echo "Unknown option: $1" 1>&2
@@ -723,6 +908,45 @@ main() {
                     echo "No artifacts folder found for run $run_id"
                 fi
             fi
+            ;;
+        emergency_stop)
+            swarm_emergency_stop
+            ;;
+        resume)
+            if [ -z "$run_id" ]; then
+                echo "Error: --resume requires a run_id" 1>&2
+                swarm_usage
+                exit 1
+            fi
+
+            # Get the devplan path for the run
+            local resume_devplan
+            resume_devplan=$(sqlite3 "$RALPH_DIR/swarm.db" "SELECT source_path FROM swarm_runs WHERE run_id = '$run_id';" 2>/dev/null || true)
+
+            if [ -z "$resume_devplan" ] || [ "$resume_devplan" = "NULL" ]; then
+                echo "Error: Run $run_id not found or has no devplan"
+                exit 1
+            fi
+
+            if [ ! -f "$resume_devplan" ]; then
+                echo "Error: Devplan file not found: $resume_devplan"
+                exit 1
+            fi
+
+            echo "Resuming run: $run_id"
+            echo "Devplan: $resume_devplan"
+            echo ""
+
+            # Show current status
+            swarm_orchestrator_status "$run_id"
+            echo ""
+
+            # Get worker count from the run
+            local resume_workers
+            resume_workers=$(sqlite3 "$RALPH_DIR/swarm.db" "SELECT worker_count FROM swarm_runs WHERE run_id = '$run_id';" 2>/dev/null || echo "4")
+
+            echo "Continuing with $resume_workers workers..."
+            swarm_orchestrator_start "" "devplan" "$resume_devplan" "" "$resume_workers" "$timeout_seconds" "$verbose" "$run_id"
             ;;
         start)
             if [ -n "$devplan_path" ]; then

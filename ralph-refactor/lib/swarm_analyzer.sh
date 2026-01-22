@@ -30,9 +30,16 @@ tasks = []
 
 with open(path, 'r', encoding='utf-8', errors='replace') as f:
     for idx, line in enumerate(f, start=1):
-        m = re.match(r'^\s*##\s+Task\s*(.*)\s*$', line)
+        # Match standard markdown checkboxes: - [ ] Task description
+        # We only capture pending tasks (empty brackets)
+        m = re.match(r'^\s*-\s*\[\s*\]\s+(.*)$', line)
+        if not m:
+            # Fallback: check for the old ## Task format just in case
+            m = re.match(r'^\s*##\s+Task\s*(.*)\s*$', line)
+            
         if not m:
             continue
+            
         task = m.group(1).strip()
         if task:
             tasks.append({"task": task, "line": idx})
@@ -77,7 +84,7 @@ swarm_analyzer_analyze_task_files() {
 
     # Default model if not specified via env var
     if [ -z "$llm_model" ]; then
-        llm_model="opencode/claude-sonnet-4-5"
+        llm_model=""
     fi
 
     local prompt_file=$(mktemp)
@@ -89,11 +96,20 @@ swarm_analyzer_analyze_task_files() {
     swarm_analyzer_build_file_prediction_prompt "$task_text" "$(cat "$tree_file")" > "$prompt_file"
 
     local opencode_cmd="opencode run"
-    if [ -n "$llm_provider" ]; then
-        opencode_cmd="$opencode_cmd --provider $llm_provider"
-    fi
+    local full_model=""
+    
     if [ -n "$llm_model" ]; then
-        opencode_cmd="$opencode_cmd --model $llm_model"
+        if [[ "$llm_model" == *"/"* ]]; then
+             full_model="$llm_model"
+        elif [ -n "$llm_provider" ]; then
+             full_model="${llm_provider}/${llm_model}"
+        else
+             full_model="$llm_model"
+        fi
+    fi
+
+    if [ -n "$full_model" ]; then
+        opencode_cmd="$opencode_cmd --model $full_model"
     fi
 
     local json_output
@@ -138,7 +154,7 @@ swarm_analyzer_decompose_prompt() {
 
     # Default model if not specified via env var
     if [ -z "$llm_model" ]; then
-        llm_model="opencode/claude-sonnet-4-5"
+        llm_model=""
     fi
 
     local prompt_file=$(mktemp)
@@ -168,11 +184,20 @@ Tasks with the same priority can run in parallel.
 EOF
 
     local opencode_cmd="opencode run"
-    if [ -n "$llm_provider" ]; then
-        opencode_cmd="$opencode_cmd --provider $llm_provider"
-    fi
+    local full_model=""
+    
     if [ -n "$llm_model" ]; then
-        opencode_cmd="$opencode_cmd --model $llm_model"
+        if [[ "$llm_model" == *"/"* ]]; then
+             full_model="$llm_model"
+        elif [ -n "$llm_provider" ]; then
+             full_model="${llm_provider}/${llm_model}"
+        else
+             full_model="$llm_model"
+        fi
+    fi
+
+    if [ -n "$full_model" ]; then
+        opencode_cmd="$opencode_cmd --model $full_model"
     fi
 
     local json_output
