@@ -982,33 +982,35 @@ class WorkerPane(Vertical):
 
 class ProgressPane(Vertical):
     """Progress dashboard pane."""
-    
+
     DEFAULT_CSS = """
     ProgressPane {
         height: auto;
         border-top: solid yellow;
         dock: bottom;
-        max-height: 4;
+        max-height: 3;
     }
-    
-    ProgressPane #progress-bar-container {
-        height: 1;
-        width: 1fr;
-    }
-    
+
     ProgressPane #stats-line {
         height: 1;
         width: 1fr;
     }
+
+    ProgressPane #progress-bar {
+        height: 1;
+        width: 30;
+    }
     """
-    
+
     progress = reactive(0.0)
-    
+
     def compose(self) -> ComposeResult:
-         with Vertical():
-            yield Static("Ready", id="stats-line")
-            yield ProgressBar(total=100, id="progress-bar", show_eta=False)
-    
+        yield Horizontal(
+            Static("Ready", id="stats-line"),
+            ProgressBar(total=100, id="progress-bar", show_eta=False),
+            id="progress-row"
+        )
+
     def update_progress(self, run_info: Optional[Dict], stats: Dict[str, int], total_cost: float = 0.0) -> None:
         """Update progress display."""
         total = sum(stats.values())
@@ -1016,12 +1018,12 @@ class ProgressPane(Vertical):
         failed = stats.get("failed", 0)
         in_progress = stats.get("in_progress", 0)
         pending = stats.get("pending", 0)
-        
+
         # Update stats display
         stats_widget = self.query_one("#stats-line", Static)
-        
+
         cost_text = f" | Cost: ${total_cost:.4f}" if total_cost else ""
-        
+
         if not run_info:
              stats_widget.update("[dim]No active run[/dim]")
              self.query_one("#progress-bar", ProgressBar).update(progress=0)
@@ -1032,14 +1034,14 @@ class ProgressPane(Vertical):
 
         stats_text = (
             f"[bold]{status}[/bold] (Run {run_id[:8]}) | "
-            f"[green]Done: {completed}[/green] | "
-            f"[blue]Active: {in_progress}[/blue] | "
-            f"[yellow]Pending: {pending}[/yellow] | "
-            f"[red]Failed: {failed}[/red]"
+            f"[green]✓ {completed}[/green] | "
+            f"[blue]● {in_progress}[/blue] | "
+            f"[yellow]○ {pending}[/yellow] | "
+            f"[red]✗ {failed}[/red]"
             f"{cost_text}"
         )
         stats_widget.update(stats_text)
-        
+
         # Update progress bar
         progress_bar = self.query_one("#progress-bar", ProgressBar)
         if total > 0:
@@ -1253,7 +1255,7 @@ class RalphTUI(App):
     Screen {
         layout: grid;
         grid-size: 2 3;
-        grid-rows: 1.2fr 0.8fr 1fr;
+        grid-rows: 1.5fr 1fr 0.3fr;
         grid-columns: 2fr 1fr;
     }
 
@@ -1272,14 +1274,14 @@ class RalphTUI(App):
         column-span: 1;
     }
 
-    #progress-container {
+    #file-container {
         row-span: 1;
         column-span: 1;
     }
 
-    #file-container {
+    #progress-container {
         row-span: 1;
-        column-span: 1;
+        column-span: 2;
     }
 
     .pane-title {
@@ -1346,12 +1348,12 @@ class RalphTUI(App):
             id="log-container"
         )
         yield Container(
-            ProgressPane(id="progress-pane"),
-            id="progress-container"
-        )
-        yield Container(
             FilePane(id="file-pane"),
             id="file-container"
+        )
+        yield Container(
+            ProgressPane(id="progress-pane"),
+            id="progress-container"
         )
         yield Footer()
     
