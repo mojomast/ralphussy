@@ -1252,14 +1252,9 @@ class RalphTUI(App):
     CSS = """
     Screen {
         layout: grid;
-        grid-size: 3 2;
-        grid-rows: 1.2fr 0.8fr;
-        grid-columns: 1fr 2fr 1fr;
-    }
-
-    #log-container {
-        row-span: 1;
-        column-span: 1;
+        grid-size: 2 3;
+        grid-rows: 1.2fr 0.8fr 1fr;
+        grid-columns: 2fr 1fr;
     }
 
     #chat-container {
@@ -1268,6 +1263,11 @@ class RalphTUI(App):
     }
 
     #worker-container {
+        row-span: 1;
+        column-span: 1;
+    }
+
+    #log-container {
         row-span: 1;
         column-span: 1;
     }
@@ -1334,16 +1334,16 @@ class RalphTUI(App):
     def compose(self) -> ComposeResult:
         yield Header()
         yield Container(
-            LogPane(id="log-pane"),
-            id="log-container"
-        )
-        yield Container(
             ChatPane(id="chat-pane"),
             id="chat-container"
         )
         yield Container(
             WorkerPane(id="worker-pane"),
             id="worker-container"
+        )
+        yield Container(
+            LogPane(id="log-pane"),
+            id="log-container"
         )
         yield Container(
             ProgressPane(id="progress-pane"),
