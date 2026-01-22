@@ -226,33 +226,49 @@ PY
 
     local run_id_result
 
-    # If resuming, use the existing run_id
+    # If resuming, use the existing run_id and SKIP task re-parsing
     if [ -n "$resume_from" ]; then
         run_id_result="$resume_from"
         # Resume the run
         swarm_db_resume_run "$run_id_result" >/dev/null
 
-        # Get completed task hashes to skip
-        local completed_hashes
-        completed_hashes=$(swarm_db_get_completed_task_hashes "$source_hash")
+        # Update the started_at timestamp for proper timeout calculation
+        sqlite3 "$RALPH_DIR/swarm.db" "UPDATE swarm_runs SET started_at = datetime('now') WHERE run_id = '$run_id_result';"
+
+        # Clean up old workers before spawning new ones
+        sqlite3 "$RALPH_DIR/swarm.db" "UPDATE workers SET status = 'stopped', current_task_id = NULL WHERE run_id = '$run_id_result';"
+        
+        # Requeue any stuck in_progress tasks
+        sqlite3 "$RALPH_DIR/swarm.db" "UPDATE tasks SET status = 'pending', worker_id = NULL, started_at = NULL WHERE run_id = '$run_id_result' AND status = 'in_progress';"
+
+        echo "Run ID: $run_id_result"
+        
+        # Show current task status
+        echo ""
+        echo "Existing tasks:"
+        sqlite3 "$RALPH_DIR/swarm.db" "SELECT status, COUNT(*) FROM tasks WHERE run_id = '$run_id_result' GROUP BY status;" | while IFS='|' read -r status count; do
+            echo "  $status: $count"
+        done
+        echo ""
+
+        # Skip the task parsing - go straight to worker spawning
+        rm -f "$task_list_file"
     else
         # Start new run with source_hash
         run_id_result=$(swarm_db_start_run "$mode" "$devplan_path" "$source_hash" "$prompt_text" "$worker_count")
-        completed_hashes=""
-    fi
 
-    if [ $? -ne 0 ] || [ -z "$run_id_result" ]; then
-        echo "Error: Failed to start run"
-        rm -f "$task_list_file"
-        return 1
-    fi
+        if [ $? -ne 0 ] || [ -z "$run_id_result" ]; then
+            echo "Error: Failed to start run"
+            rm -f "$task_list_file"
+            return 1
+        fi
 
-    echo "Run ID: $run_id_result"
+        echo "Run ID: $run_id_result"
 
-    local task_id
-    local current_priority=1
+        local task_id
+        local current_priority=1
 
-    python3 - "$task_list_file" <<'PY' | while IFS= read -r task_json; do
+        python3 - "$task_list_file" <<'PY' | while IFS= read -r task_json; do
 import base64
 import json
 import sys
@@ -275,45 +291,33 @@ for item in data:
     }
     sys.stdout.write(json.dumps(payload) + "\n")
 PY
-        [ -z "$task_json" ] && continue
+            [ -z "$task_json" ] && continue
 
-        local task_b64 devplan_line priority task_text task_hash skip_task
-        if command -v jq >/dev/null 2>&1; then
-            task_b64=$(printf '%s' "$task_json" | jq -r '.task_b64')
-            devplan_line=$(printf '%s' "$task_json" | jq -r '.line // "null"')
-            priority=$(printf '%s' "$task_json" | jq -r '.priority // empty')
-            task_text=$(printf '%s' "$task_json" | jq -r '.task')
-        else
-            task_b64=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("task_b64",""))' <<<"$task_json")
-            devplan_line=$(python3 -c 'import json,sys; v=json.load(sys.stdin).get("line", None); print("null" if v is None else v)' <<<"$task_json")
-            priority=$(python3 -c 'import json,sys; v=json.load(sys.stdin).get("priority", None); print("" if v is None else v)' <<<"$task_json")
-            task_text=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("task",""))' <<<"$task_json")
-        fi
-
-        if [ -z "$priority" ]; then
-            priority="$current_priority"
-        fi
-
-        # Check if task is already completed (for resume mode)
-        skip_task="no"
-        if [ -n "$completed_hashes" ]; then
-            task_hash=$(printf '%s' "$task_text" | sha256sum | cut -d' ' -f1)
-            if echo "$completed_hashes" | grep -q "$task_hash"; then
-                skip_task="yes"
+            local task_b64 devplan_line priority task_text
+            if command -v jq >/dev/null 2>&1; then
+                task_b64=$(printf '%s' "$task_json" | jq -r '.task_b64')
+                devplan_line=$(printf '%s' "$task_json" | jq -r '.line // "null"')
+                priority=$(printf '%s' "$task_json" | jq -r '.priority // empty')
+                task_text=$(printf '%s' "$task_json" | jq -r '.task')
+            else
+                task_b64=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("task_b64",""))' <<<"$task_json")
+                devplan_line=$(python3 -c 'import json,sys; v=json.load(sys.stdin).get("line", None); print("null" if v is None else v)' <<<"$task_json")
+                priority=$(python3 -c 'import json,sys; v=json.load(sys.stdin).get("priority", None); print("" if v is None else v)' <<<"$task_json")
+                task_text=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("task",""))' <<<"$task_json")
             fi
-        fi
 
-        if [ "$skip_task" = "yes" ]; then
-            echo "Skipping already completed task: ${task_text:0:50}..."
-        else
+            if [ -z "$priority" ]; then
+                priority="$current_priority"
+            fi
+
             task_id=$(swarm_db_add_task "$run_id_result" "$task_text" "[]" "$devplan_line" "$priority")
             echo "Added task $task_id: $task_text"
-        fi
 
-        current_priority=$((current_priority + 1))
-    done
+            current_priority=$((current_priority + 1))
+        done
 
-    rm -f "$task_list_file"
+        rm -f "$task_list_file"
+    fi
 
     local spawn_result
     # Spawn N workers (worker_num=1..N) using the ralph entrypoint.
@@ -453,6 +457,178 @@ swarm_orchestrator_cleanup() {
     echo "Cleanup complete for run $run_id"
 }
 
+swarm_orchestrator_fix() {
+    local run_id="$1"
+
+    if [ -z "$run_id" ]; then
+        run_id=$(sqlite3 "$RALPH_DIR/swarm.db" "SELECT run_id FROM swarm_runs ORDER BY id DESC LIMIT 1" 2>/dev/null || true)
+    fi
+
+    if [ -z "$run_id" ]; then
+        echo "No swarm runs found"
+        return 1
+    fi
+
+    echo "=== Fixing Swarm Run: $run_id ==="
+    echo ""
+
+    local db_path="$RALPH_DIR/swarm.db"
+
+    # 1. Find and report dead workers
+    echo "Checking worker status..."
+    local dead_count=0
+    local alive_count=0
+    
+    while IFS='|' read -r worker_id worker_num pid branch status current_task started_at heartbeat; do
+        [ -z "$worker_id" ] && continue
+        
+        if [ -n "$pid" ] && [ "$pid" != "NULL" ] && [ "$pid" != "0" ] && kill -0 "$pid" 2>/dev/null; then
+            echo "  Worker $worker_num (PID: $pid): ALIVE"
+            alive_count=$((alive_count + 1))
+        else
+            echo "  Worker $worker_num (PID: $pid): DEAD"
+            dead_count=$((dead_count + 1))
+            
+            # Mark as stopped
+            sqlite3 "$db_path" "UPDATE workers SET status = 'stopped', current_task_id = NULL WHERE id = $worker_id;"
+        fi
+    done < <(swarm_db_list_workers "$run_id" 2>/dev/null)
+
+    echo ""
+    echo "Workers: $alive_count alive, $dead_count dead"
+
+    # 2. Requeue stuck in_progress tasks
+    echo ""
+    echo "Checking for stuck tasks..."
+    
+    local stuck_tasks
+    stuck_tasks=$(sqlite3 "$db_path" "SELECT id, task_text FROM tasks WHERE run_id = '$run_id' AND status = 'in_progress';" 2>/dev/null)
+    
+    if [ -n "$stuck_tasks" ]; then
+        local requeued=0
+        echo "$stuck_tasks" | while IFS='|' read -r task_id task_text; do
+            [ -z "$task_id" ] && continue
+            echo "  Requeuing task $task_id: ${task_text:0:50}..."
+            sqlite3 "$db_path" "UPDATE tasks SET status = 'pending', worker_id = NULL, started_at = NULL, stall_count = COALESCE(stall_count, 0) + 1 WHERE id = $task_id;"
+        done
+        requeued=$(echo "$stuck_tasks" | grep -c '^[0-9]' || echo "0")
+        echo "Requeued $requeued stuck tasks"
+    else
+        echo "  No stuck tasks found"
+    fi
+
+    # 3. Clean up file locks
+    echo ""
+    echo "Cleaning up file locks..."
+    sqlite3 "$db_path" "DELETE FROM file_locks WHERE run_id = '$run_id';"
+    echo "  File locks cleared"
+
+    # 4. Show final state
+    echo ""
+    echo "=== Fixed State ==="
+    sqlite3 "$db_path" "SELECT status, COUNT(*) as count FROM tasks WHERE run_id = '$run_id' GROUP BY status;" | while IFS='|' read -r status count; do
+        echo "  $status: $count"
+    done
+
+    echo ""
+    if [ $alive_count -eq 0 ]; then
+        echo "All workers are dead. Use one of these commands to continue:"
+        echo "  ralph-swarm --resume $run_id"
+        echo "  /swarm resume $run_id  (in TUI)"
+    else
+        echo "Workers are running. Tasks will be picked up automatically."
+    fi
+}
+
+swarm_orchestrator_reset() {
+    local run_id="$1"
+
+    if [ -z "$run_id" ]; then
+        run_id=$(sqlite3 "$RALPH_DIR/swarm.db" "SELECT run_id FROM swarm_runs ORDER BY id DESC LIMIT 1" 2>/dev/null || true)
+    fi
+
+    if [ -z "$run_id" ]; then
+        echo "No swarm runs found"
+        return 1
+    fi
+
+    echo "=== Resetting Swarm Run: $run_id ==="
+    echo ""
+    echo "This will:"
+    echo "  - Delete all tasks for this run"
+    echo "  - Delete all workers for this run"
+    echo "  - Reset the run to allow a fresh start"
+    echo ""
+
+    read -r -p "Are you sure? (yes/no): " confirm
+    if [ "$confirm" != "yes" ]; then
+        echo "Cancelled"
+        return 1
+    fi
+
+    local db_path="$RALPH_DIR/swarm.db"
+
+    # Kill any running worker processes
+    echo ""
+    echo "Stopping any running workers..."
+    while IFS='|' read -r worker_id worker_num pid rest; do
+        [ -z "$pid" ] && continue
+        [ "$pid" = "NULL" ] && continue
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "  Killing worker $worker_num (PID: $pid)"
+            kill "$pid" 2>/dev/null || true
+        fi
+    done < <(swarm_db_list_workers "$run_id" 2>/dev/null)
+
+    # Delete all data for this run
+    echo ""
+    echo "Deleting run data..."
+    
+    sqlite3 "$db_path" <<EOF
+BEGIN TRANSACTION;
+
+-- Delete file locks
+DELETE FROM file_locks WHERE run_id = '$run_id';
+
+-- Delete task costs
+DELETE FROM task_costs WHERE run_id = '$run_id';
+
+-- Delete workers
+DELETE FROM worker_registry WHERE run_id = '$run_id';
+DELETE FROM workers WHERE run_id = '$run_id';
+
+-- Delete tasks
+DELETE FROM tasks WHERE run_id = '$run_id';
+
+-- Reset the run
+UPDATE swarm_runs 
+SET status = 'reset',
+    total_tasks = 0,
+    completed_tasks = 0,
+    failed_tasks = 0,
+    started_at = NULL,
+    completed_at = NULL
+WHERE run_id = '$run_id';
+
+COMMIT;
+EOF
+
+    # Clean up run directory
+    local run_dir="$RALPH_DIR/swarm/runs/$run_id"
+    if [ -d "$run_dir" ]; then
+        echo "Cleaning up run directory..."
+        rm -rf "$run_dir"
+    fi
+
+    echo ""
+    echo "=== Run Reset Complete ==="
+    echo ""
+    echo "The run '$run_id' has been reset."
+    echo "Start a fresh swarm with:"
+    echo "  ralph-swarm --devplan <path>"
+    echo "  /swarm start  (in TUI)"
+}
+
 swarm_orchestrator_logs() {
     local run_id="$1"
     local worker_num="${2:-}"
@@ -574,10 +750,12 @@ swarm_usage() {
     ralph-refactor/ralph-swarm --stop [RUN_ID]
     ralph-refactor/ralph-swarm --reiterate [RUN_ID] --worker N
     ralph-refactor/ralph-swarm --cleanup [RUN_ID]
-    ralph-refactor/ralph-swarm --resume RUN_ID    Resume a previous swarm run
-    ralph-refactor/ralph-swarm --interactive|-i   Start interactive configuration prompts
-    ralph-refactor/ralph-swarm --inspect [RUN_ID]   Show artifacts and quick info for a run
-    ralph-refactor/ralph-swarm --emergency-stop   Kill all running swarm workers immediately
+    ralph-refactor/ralph-swarm --fix [RUN_ID]       Fix stuck run (requeue tasks, cleanup dead workers)
+    ralph-refactor/ralph-swarm --reset [RUN_ID]    Reset run completely (delete all tasks, start fresh)
+    ralph-refactor/ralph-swarm --resume RUN_ID      Resume a previous swarm run
+    ralph-refactor/ralph-swarm --interactive|-i    Start interactive configuration prompts
+    ralph-refactor/ralph-swarm --inspect [RUN_ID]  Show artifacts and quick info for a run
+    ralph-refactor/ralph-swarm --emergency-stop    Kill all running swarm workers immediately
 
  ENV:
     RALPH_DIR            State directory (default: ~/.ralph)
@@ -590,8 +768,9 @@ swarm_usage() {
     SWARM_ARTIFACTS_DIR      Base folder for artifacts. Use %RUN_ID% to place run id in path
 
  NOTES:
-    - The analyzer uses OpenCode CLI: `opencode run --format json`.
-    - This script expects `opencode` to be installed and accessible in PATH.
+    - The analyzer uses OpenCode CLI: \`opencode run --format json\`.
+    - This script expects \`opencode\` to be installed and accessible in PATH.
+    - Use --fix to recover from stuck runs (dead workers, orphaned tasks)
     - Use --resume RUN_ID to continue a previously interrupted swarm run
     - Use --emergency-stop to kill all running workers in case of runaway spawning.
     - Devplan runs are automatically detected - if same devplan exists, you'll be prompted to resume.
@@ -740,6 +919,24 @@ main() {
             --emergency-stop|--kill-all)
                 action="emergency_stop"
                 shift
+                ;;
+            --fix)
+                action="fix"
+                if [ -n "${2:-}" ] && [ "${2#--}" = "${2}" ]; then
+                    run_id="$2"
+                    shift 2
+                else
+                    shift
+                fi
+                ;;
+            --reset)
+                action="reset"
+                if [ -n "${2:-}" ] && [ "${2#--}" = "${2}" ]; then
+                    run_id="$2"
+                    shift 2
+                else
+                    shift
+                fi
                 ;;
             -* )
                 echo "Unknown option: $1" 1>&2
@@ -911,6 +1108,12 @@ main() {
             ;;
         emergency_stop)
             swarm_emergency_stop
+            ;;
+        fix)
+            swarm_orchestrator_fix "$run_id"
+            ;;
+        reset)
+            swarm_orchestrator_reset "$run_id"
             ;;
         resume)
             if [ -z "$run_id" ]; then

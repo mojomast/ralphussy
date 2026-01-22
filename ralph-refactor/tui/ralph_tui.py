@@ -688,23 +688,32 @@ class ChatInput(Input):
 
 
 class ChatPane(Vertical):
-    """Chat terminal pane for user interaction."""
+    """Chat terminal pane for user interaction with enhanced styling."""
     
     DEFAULT_CSS = """
     ChatPane {
         height: 100%;
-        border: solid green;
+        border: solid #2ecc71;
+    }
+    
+    ChatPane #chat-header {
+        height: 3;
+        background: #27ae60;
+        color: white;
+        padding: 1;
     }
     
     ChatPane #chat-log {
         height: 1fr;
         scrollbar-gutter: stable;
         overflow-y: scroll;
+        background: $surface;
     }
     
     ChatPane #chat-input {
         dock: bottom;
         height: 3;
+        border-top: solid #2ecc71;
     }
     """
     
@@ -715,7 +724,7 @@ class ChatPane(Vertical):
             super().__init__()
     
     def compose(self) -> ComposeResult:
-        # Use TextArea instead of RichLog for selectable text
+        yield Static("[bold]💬 Chat[/bold] [dim](commands: /help)[/dim]", id="chat-header")
         yield TextArea(id="chat-log", read_only=True)
         yield ChatInput(self, placeholder="Enter command or chat...", id="chat-input")
     
@@ -821,21 +830,33 @@ class ChatPane(Vertical):
         input_widget.value = candidates[self._autocomplete_index]
     
     def log_message(self, message: str, msg_type: str = "info") -> None:
-        """Log a message to the chat."""
+        """Log a message to the chat with color-coded prefixes."""
         log = self.query_one("#chat-log", TextArea)
         timestamp = datetime.now().strftime("%H:%M:%S")
         
+        # Color-coded prefixes and symbols for different message types
         prefix = ""
+        symbol = ""
         if msg_type == "user":
-            prefix = f"{timestamp} You: "
+            symbol = "▶"
+            prefix = f"{timestamp} {symbol} You: "
         elif msg_type == "ralph":
-            prefix = f"{timestamp} Ralph: "
+            symbol = "◆"
+            prefix = f"{timestamp} {symbol} Ralph: "
         elif msg_type == "system":
-            prefix = f"{timestamp} System: "
+            symbol = "●"
+            prefix = f"{timestamp} {symbol} System: "
         elif msg_type == "error":
-            prefix = f"{timestamp} Error: "
+            symbol = "✗"
+            prefix = f"{timestamp} {symbol} Error: "
+        elif msg_type == "success":
+            symbol = "✓"
+            prefix = f"{timestamp} {symbol} "
+        elif msg_type == "warning":
+            symbol = "⚠"
+            prefix = f"{timestamp} {symbol} Warning: "
         else:
-            prefix = f"{timestamp} "
+            prefix = f"{timestamp}   "
             
         # Append text to the TextArea
         # Strip rich markup for the plain text area
@@ -851,7 +872,6 @@ class ChatPane(Vertical):
         log.scroll_end(animate=False)
         
         # Force cursor to end to help maintain position
-        # Note: TextArea cursor logic can be version dependent, so we rely mainly on scroll_end
         try:
             log.cursor_location = (log.document.line_count - 1, 0)
         except Exception:
@@ -869,7 +889,7 @@ class ChatPane(Vertical):
 
 
 class WorkerPane(Vertical):
-    """Worker status pane showing swarm activity."""
+    """Worker status pane showing swarm activity with color-coded status."""
 
     DEFAULT_CSS = """
     WorkerPane {
@@ -896,75 +916,91 @@ class WorkerPane(Vertical):
             super().__init__()
 
     def compose(self) -> ComposeResult:
-        yield Static("[bold]Workers[/bold] (Click ID for logs)", id="worker-header")
+        yield Static("[bold cyan]⚙ Workers[/bold cyan] [dim](click for logs)[/dim]", id="worker-header")
         yield DataTable(id="worker-table", cursor_type="row")
 
     def on_mount(self) -> None:
         """Initialize worker table."""
         table = self.query_one("#worker-table", DataTable)
-        table.add_columns("ID", "Status", "Current Task", "Branch", "RunID")
+        table.add_columns("W#", "Status", "Task", "Progress")
 
     def update_workers(self, workers: List[Dict[str, Any]]) -> None:
-        """Update worker table with current workers."""
+        """Update worker table with current workers and activity."""
         table = self.query_one("#worker-table", DataTable)
         table.clear()
 
+        # Deduplicate workers: keep only the latest worker per worker_num
+        # This prevents row key collisions when old + new workers exist
+        workers_by_num: Dict[int, Dict[str, Any]] = {}
         for worker in workers:
+            worker_num = worker.get("worker_num")
+            if worker_num is None:
+                continue
+            worker_id = worker.get("id", 0)
+            existing = workers_by_num.get(worker_num)
+            if existing is None or worker_id > existing.get("id", 0):
+                workers_by_num[worker_num] = worker
+
+        # Sort by worker_num for display
+        sorted_workers = sorted(workers_by_num.values(), key=lambda w: w.get("worker_num", 0))
+
+        for worker in sorted_workers:
+            worker_id = worker.get("id", "?")
             worker_num = worker.get("worker_num", "?")
             status = worker.get("status", "unknown")
             task_id = worker.get("current_task_id", "-")
             task_text = worker.get("current_task_text", "")
-            branch = worker.get("branch_name", "-")
             run_id = worker.get("run_id", "")
-            last_heartbeat = worker.get("last_heartbeat", "")
 
-            # Colorize status with enhanced display
+            # Color-coded status with symbols
             if status == "idle":
-                status_display = "[yellow]idle[/yellow]"
+                status_display = "[yellow]○ idle[/yellow]"
             elif status == "working":
-                # Show as working with activity indicator
                 status_display = "[green]● working[/green]"
             elif status == "error":
-                status_display = "[red]● error[/red]"
+                status_display = "[red]✗ error[/red]"
             elif status == "stuck":
                 status_display = "[yellow]⏳ stuck[/yellow]"
+            elif status == "completed":
+                status_display = "[cyan]✓ done[/cyan]"
+            elif status == "stopped":
+                status_display = "[dim]◼ stopped[/dim]"
             else:
                 status_display = f"[dim]{status}[/dim]"
 
-            # Enhanced task display
+            # Task display with truncation
             if task_text:
-                # Truncate task text but keep more context
-                if len(task_text) > 40:
-                    task_display = f"{task_text[:40]}..."
+                # Truncate but keep meaningful context
+                if len(task_text) > 35:
+                    task_display = f"{task_text[:32]}..."
                 else:
                     task_display = task_text
-                # Add status indicator based on worker state
-                if status == "working":
-                    task_display = f"[green]→[/green] {task_display}"
-                elif status == "error":
-                    task_display = f"[red]![/red] {task_display}"
-                elif status == "stuck":
-                    task_display = f"[yellow]?[/yellow] {task_display}"
             elif task_id and task_id != "-" and task_id != "None":
-                # No task text but has task ID - show brief
-                task_display = f"[dim]Task #{task_id}[/dim]"
+                task_display = f"[dim]#{task_id}[/dim]"
             else:
-                task_display = "[dim]-[/dim]"
+                task_display = "[dim]—[/dim]"
 
-            # Shorten run_id for display
-            run_display = run_id[:8] if run_id else "-"
-            # Shorten branch name
-            branch_short = branch.split("/")[-1] if branch else "-"
-            if len(branch_short) > 12:
-                branch_short = branch_short[:12] + "..."
+            # Progress indicator based on status
+            if status == "working":
+                progress = "[green]▓▓▓░░[/green]"
+            elif status == "idle":
+                progress = "[dim]░░░░░[/dim]"
+            elif status == "completed":
+                progress = "[cyan]▓▓▓▓▓[/cyan]"
+            elif status == "error":
+                progress = "[red]▓▓✗░░[/red]"
+            elif status == "stopped":
+                progress = "[dim]—————[/dim]"
+            else:
+                progress = "[dim]?????[/dim]"
 
+            # Use unique worker database ID as key to prevent collisions
             table.add_row(
-                str(worker_num),
+                f"[bold]{worker_num}[/bold]",
                 status_display,
                 task_display,
-                branch_short,
-                run_display,
-                key=f"{run_id}|{worker_num}"
+                progress,
+                key=str(worker_id)
             )
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
@@ -981,14 +1017,16 @@ class WorkerPane(Vertical):
 
 
 class ProgressPane(Vertical):
-    """Progress dashboard pane."""
+    """Progress dashboard pane with enhanced visual display."""
 
     DEFAULT_CSS = """
     ProgressPane {
         height: auto;
-        border-top: solid yellow;
+        border-top: solid #f1c40f;
         dock: bottom;
         max-height: 3;
+        background: $surface-darken-1;
+        padding: 0 1;
     }
 
     ProgressPane #stats-line {
@@ -998,7 +1036,12 @@ class ProgressPane(Vertical):
 
     ProgressPane #progress-bar {
         height: 1;
-        width: 30;
+        width: 25;
+    }
+    
+    ProgressPane #progress-row {
+        height: 1;
+        padding: 0;
     }
     """
 
@@ -1006,13 +1049,13 @@ class ProgressPane(Vertical):
 
     def compose(self) -> ComposeResult:
         yield Horizontal(
-            Static("Ready", id="stats-line"),
+            Static("[dim]◎ Ready[/dim]", id="stats-line"),
             ProgressBar(total=100, id="progress-bar", show_eta=False),
             id="progress-row"
         )
 
     def update_progress(self, run_info: Optional[Dict], stats: Dict[str, int], total_cost: float = 0.0) -> None:
-        """Update progress display."""
+        """Update progress display with color-coded stats."""
         total = sum(stats.values())
         completed = stats.get("completed", 0)
         failed = stats.get("failed", 0)
@@ -1022,22 +1065,34 @@ class ProgressPane(Vertical):
         # Update stats display
         stats_widget = self.query_one("#stats-line", Static)
 
-        cost_text = f" | Cost: ${total_cost:.4f}" if total_cost else ""
+        cost_text = f" | [cyan]${total_cost:.4f}[/cyan]" if total_cost else ""
 
         if not run_info:
-             stats_widget.update("[dim]No active run[/dim]")
+             stats_widget.update("[dim]◎ No active run[/dim]")
              self.query_one("#progress-bar", ProgressBar).update(progress=0)
              return
 
         run_id = run_info.get("run_id", "N/A")
         status = run_info.get("status", "N/A")
+        
+        # Color-code the status
+        if status == "running":
+            status_display = "[green bold]● RUNNING[/green bold]"
+        elif status == "completed":
+            status_display = "[cyan bold]✓ DONE[/cyan bold]"
+        elif status == "failed":
+            status_display = "[red bold]✗ FAILED[/red bold]"
+        elif status == "stopped":
+            status_display = "[yellow bold]◼ STOPPED[/yellow bold]"
+        else:
+            status_display = f"[bold]{status}[/bold]"
 
         stats_text = (
-            f"[bold]{status}[/bold] (Run {run_id[:8]}) | "
-            f"[green]✓ {completed}[/green] | "
-            f"[blue]● {in_progress}[/blue] | "
-            f"[yellow]○ {pending}[/yellow] | "
-            f"[red]✗ {failed}[/red]"
+            f"{status_display} [dim]({run_id[:8]})[/dim] │ "
+            f"[green]✓{completed}[/green] "
+            f"[blue]●{in_progress}[/blue] "
+            f"[yellow]○{pending}[/yellow] "
+            f"[red]✗{failed}[/red]"
             f"{cost_text}"
         )
         stats_widget.update(stats_text)
@@ -1054,7 +1109,7 @@ class ProgressPane(Vertical):
 
 
 class LogPane(Vertical):
-    """Non-interactive system log pane for swarm/agent process details."""
+    """Non-interactive system log pane for swarm/agent process details with real-time updates."""
 
     DEFAULT_CSS = """
     LogPane {
@@ -1077,22 +1132,143 @@ class LogPane(Vertical):
         super().__init__(**kwargs)
         self._max_lines = 1000
         self._log_levels = {
-            "info": "[blue]I[/blue]",
+            "info": "[blue]●[/blue]",
             "success": "[green]✓[/green]",
             "warning": "[yellow]⚠[/yellow]",
             "error": "[red]✗[/red]",
             "task": "[magenta]→[/magenta]",
             "tool": "[cyan]◇[/cyan]",
             "file": "[green]◆[/green]",
-            "cmd": "[yellow]★[/yellow]",
-            "completed": "[green]✅[/green]",
-            "failed": "[red]❌[/failed]",
+            "cmd": "[yellow]$[/yellow]",
+            "completed": "[green]✓[/green]",
+            "failed": "[red]✗[/red]",
             "stuck": "[yellow]⏳[/yellow]",
+            "read": "[blue]◈[/blue]",
+            "write": "[green]◈[/green]",
+            "edit": "[cyan]◈[/cyan]",
+            "thinking": "[magenta]◎[/magenta]",
         }
+        # Track file positions for incremental reading
+        self._log_file_positions: Dict[str, int] = {}
+        # Patterns to detect interesting log events
+        self._tool_pattern = re.compile(r"Tool[:\s]+(\w+)\s*[\(\[]?(.{0,60})")
+        self._file_pattern = re.compile(r"(Read|Write|Edit|Create|Delete)[:\s]+(.+?)(?:\s|$)")
+        self._cmd_pattern = re.compile(r"(Bash|Command|Run|Exec)[:\s]+(.+?)(?:\s|$)")
+        self._thinking_pattern = re.compile(r"(Thinking|Planning|Analyzing)[:\s]*(.{0,50})")
 
     def compose(self) -> ComposeResult:
-        yield Static("[bold]System Log[/bold]", id="log-header")
+        yield Static("[bold orange1]◉ System Log[/bold orange1] [dim](live worker activity)[/dim]", id="log-header")
         yield TextArea(id="system-log", read_only=True)
+
+    def scan_worker_logs(self, run_id: str) -> None:
+        """Scan worker log files for new content and display updates."""
+        if not run_id:
+            return
+        
+        run_dir = RALPH_DIR / "swarm" / "runs" / run_id
+        if not run_dir.exists():
+            return
+
+        # Find all worker log directories
+        try:
+            worker_dirs = list(run_dir.glob("worker-*"))
+        except Exception:
+            return
+
+        for worker_dir in worker_dirs:
+            worker_num = worker_dir.name.replace("worker-", "")
+            log_dir = worker_dir / "logs"
+            if not log_dir.exists():
+                continue
+
+            # Find log files
+            try:
+                log_files = list(log_dir.glob("*.log"))
+                if not log_files:
+                    continue
+                
+                # Process each log file
+                for log_file in log_files:
+                    self._process_log_file(log_file, f"W{worker_num}")
+            except Exception:
+                continue
+
+    def _process_log_file(self, log_path: Path, worker_id: str) -> None:
+        """Process a single log file for new content."""
+        file_key = str(log_path)
+        
+        try:
+            file_size = log_path.stat().st_size
+            last_pos = self._log_file_positions.get(file_key, 0)
+            
+            # Skip if no new content
+            if file_size <= last_pos:
+                return
+            
+            with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                f.seek(last_pos)
+                new_content = f.read()
+                self._log_file_positions[file_key] = f.tell()
+            
+            # Parse and display interesting events
+            for line in new_content.splitlines():
+                self._parse_and_log_line(line.strip(), worker_id)
+                
+        except Exception:
+            pass
+
+    def _parse_and_log_line(self, line: str, worker_id: str) -> None:
+        """Parse a log line and display if it's interesting."""
+        if not line or len(line) < 3:
+            return
+        
+        # Skip noise lines
+        noise_patterns = ["---", "===", "***", "DEBUG:", "TRACE:"]
+        if any(line.startswith(p) for p in noise_patterns):
+            return
+        
+        # Check for tool calls
+        tool_match = self._tool_pattern.search(line)
+        if tool_match:
+            tool_name = tool_match.group(1)
+            args = tool_match.group(2) if tool_match.group(2) else ""
+            self.write_log(f"{tool_name}: {args[:40]}", "tool", worker_id)
+            return
+        
+        # Check for file operations
+        file_match = self._file_pattern.search(line)
+        if file_match:
+            action = file_match.group(1).lower()
+            filepath = file_match.group(2)[:50]
+            level = "read" if action == "read" else "write" if action in ["write", "create"] else "edit"
+            self.write_log(f"{action}: {filepath}", level, worker_id)
+            return
+        
+        # Check for command execution
+        cmd_match = self._cmd_pattern.search(line)
+        if cmd_match:
+            cmd = cmd_match.group(2)[:45]
+            self.write_log(f"$ {cmd}", "cmd", worker_id)
+            return
+        
+        # Check for thinking/planning
+        thinking_match = self._thinking_pattern.search(line)
+        if thinking_match:
+            thought = thinking_match.group(2)[:40] if thinking_match.group(2) else "..."
+            self.write_log(f"thinking: {thought}", "thinking", worker_id)
+            return
+        
+        # Check for errors/warnings in the line
+        line_lower = line.lower()
+        if "error" in line_lower or "exception" in line_lower or "failed" in line_lower:
+            self.write_log(line[:60], "error", worker_id)
+            return
+        if "warning" in line_lower or "warn" in line_lower:
+            self.write_log(line[:60], "warning", worker_id)
+            return
+        if "success" in line_lower or "completed" in line_lower or "done" in line_lower:
+            self.write_log(line[:60], "success", worker_id)
+            return
 
     def write_log(self, message: str, level: str = "info", worker_id: Optional[str] = None) -> None:
         """Write a log entry to the pane."""
@@ -1151,27 +1327,31 @@ class LogPane(Vertical):
 
 
 class FilePane(Vertical):
-    """File browser pane for project exploration."""
+    """File browser pane for project exploration with enhanced styling."""
     
     DEFAULT_CSS = """
     FilePane {
         height: 100%;
-        border: solid magenta;
+        border: solid #9b59b6;
     }
     
     FilePane #file-header {
         height: 3;
-        background: $surface;
+        background: #8e44ad;
+        color: white;
         padding: 1;
     }
     
     FilePane #file-tree {
         height: 1fr;
+        background: $surface;
     }
     
     FilePane #file-preview {
-        height: 10;
-        border-top: solid $primary;
+        height: 12;
+        border-top: solid #9b59b6;
+        background: $surface-darken-1;
+        padding: 0 1;
     }
     """
     
@@ -1186,9 +1366,9 @@ class FilePane(Vertical):
         self.root_path = root_path
     
     def compose(self) -> ComposeResult:
-        yield Static(f"[bold]Files:[/bold] {self.root_path.name}", id="file-header")
+        yield Static(f"[bold]📁 Files:[/bold] {self.root_path.name}", id="file-header")
         yield DirectoryTree(str(self.root_path), id="file-tree")
-        yield Static("", id="file-preview")
+        yield Static("[dim]Select a file to preview[/dim]", id="file-preview")
     
     def on_directory_tree_file_selected(self, event: DirectoryTree.FileSelected) -> None:
         """Handle file selection."""
@@ -1237,7 +1417,7 @@ class FilePane(Vertical):
         """Change the root directory."""
         self.root_path = root_path
         header = self.query_one("#file-header", Static)
-        header.update(f"[bold]Files:[/bold] {root_path.name}")
+        header.update(f"[bold]📁 Files:[/bold] {root_path.name}")
 
         # Update existing tree in place to avoid duplicate widget IDs.
         tree = self.query_one("#file-tree", DirectoryTree)
@@ -1254,40 +1434,100 @@ class RalphTUI(App):
     CSS = """
     Screen {
         layout: grid;
-        grid-size: 2 3;
-        grid-rows: 1.5fr 1fr 0.3fr;
-        grid-columns: 2fr 1fr;
+        grid-size: 3 2;
+        grid-rows: 1fr 3;
+        grid-columns: 1.4fr 0.8fr 1.2fr;
     }
 
+    /* Main chat area - left column */
     #chat-container {
         row-span: 1;
         column-span: 1;
     }
 
-    #worker-container {
+    /* Center column: stacked Workers + Log */
+    #center-column {
         row-span: 1;
         column-span: 1;
+        layout: vertical;
+    }
+
+    #worker-container {
+        height: auto;
+        min-height: 8;
+        max-height: 14;
     }
 
     #log-container {
-        row-span: 1;
-        column-span: 1;
+        height: 1fr;
     }
 
+    /* File browser - right column, expanded */
     #file-container {
         row-span: 1;
         column-span: 1;
     }
 
+    /* Progress bar - full width bottom */
     #progress-container {
         row-span: 1;
-        column-span: 2;
+        column-span: 3;
+        height: 3;
     }
 
     .pane-title {
         text-style: bold;
         background: $surface;
         padding: 0 1;
+    }
+
+    /* Enhanced color scheme with vivid borders */
+    ChatPane {
+        border: solid #2ecc71;
+    }
+    
+    ChatPane #chat-log {
+        background: $surface;
+    }
+    
+    WorkerPane {
+        border: solid #3498db;
+    }
+    
+    WorkerPane #worker-header {
+        background: #2980b9;
+        color: white;
+    }
+    
+    WorkerPane DataTable {
+        background: $surface;
+    }
+    
+    LogPane {
+        border: solid #e67e22;
+    }
+    
+    LogPane #log-header {
+        background: #d35400;
+        color: white;
+    }
+    
+    FilePane {
+        border: solid #9b59b6;
+    }
+    
+    FilePane #file-header {
+        background: #8e44ad;
+        color: white;
+    }
+    
+    FilePane DirectoryTree {
+        background: $surface;
+    }
+    
+    ProgressPane {
+        border-top: solid #f1c40f;
+        background: $surface-darken-1;
     }
     """
     
@@ -1335,22 +1575,29 @@ class RalphTUI(App):
     
     def compose(self) -> ComposeResult:
         yield Header()
+        # Left column: Chat
         yield Container(
             ChatPane(id="chat-pane"),
             id="chat-container"
         )
-        yield Container(
-            WorkerPane(id="worker-pane"),
-            id="worker-container"
+        # Center column: Workers (compact) + System Log (expanded)
+        yield Vertical(
+            Container(
+                WorkerPane(id="worker-pane"),
+                id="worker-container"
+            ),
+            Container(
+                LogPane(id="log-pane"),
+                id="log-container"
+            ),
+            id="center-column"
         )
-        yield Container(
-            LogPane(id="log-pane"),
-            id="log-container"
-        )
+        # Right column: File browser (expanded)
         yield Container(
             FilePane(id="file-pane"),
             id="file-container"
         )
+        # Bottom: Progress bar
         yield Container(
             ProgressPane(id="progress-pane"),
             id="progress-container"
@@ -1459,6 +1706,10 @@ class RalphTUI(App):
 
             # Update tracked status
             self._last_task_stats[t_id] = str(t_status)
+
+        # Scan worker log files for real-time activity updates
+        if log_pane:
+            log_pane.scan_worker_logs(run_id)
     
     def on_chat_pane_command_submitted(self, event: ChatPane.CommandSubmitted) -> None:
         """Handle commands from chat pane."""

@@ -158,17 +158,23 @@ CREATE TABLE IF NOT EXISTS workers (
       run_id TEXT
   );
 
-  CREATE INDEX IF NOT EXISTS idx_completed_tasks_hash ON completed_tasks(task_hash);
-  CREATE INDEX IF NOT EXISTS idx_completed_tasks_source ON completed_tasks(source_hash);
- EOF
+   CREATE INDEX IF NOT EXISTS idx_completed_tasks_hash ON completed_tasks(task_hash);
+   CREATE INDEX IF NOT EXISTS idx_completed_tasks_source ON completed_tasks(source_hash);
+  EOF
+
+    # Migration: Add missing columns to existing tables (for schema upgrades)
+    # These ALTER TABLE statements are safe even if columns already exist
+    sqlite3 "$db_path" "ALTER TABLE swarm_runs ADD COLUMN source_hash TEXT;" 2>/dev/null || true
+    sqlite3 "$db_path" "ALTER TABLE tasks ADD COLUMN task_hash TEXT;" 2>/dev/null || true
 
     # Set default configuration values
     sqlite3 "$db_path" "INSERT OR IGNORE INTO swarm_config (key, value, updated_at) VALUES ('swarm_max_workers', '${SWARM_MAX_WORKERS:-8}', datetime('now'));"
     sqlite3 "$db_path" "INSERT OR IGNORE INTO swarm_config (key, value, updated_at) VALUES ('swarm_spawn_delay', '${SWARM_SPAWN_DELAY:-1}', datetime('now'));"
     sqlite3 "$db_path" "INSERT OR IGNORE INTO swarm_config (key, value, updated_at) VALUES ('swarm_max_total_workers', '${SWARM_MAX_TOTAL_WORKERS:-16}', datetime('now'));"
-    sqlite3 "$db_path" "INSERT OR IGNORE INTO swarm_config (key, value, updated_at) VALUES ('swarm_max_processes_per_worker', '${SWARM_MAX_PROCESSES_PER_WORKER:-50}', datetime('now'));"
-    sqlite3 "$db_path" "INSERT OR IGNORE INTO swarm_config (key, value, updated_at) VALUES ('swarm_max_memory_mb', '${SWARM_MAX_MEMORY_MB:-1024}', datetime('now'));"
-    sqlite3 "$db_path" "INSERT OR IGNORE INTO swarm_config (key, value, updated_at) VALUES ('swarm_max_cpu_seconds', '${SWARM_MAX_CPU_SECONDS:-3600}', datetime('now'));"
+    # Resource limits disabled by default (0 = no limit) to prevent fork errors
+    sqlite3 "$db_path" "INSERT OR IGNORE INTO swarm_config (key, value, updated_at) VALUES ('swarm_max_processes_per_worker', '${SWARM_MAX_PROCESSES_PER_WORKER:-0}', datetime('now'));"
+    sqlite3 "$db_path" "INSERT OR IGNORE INTO swarm_config (key, value, updated_at) VALUES ('swarm_max_memory_mb', '${SWARM_MAX_MEMORY_MB:-0}', datetime('now'));"
+    sqlite3 "$db_path" "INSERT OR IGNORE INTO swarm_config (key, value, updated_at) VALUES ('swarm_max_cpu_seconds', '${SWARM_MAX_CPU_SECONDS:-0}', datetime('now'));"
 
     echo "Database initialized at: $db_path"
 }

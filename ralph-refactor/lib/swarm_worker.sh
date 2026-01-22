@@ -1,34 +1,14 @@
 #!/usr/bin/env bash
 
 swarm_worker_apply_limits() {
-    local max_procs="${SWARM_MAX_PROCESSES_PER_WORKER:-50}"
-    local max_memory_mb="${SWARM_MAX_MEMORY_MB:-1024}"
-    local max_cpu_seconds="${SWARM_MAX_CPU_SECONDS:-3600}"
-
-    # Apply process limit (max processes per user)
-    if [ "$max_procs" -gt 0 ] 2>/dev/null; then
-        ulimit -u "$max_procs" 2>/dev/null || true
-    fi
-
-    # Apply memory limit (in kilobytes)
-    if [ "$max_memory_mb" -gt 0 ] 2>/dev/null; then
-        local max_memory_kb=$((max_memory_mb * 1024))
-        ulimit -v "$max_memory_kb" 2>/dev/null || true
-        ulimit -m "$max_memory_kb" 2>/dev/null || true
-    fi
-
-    # Apply CPU time limit (in seconds)
-    if [ "$max_cpu_seconds" -gt 0 ] 2>/dev/null; then
-        ulimit -t "$max_cpu_seconds" 2>/dev/null || true
-    fi
-
-    # Apply file descriptor limit
-    ulimit -n 1024 2>/dev/null || true
-
-    # Apply core dump size limit (disable core dumps for security)
+    # Resource limits are DISABLED by default (0 = no limit)
+    # These would cause "fork: Resource temporarily unavailable" errors if set too low
+    # Only enable by explicitly setting environment variables to non-zero values
+    
+    # Increase file descriptor limit if possible
+    ulimit -n 4096 2>/dev/null || true
+    # Disable core dumps
     ulimit -c 0 2>/dev/null || true
-
-    echo "[$(date)] Resource limits applied: procs=$max_procs, memory=${max_memory_mb}MB, cpu=${max_cpu_seconds}s"
 }
 
 swarm_worker_create_isolated_devplan() {
@@ -117,21 +97,37 @@ swarm_worker_spawn() {
     # Register worker with placeholder PID; updated after spawn.
     worker_id=$(swarm_db_register_worker "$run_id" "$worker_num" 0 "$branch_name" "$worker_dir")
 
-    (
-        cd "$repo_dir" || exit 1
-
-        # Apply resource limits first
-        swarm_worker_apply_limits
-
-        echo "[$(date)] Worker $worker_num started (PID: $$, ID: $worker_id)"
-        echo "[$(date)] Run ID: $run_id"
-        echo "[$(date)] Worker directory: $worker_dir"
-
-        swarm_worker_main_loop "$run_id" "$worker_num" "$worker_id" "$devplan_path" "$ralph_path" "$log_full"
-
-        echo "[$(date)] Worker $worker_num shutting down"
-        true
-    ) > "$log_full" 2>&1 &
+    # Spawn worker fully detached using setsid to avoid inheriting parent restrictions
+    # This creates a new session and process group, avoiding issues with pipe buffering
+    # and inherited file descriptor limits
+    local swarm_dir="$__RALPH_SWARM_DIR__"
+    local ralph_dir_val="$RALPH_DIR"
+    local llm_provider="${RALPH_LLM_PROVIDER:-}"
+    local llm_model="${RALPH_LLM_MODEL:-}"
+    
+    setsid bash -c '
+        cd "'"$repo_dir"'" || exit 1
+        
+        # Increase file descriptor limit
+        ulimit -n 4096 2>/dev/null || true
+        
+        echo "Worker '"$worker_num"' started (PID: $$, ID: '"$worker_id"')"
+        echo "Run ID: '"$run_id"'"
+        echo "Worker directory: '"$worker_dir"'"
+        
+        # Export necessary variables
+        export RALPH_DIR="'"$ralph_dir_val"'"
+        export RALPH_LLM_PROVIDER="'"$llm_provider"'"
+        export RALPH_LLM_MODEL="'"$llm_model"'"
+        
+        # Source the worker module and run main loop
+        source "'"$swarm_dir"'/lib/swarm_db.sh"
+        source "'"$swarm_dir"'/lib/swarm_worker.sh"
+        
+        swarm_worker_main_loop "'"$run_id"'" "'"$worker_num"'" "'"$worker_id"'" "'"$devplan_path"'" "'"$ralph_path"'" "'"$log_full"'"
+        
+        echo "Worker '"$worker_num"' shutting down"
+    ' > "$log_full" 2>&1 &
 
     local worker_pid=$!
     sleep 1

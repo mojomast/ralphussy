@@ -12,6 +12,39 @@ An upgraded Terminal User Interface (TUI) for Ralph with:
 3. **Resume/Persistence** - Progress saving across runs
 4. **Swarm Containment** - Resource limits and emergency controls
 
+Bug Fix (2026-01-22)
+--------------------
+Fixed critical database schema bug that caused swarm runs to fail silently:
+
+**Problem**: The `swarm_runs` table was missing the `source_hash` column. When `swarm_db_start_run()` tried to insert a new run, the INSERT failed but errors were silently swallowed by the sqlite3 shim. This caused:
+- New runs to not appear in the TUI progress display
+- Progress showing stale data from old runs
+- Workers dying immediately after spawn
+
+**Root Cause**:
+- Database schema was updated in code but not migrated for existing databases
+- The Python sqlite3 shim (`ralph-refactor/tools/sqlite3`) caught exceptions and silently continued on error
+- Task IDs continued incrementing across projects because runs weren't properly isolated
+
+**Solution**:
+1. Added migration logic to `swarm_db_init()` to add missing columns:
+   - `source_hash` column to `swarm_runs` table
+   - `task_hash` column to `tasks` table
+2. Fixed sqlite3 shim to log errors to stderr instead of silently swallowing them
+3. Added `ALTER TABLE` statements with `2>/dev/null || true` for safe migration
+
+**Files Changed**:
+- `ralph-refactor/lib/swarm_db.sh` - Added migration logic
+- `ralph-refactor/tools/sqlite3` - Fixed error handling
+
+**To Fix Existing Installations**:
+```bash
+# The fix is automatic on next ralph-swarm run
+# Manual fix if needed:
+sqlite3 ~/.ralph/swarm.db "ALTER TABLE swarm_runs ADD COLUMN source_hash TEXT;"
+sqlite3 ~/.ralph/swarm.db "ALTER TABLE tasks ADD COLUMN task_hash TEXT;"
+```
+
 Core Features
 -------------
 

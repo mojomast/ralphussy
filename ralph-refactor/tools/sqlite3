@@ -13,13 +13,8 @@ def main():
         print('Missing db path')
         sys.exit(1)
 
-    # Read SQL either from args (joined) or stdin
-    if len(sys.argv) >= 3:
-        sql = ' '.join(sys.argv[2:])
-    else:
-        sql = sys.stdin.read()
+    sql = ' '.join(sys.argv[2:]) if len(sys.argv) >= 3 else sys.stdin.read()
 
-    # Ensure directory exists
     db_dir = os.path.dirname(db_path)
     if db_dir and not os.path.exists(db_dir):
         try:
@@ -28,26 +23,26 @@ def main():
             pass
 
     conn = sqlite3.connect(db_path)
-    conn.isolation_level = None  # allow explicit BEGIN/COMMIT
+    conn.isolation_level = None
     cur = conn.cursor()
 
-    # Split statements by semicolon for handling SELECT outputs
     statements = [s.strip() for s in sql.split(';') if s.strip()]
 
     try:
         for stmt in statements:
-            # Normalize leading keyword
             stmt_upper = stmt.lstrip().upper()
             try:
                 cur.execute(stmt)
-            except sqlite3.Error:
-                # Try executescript for multi-statement blocks
+            except sqlite3.Error as e:
                 try:
                     conn.executescript(stmt)
-                except sqlite3.Error:
+                except sqlite3.Error as e2:
+                    err_str = str(e2).lower()
+                    if 'already exists' not in err_str and 'duplicate column' not in err_str:
+                        print(f"sqlite3 error: {e2}", file=sys.stderr)
+                        print(f"  statement: {stmt[:100]}...", file=sys.stderr)
                     continue
 
-            # If statement is a query or contains RETURNING, fetch and print rows
             if (stmt_upper.startswith('SELECT') or stmt_upper.startswith('PRAGMA') or 'RETURNING' in stmt_upper):
                 try:
                     rows = cur.fetchall()
@@ -58,7 +53,6 @@ def main():
                             return str(item)
                         print('|'.join(fmt(item) for item in row))
                 except sqlite3.Error:
-                    # Nothing to fetch
                     pass
         conn.commit()
     finally:

@@ -1,24 +1,124 @@
 #!/usr/bin/env bash
 
+# Check if a process is running by PID
+swarm_scheduler_is_pid_alive() {
+    local pid="$1"
+    [ -n "$pid" ] && [ "$pid" != "NULL" ] && [ "$pid" != "0" ] && kill -0 "$pid" 2>/dev/null
+}
+
+# Detect dead workers and requeue their tasks
+swarm_scheduler_cleanup_dead_workers() {
+    local run_id="$1"
+    local db_path="$RALPH_DIR/swarm.db"
+    local dead_count=0
+    local requeued_count=0
+
+    # Get all workers for this run
+    while IFS='|' read -r worker_id worker_num pid branch status current_task started_at heartbeat; do
+        [ -z "$worker_id" ] && continue
+        
+        # Check if worker process is actually running
+        if ! swarm_scheduler_is_pid_alive "$pid"; then
+            echo "[SCHEDULER] Worker $worker_num (PID: $pid) is DEAD"
+            dead_count=$((dead_count + 1))
+            
+            # Requeue the current task if any
+            if [ -n "$current_task" ] && [ "$current_task" != "NULL" ]; then
+                echo "[SCHEDULER] Requeuing task $current_task from dead worker $worker_num"
+                sqlite3 "$db_path" <<EOF
+UPDATE tasks 
+SET status = 'pending', 
+    worker_id = NULL, 
+    started_at = NULL,
+    stall_count = COALESCE(stall_count, 0) + 1
+WHERE id = $current_task AND status = 'in_progress';
+EOF
+                requeued_count=$((requeued_count + 1))
+            fi
+            
+            # Mark worker as dead/stopped
+            sqlite3 "$db_path" <<EOF
+UPDATE workers 
+SET status = 'stopped', 
+    current_task_id = NULL 
+WHERE id = $worker_id;
+EOF
+            
+            # Release any locks held by this worker
+            swarm_db_release_locks "$worker_id" 2>/dev/null || true
+        fi
+    done < <(swarm_db_list_workers "$run_id" 2>/dev/null)
+
+    # Also check for orphaned in_progress tasks (worker_id points to dead/stopped worker)
+    local orphaned_tasks
+    orphaned_tasks=$(sqlite3 "$db_path" <<EOF
+SELECT t.id, t.worker_id, w.pid, w.status as worker_status
+FROM tasks t
+LEFT JOIN workers w ON t.worker_id = w.id
+WHERE t.run_id = '$run_id' 
+AND t.status = 'in_progress'
+AND (w.status = 'stopped' OR w.status IS NULL OR w.id IS NULL);
+EOF
+)
+    
+    if [ -n "$orphaned_tasks" ]; then
+        echo "$orphaned_tasks" | while IFS='|' read -r task_id worker_id pid worker_status; do
+            [ -z "$task_id" ] && continue
+            echo "[SCHEDULER] Requeuing orphaned task $task_id (worker was $worker_status)"
+            sqlite3 "$db_path" <<EOF
+UPDATE tasks 
+SET status = 'pending', 
+    worker_id = NULL, 
+    started_at = NULL,
+    stall_count = COALESCE(stall_count, 0) + 1
+WHERE id = $task_id;
+EOF
+            requeued_count=$((requeued_count + 1))
+        done
+    fi
+
+    if [ $dead_count -gt 0 ] || [ $requeued_count -gt 0 ]; then
+        echo "[SCHEDULER] Cleanup: $dead_count dead workers, $requeued_count tasks requeued"
+    fi
+    
+    echo "$dead_count"
+}
+
+# Count alive workers
+swarm_scheduler_count_alive_workers() {
+    local run_id="$1"
+    local alive=0
+    
+    while IFS='|' read -r worker_id worker_num pid rest; do
+        [ -z "$worker_id" ] && continue
+        if swarm_scheduler_is_pid_alive "$pid"; then
+            alive=$((alive + 1))
+        fi
+    done < <(swarm_db_list_workers "$run_id" 2>/dev/null)
+    
+    echo "$alive"
+}
+
 swarm_scheduler_main_loop() {
     local run_id="$1"
-    local stop_timeout="${2:-60}"
+    local stop_timeout="${2:-3600}"
     local verbose="${3:-false}"
 
     echo "Scheduler started for run $run_id"
-    echo "Poll interval: 1 second"
+    echo "Poll interval: 5 seconds"
     echo "Stop timeout: $stop_timeout seconds"
     echo ""
 
     local iteration=0
     local last_status_check=0
-    local workers_found=0
-    local tasks_found=0
+    local last_cleanup_check=0
+    local scheduler_start_time=$(date +%s)
 
     while true; do
         iteration=$((iteration + 1))
         current_time=$(date +%s)
 
+        # Periodic status display
         if [ $current_time -ge $last_status_check ]; then
             local status_info
             status_info=$(swarm_db_get_run_status "$run_id" 2>/dev/null)
@@ -31,45 +131,61 @@ swarm_scheduler_main_loop() {
             fi
         fi
 
+        # Periodic dead worker cleanup (every 15 seconds)
+        if [ $((current_time - last_cleanup_check)) -ge 15 ]; then
+            local dead_workers
+            dead_workers=$(swarm_scheduler_cleanup_dead_workers "$run_id")
+            last_cleanup_check=$current_time
+            
+            # Check if ALL workers are dead
+            local alive_workers
+            alive_workers=$(swarm_scheduler_count_alive_workers "$run_id")
+            if [ "$alive_workers" -eq 0 ]; then
+                echo ""
+                echo "[SCHEDULER] All workers have died! No alive workers remaining."
+                echo "[SCHEDULER] Run '/swarm resume $run_id' to restart workers and continue."
+                break
+            fi
+        fi
+
         local pending_tasks
         pending_tasks=$(swarm_db_get_pending_tasks "$run_id" 2>/dev/null | wc -l)
         local worker_stats
         worker_stats=$(swarm_db_get_worker_stats "$run_id" 2>/dev/null || echo "")
+        local alive_workers
+        alive_workers=$(swarm_scheduler_count_alive_workers "$run_id")
 
-        echo "[${current_time}] Iteration $iteration: $pending_tasks pending tasks, $worker_stats"
+        if [ "$verbose" = "true" ] || [ $((iteration % 10)) -eq 0 ]; then
+            echo "[${current_time}] Iteration $iteration: $pending_tasks pending, $alive_workers alive workers"
+        fi
 
         if [ $pending_tasks -eq 0 ]; then
             echo ""
             echo "No pending tasks remaining"
 
-            local all_workers_stopped=true
-            local worker_id
-            for worker_id in $(swarm_db_list_workers "$run_id" 2>/dev/null | awk -F'|' '{print $1}'); do
-                local worker_status
-                worker_status=$(swarm_db_worker_status "$run_id" "$worker_id" 2>/dev/null | awk -F'|' '{print $5}')
-                if [ "$worker_status" = "in_progress" ]; then
-                    all_workers_stopped=false
-                    break
-                fi
-            done
-
-            if $all_workers_stopped; then
-                echo "All workers have stopped"
-                break
-            else
-                echo "Waiting for in-progress workers to complete..."
+            # Check for in-progress tasks
+            local in_progress_count
+            in_progress_count=$(sqlite3 "$RALPH_DIR/swarm.db" "SELECT COUNT(*) FROM tasks WHERE run_id = '$run_id' AND status = 'in_progress';" 2>/dev/null || echo "0")
+            
+            if [ "$in_progress_count" -gt 0 ]; then
+                echo "Waiting for $in_progress_count in-progress tasks to complete..."
                 sleep 5
                 continue
+            else
+                echo "All tasks completed or failed"
+                break
             fi
         fi
 
-        if [ $iteration -ge $stop_timeout ]; then
+        # Check for timeout using local start time (not database start time)
+        local elapsed=$((current_time - scheduler_start_time))
+        if [ $elapsed -ge $stop_timeout ]; then
             echo ""
-            echo "Timeout reached after $stop_timeout seconds"
+            echo "Timeout reached after $elapsed seconds"
             break
         fi
 
-        sleep 1
+        sleep 5
     done
 
     echo ""
