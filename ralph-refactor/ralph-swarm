@@ -465,16 +465,63 @@ swarm_orchestrator_status() {
     echo "=== Swarm Run Status: $run_id ==="
     echo ""
     echo "Run Status:"
-    swarm_db_get_run_status "$run_id" || true
+    local run_status
+    run_status=$(swarm_db_get_run_status "$run_id" || true)
+    if [ -n "$run_status" ]; then
+        while IFS='|' read -r status total completed failed started completed_at; do
+            [ -z "$status" ] && continue
+            echo "  Status: $status"
+            echo "  Total Tasks: $total"
+            echo "  Completed: $completed"
+            echo "  Failed: $failed"
+            [ -n "$started" ] && [ "$started" != "NULL" ] && echo "  Started: $started"
+            [ -n "$completed_at" ] && [ "$completed_at" != "NULL" ] && echo "  Completed: $completed_at"
+        done <<< "$run_status"
+    fi
     echo ""
     echo "Workers:"
-    swarm_db_list_workers "$run_id" || true
+    local workers_output
+    workers_output=$(swarm_db_list_workers "$run_id" || true)
+    if [ -n "$workers_output" ]; then
+        while IFS='|' read -r id worker_num pid branch status current_task started_at heartbeat rest; do
+            [ -z "$id" ] && continue
+            local pid_display="${pid:-NULL}"
+            local task_display="${current_task:-None}"
+            echo "  Worker #$worker_num: status=$status, pid=$pid_display, current_task=$task_display"
+        done <<< "$workers_output"
+    else
+        echo "  No workers"
+    fi
     echo ""
     echo "Tasks by Status:"
-    swarm_db_get_task_count_by_status "$run_id" || true
+    local task_stats
+    task_stats=$(swarm_db_get_task_count_by_status "$run_id" || true)
+    if [ -n "$task_stats" ]; then
+        while IFS='|' read -r status count; do
+            [ -z "$status" ] && continue
+            echo "  $status: $count"
+        done <<< "$task_stats"
+    else
+        echo "  No tasks found"
+    fi
     echo ""
-    echo "Pending Tasks:"
-    swarm_db_get_pending_tasks "$run_id" || true
+    echo "Pending Tasks (up to 10):"
+    local pending_tasks
+    pending_tasks=$(swarm_db_get_pending_tasks "$run_id" || true)
+    if [ -n "$pending_tasks" ]; then
+        local count=0
+        while IFS='|' read -r task_id task_text priority estimated_files devplan_line; do
+            [ -z "$task_id" ] && continue
+            echo "  [$task_id] $task_text"
+            count=$((count + 1))
+            if [ $count -ge 10 ]; then
+                echo "  ... and more"
+                break
+            fi
+        done <<< "$pending_tasks"
+    else
+        echo "  No pending tasks"
+    fi
 }
 
 swarm_orchestrator_stop() {

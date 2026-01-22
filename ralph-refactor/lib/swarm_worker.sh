@@ -12,11 +12,49 @@ swarm_worker_apply_limits() {
     # Resource limits are DISABLED by default (0 = no limit)
     # These would cause "fork: Resource temporarily unavailable" errors if set too low
     # Only enable by explicitly setting environment variables to non-zero values
-    
+
     # Increase file descriptor limit if possible
     ulimit -n 4096 2>/dev/null || true
     # Disable core dumps
     ulimit -c 0 2>/dev/null || true
+}
+
+swarm_worker_check_commit_for_task() {
+    local run_id="$1"
+    local task_id="$2"
+    local task_text="$3"
+    local worker_dir="$4"
+
+    local repo_dir="$worker_dir/repo"
+
+    if [ ! -d "$repo_dir/.git" ]; then
+        echo "check:skip"
+        return
+    fi
+
+    # Try to find commits that match the task text
+    # We search for commits whose message contains keywords from the task
+    local task_keywords
+    task_keywords=$(echo "$task_text" | grep -oE '\b[a-zA-Z]{4,}\b' | head -n 5 | tr '\n' '|' | sed 's/|$//')
+
+    if [ -z "$task_keywords" ]; then
+        echo "check:skip"
+        return
+    fi
+
+    local matching_commit
+    matching_commit=$(cd "$repo_dir" && git log --all --grep="$task_keywords" --oneline 2>/dev/null | head -n 1 || true)
+
+    if [ -n "$matching_commit" ]; then
+        local commit_hash
+        commit_hash=$(echo "$matching_commit" | cut -d' ' -f1)
+        local commit_msg
+        commit_msg=$(echo "$matching_commit" | cut -d' ' -f2-)
+        echo "check:found|$commit_hash|$commit_msg"
+        return
+    fi
+
+    echo "check:not_found"
 }
 
 swarm_worker_create_isolated_devplan() {
@@ -199,6 +237,35 @@ swarm_worker_main_loop() {
         fi
 
         swarm_db_worker_heartbeat "$worker_id"
+
+        # Check if this task has already been completed by checking for matching commits
+        local worker_dir
+        worker_dir="$RALPH_DIR/swarm/runs/$run_id/worker-$worker_num"
+        local commit_check_result
+        commit_check_result=$(swarm_worker_check_commit_for_task "$run_id" "$task_id" "$task_text" "$worker_dir")
+
+        local check_status
+        check_status=$(echo "$commit_check_result" | cut -d'|' -f1)
+
+        if [ "$check_status" = "check:found" ]; then
+            local commit_hash
+            commit_hash=$(echo "$commit_check_result" | cut -d'|' -f2)
+            local commit_msg
+            commit_msg=$(echo "$commit_check_result" | cut -d'|' -f3-)
+
+            echo "[$(date)] Task $task_id already completed (found commit: $commit_hash)"
+            echo "[$(date)] Commit message: $commit_msg"
+
+            if [ "${SWARM_OUTPUT_MODE:-}" = "live" ]; then
+                echo -e "${GREEN}✓${NC} Worker $worker_num skipping task $task_id (already done)"
+                echo -e "${GREEN}✓${NC}   Found commit: $commit_hash - ${commit_msg:0:60}..."
+                echo ""
+            fi
+
+            # Mark task as completed
+            swarm_db_complete_task "$task_id" "$estimated_files" "$worker_id"
+            continue
+        fi
 
         # Update global heartbeat before task execution
         if command -v swarm_db_heartbeat_worker_global >/dev/null 2>&1; then

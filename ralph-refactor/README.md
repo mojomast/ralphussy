@@ -64,7 +64,7 @@ Swarm CLI
 ---------
 
 The `ralph-refactor/ralph-swarm` script provides a small CLI to run a parallel
-"swarm" over a devplan file or a decomposed prompt. It uses the OpenCode CLI
+"swarm" over a devplan file or a decomposed prompt. It uses OpenCode CLI
 (`opencode run --format json`) for analysis and for worker runs. Basic usage:
 
 1. Analyze a devplan (no network calls):
@@ -73,25 +73,41 @@ The `ralph-refactor/ralph-swarm` script provides a small CLI to run a parallel
 ./ralph-refactor/ralph-swarm --analyze ralph-refactor/tests/devplan_complex.md
 ```
 
-2. Run the swarm against a devplan (example using GitHub Copilot / Gemini):
+2. Run swarm against a devplan (default uses `zai-coding-plan/glm-4.7`):
 
 ```bash
 RALPH_DIR=/tmp/ralph_swarm_run \
-RALPH_LLM_PROVIDER=github-copilot \
-RALPH_LLM_MODEL=github-copilot/gemini-3-flash-preview \
 ./ralph-refactor/ralph-swarm --devplan ralph-refactor/tests/devplan_complex.md --workers 4 --timeout 3600
 ```
 
-- `RALPH_DIR` points at state/log/run artifacts (default: `~/.ralph`).
-- `RALPH_LLM_PROVIDER` and `RALPH_LLM_MODEL` are forwarded to `opencode run`.
-- Ensure `opencode` is installed and configured to use the provider/model you
-  select (see OpenCode docs).
+Or with live output:
 
-3. Helpful runtime commands (use the same `RALPH_DIR`):
+```bash
+RALPH_DIR=/tmp/ralph_swarm_run \
+SWARM_OUTPUT_MODE=live \
+./ralph-refactor/ralph-swarm --devplan ralph-refactor/tests/devplan_complex.md --workers 2
+```
+
+- `RALPH_DIR` points at state/log/run artifacts (default: `~/.ralph`).
+- Default model is `zai-coding-plan/glm-4.7` (set in `lib/core.sh`).
+- Override provider/model via `RALPH_LLM_PROVIDER` and `RALPH_LLM_MODEL`.
+- Ensure `opencode` is installed and configured.
+
+3. Resume a previous swarm run:
+
+```bash
+RALPH_DIR=/tmp/ralph_swarm_run \
+./ralph-refactor/ralph-swarm --resume 20260122_230145
+```
+
+4. Helpful runtime commands (use the same `RALPH_DIR`):
 
 ```bash
 # show status
 RALPH_DIR=/tmp/ralph_swarm_run ./ralph-refactor/ralph-swarm --status
+
+# show status for a specific run
+RALPH_DIR=/tmp/ralph_swarm_run ./ralph-refactor/ralph-swarm --status 20260122_230145
 
 # tail aggregated logs
 RALPH_DIR=/tmp/ralph_swarm_run ./ralph-refactor/ralph-swarm --logs --lines 200
@@ -103,10 +119,18 @@ RALPH_DIR=/tmp/ralph_swarm_run ./ralph-refactor/ralph-swarm --stop
 Environment toggles:
 - `SWARM_AUTO_MERGE=true` (auto-merge worker branches at the end)
 - `SWARM_PUSH_AFTER_MERGE=true` (push merged main branch to origin)
+- `SWARM_OUTPUT_MODE=live` (show real-time task progress)
+- `SWARM_TASK_TIMEOUT=600` (default 10 minutes per task)
+- `SWARM_MAX_WORKERS=8` (max workers per run)
+- `SWARM_MAX_TOTAL_WORKERS=16` (max concurrent workers system-wide)
 
 Note: Worker execution runs `opencode run` inside isolated git worktrees created
 per worker. The LLM must perform repository edits and commit them (or produce
 patches) for merges to be meaningful.
+
+**Resume Behavior**: When resuming a swarm run, workers check for existing git
+commits matching task descriptions before executing. Tasks with matching commits are
+automatically marked as complete and skipped.
 
 Ralph TUI
 ---------

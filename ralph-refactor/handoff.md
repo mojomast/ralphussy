@@ -277,3 +277,201 @@ Worker 1 completed task 1565
 
 1. `lib/swarm_worker.sh:329-333` - Fixed token aggregation to sum all events
 2. `lib/swarm_worker.sh:338-344` - Added debug warning for 0 token cases
+3. `lib/json.sh:14` - Fixed critical jq syntax error for text extraction
+4. `lib/swarm_worker.sh:356-374` - Enhanced completion detection with multiple patterns
+5. `lib/swarm_worker.sh:259-272` - Added critical instruction emphasis
+
+---
+
+# Handoff: Swarm Resume & Display Fixes
+
+## Date
+2026-01-22
+
+## Context
+After attempting to resume a swarm run, identified three issues:
+1. Model configuration was not using the correct provider (`zai-coding-plan/glm-4.7`)
+2. Status display showed garbled pipe-delimited output instead of formatted output
+3. When resuming tasks, workers would re-do work already committed to the repo
+
+## What Was Fixed
+
+### 1. Model Configuration Verification
+
+**Status:** ✅ Already correct in `lib/core.sh:35-36`
+
+The default model configuration was already set correctly:
+```bash
+MODEL="${MODEL:-glm-4.7}"
+PROVIDER="${PROVIDER:-zai-coding-plan}"
+```
+
+No changes needed. The swarm will use `zai-coding-plan/glm-4.7` by default.
+
+### 2. Fixed Display Encoding Issue
+
+**File:** `ralph-swarm:453-507`
+
+**Problem:** `swarm_orchestrator_status()` was outputting raw pipe-delimited SQL results directly to the terminal, causing the "weird encoding" seen at the end of task lists.
+
+**Root Cause:** The function called `swarm_db_get_run_status()`, `swarm_db_list_workers()`, `swarm_db_get_task_count_by_status()`, and `swarm_db_get_pending_tasks()` but didn't parse their pipe-delimited output.
+
+**Fix:** Added proper parsing to format SQL output into human-readable display:
+
+```bash
+# Before (raw SQL output):
+echo "Run Status:"
+swarm_db_get_run_status "$run_id" || true
+# Output: running|59|0|0|2026-01-22 23:01:45|
+
+# After (formatted):
+echo "Run Status:"
+local run_status=$(swarm_db_get_run_status "$run_id" || true)
+if [ -n "$run_status" ]; then
+    while IFS='|' read -r status total completed failed started completed_at; do
+        echo "  Status: $status"
+        echo "  Total Tasks: $total"
+        echo "  Completed: $completed"
+        echo "  Failed: $failed"
+        [ -n "$started" ] && echo "  Started: $started"
+    done <<< "$run_status"
+fi
+```
+
+Applied the same fix to:
+- Workers display
+- Tasks by Status display
+- Pending Tasks display (limited to 10 tasks)
+
+### 3. Added Commit Checking When Resuming Tasks
+
+**File:** `lib/swarm_worker.sh:21-60` (new function)
+**File:** `lib/swarm_worker.sh:239-267` (integrated into main loop)
+
+**Problem:** When resuming a swarm run, workers would execute all pending tasks even if the work was already done and committed to the git repository.
+
+**Solution:** Added `swarm_worker_check_commit_for_task()` function that:
+
+1. Checks if the worker's repo has a git history
+2. Extracts keywords from the task description
+3. Searches for commits matching those keywords
+4. Returns the commit hash and message if found
+
+**Implementation:**
+
+```bash
+swarm_worker_check_commit_for_task() {
+    local run_id="$1"
+    local task_id="$2"
+    local task_text="$3"
+    local worker_dir="$4"
+
+    local repo_dir="$worker_dir/repo"
+
+    if [ ! -d "$repo_dir/.git" ]; then
+        echo "check:skip"
+        return
+    fi
+
+    # Extract keywords from task (4+ letter words)
+    local task_keywords
+    task_keywords=$(echo "$task_text" | grep -oE '\b[a-zA-Z]{4,}\b' | head -n 5 | tr '\n' '|' | sed 's/|$//')
+
+    if [ -z "$task_keywords" ]; then
+        echo "check:skip"
+        return
+    fi
+
+    # Search for matching commits
+    local matching_commit
+    matching_commit=$(cd "$repo_dir" && git log --all --grep="$task_keywords" --oneline 2>/dev/null | head -n 1 || true)
+
+    if [ -n "$matching_commit" ]; then
+        local commit_hash=$(echo "$matching_commit" | cut -d' ' -f1)
+        local commit_msg=$(echo "$matching_commit" | cut -d' ' -f2-)
+        echo "check:found|$commit_hash|$commit_msg"
+        return
+    fi
+
+    echo "check:not_found"
+}
+```
+
+**Integration:** Added commit check in `swarm_worker_main_loop()` right after claiming a task:
+
+```bash
+# Check if this task has already been completed by checking for matching commits
+local worker_dir="$RALPH_DIR/swarm/runs/$run_id/worker-$worker_num"
+local commit_check_result=$(swarm_worker_check_commit_for_task "$run_id" "$task_id" "$task_text" "$worker_dir")
+
+local check_status=$(echo "$commit_check_result" | cut -d'|' -f1)
+
+if [ "$check_status" = "check:found" ]; then
+    local commit_hash=$(echo "$commit_check_result" | cut -d'|' -f2)
+    local commit_msg=$(echo "$commit_check_result" | cut -d'|' -f3-)
+
+    echo "[$(date)] Task $task_id already completed (found commit: $commit_hash)"
+    echo "[$(date)] Commit message: $commit_msg"
+
+    if [ "${SWARM_OUTPUT_MODE:-}" = "live" ]; then
+        echo -e "${GREEN}✓${NC} Worker $worker_num skipping task $task_id (already done)"
+        echo -e "${GREEN}✓${NC}   Found commit: $commit_hash - ${commit_msg:0:60}..."
+        echo ""
+    fi
+
+    # Mark task as completed without re-executing
+    swarm_db_complete_task "$task_id" "$estimated_files" "$worker_id"
+    continue
+fi
+```
+
+**Result:** When resuming a swarm run, workers now:
+- Check for existing commits before executing tasks
+- Skip tasks that have matching commits
+- Mark those tasks as complete in the database
+- Show live output indicating the task was skipped
+
+### 4. Updated Documentation
+
+**File:** `ralph-refactor/README.md:63-125`
+
+Enhanced the Swarm CLI documentation with:
+- Default model information (`zai-coding-plan/glm-4.7`)
+- Live output mode (`SWARM_OUTPUT_MODE=live`)
+- Resume command example
+- Updated environment variable toggles
+- Resume behavior documentation
+
+## Restart Command
+
+To restart the project with all fixes applied:
+
+```bash
+cd /home/mojo/projects/ralphussy/ralph-refactor
+
+# Option 1: Start fresh with current defaults
+SWARM_OUTPUT_MODE=live ./ralph-swarm --devplan ../devplan.md --workers 2
+
+# Option 2: Resume existing run
+SWARM_OUTPUT_MODE=live ./ralph-swarm --resume 20260122_230145
+
+# Option 3: Override model if needed
+RALPH_LLM_PROVIDER=zai-coding-plan \
+RALPH_LLM_MODEL=glm-4.7 \
+SWARM_OUTPUT_MODE=live \
+./ralph-swarm --devplan ../devplan.md --workers 2
+```
+
+## Status
+
+**Previous Issues Status:**
+- ✅ Model Configuration - CORRECT (using zai-coding-plan/glm-4.7)
+- ✅ Display Encoding - FIXED (formatted SQL output in status command)
+- ✅ Resume Behavior - FIXED (commit checking to skip completed tasks)
+
+## Files Modified
+
+1. `ralph-swarm:467-507` - Fixed status display to format SQL output
+2. `lib/swarm_worker.sh:21-60` - Added `swarm_worker_check_commit_for_task()` function
+3. `lib/swarm_worker.sh:239-267` - Integrated commit checking into worker main loop
+4. `README.md:63-125` - Updated Swarm CLI documentation
