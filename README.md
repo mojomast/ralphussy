@@ -73,13 +73,16 @@ SWARM_OUTPUT_MODE=live ./ralph-refactor/ralph-swarm --devplan ./devplan.md
 
 *Note: Swarm mode creates temporary git worktrees to isolate worker contexts.*
 
-**Recent Improvements:**
+**Recent Swarm Improvements:**
 - ✅ Fixed token aggregation bug (was showing 0 tokens incorrectly)
 - ✅ Added model validation against enabled-models.json
 - ✅ Improved database locking with retry logic and WAL mode
-- ✅ Added timeout protection for long-running tasks (default: 3 min)
+- ✅ Added timeout protection for long-running tasks (increased to 10 min)
 - ✅ Automatic cleanup of orphaned processes
 - ✅ Resume functionality for interrupted runs
+- ✅ **NEW:** Commit-aware resume - workers check for existing git commits and skip completed work
+- ✅ **NEW:** Fixed display encoding in status output - now shows formatted, human-readable task lists
+- ✅ **NEW:** Default model is `zai-coding-plan/glm-4.7` (no longer broken free model)
 
 ## 🛠️ Usage Guide
 
