@@ -1257,27 +1257,27 @@ class RalphTUI(App):
         grid-columns: 1fr 2fr 1fr;
     }
 
-    #log-pane {
+    #log-container {
         row-span: 1;
         column-span: 1;
     }
 
-    #chat-pane {
+    #chat-container {
         row-span: 1;
         column-span: 1;
     }
 
-    #worker-pane {
+    #worker-container {
         row-span: 1;
         column-span: 1;
     }
 
-    #progress-pane {
+    #progress-container {
         row-span: 1;
         column-span: 1;
     }
 
-    #file-pane {
+    #file-container {
         row-span: 1;
         column-span: 1;
     }
@@ -1335,23 +1335,23 @@ class RalphTUI(App):
         yield Header()
         yield Container(
             LogPane(id="log-pane"),
-            id="log-pane"
+            id="log-container"
         )
         yield Container(
             ChatPane(id="chat-pane"),
-            id="chat-pane"
+            id="chat-container"
         )
         yield Container(
             WorkerPane(id="worker-pane"),
-            id="worker-pane"
+            id="worker-container"
         )
         yield Container(
             ProgressPane(id="progress-pane"),
-            id="progress-pane"
+            id="progress-container"
         )
         yield Container(
             FilePane(id="file-pane"),
-            id="file-pane"
+            id="file-container"
         )
         yield Footer()
     
