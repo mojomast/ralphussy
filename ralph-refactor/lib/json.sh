@@ -6,26 +6,12 @@ json_extract_text() {
     local json="$1"
     local text=""
 
-    if command -v jq &> /dev/null; then
+     if command -v jq &> /dev/null; then
         # Try several common fields used by different providers / versions.
         # This covers OpenCode (.part.messages[].text), OpenAI chat/completions,
         # Anthropic (.completion), Google (.candidates[].content), and other shapes.
-        text=$(printf '%s' "$json" | jq -r '
-            (
-              (.part.messages[]?.text)
-              // (.messages[]?.text)
-              // (.part.output.text?)
-              // (.output.text?)
-              // (.outputs[]?.content[]?.text)
-              // (.choices[]?.message?.content)
-              // (.choices[]?.text)
-              // (.candidates[]?.content)
-              // (.result?.candidates[]?.content)
-              // (.result?.content)
-              // (.completion)
-              // (.text)
-            ) // ""'
-            2>/dev/null | head -1) || text=
+        # Get last text message which contains completion marker
+        text=$(printf '%s' "$json" | jq -r ".[] | select(.type == \"text\") | .part.text] | .[-1] // \"\"" 2>/dev/null | tr -d '"') || text=
     fi
 
     if [ -z "$text" ]; then

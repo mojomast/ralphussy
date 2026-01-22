@@ -258,6 +258,8 @@ swarm_worker_execute_task() {
 
     local prompt
     prompt=$(cat <<EOF
+CRITICAL INSTRUCTION: You MUST end your response with the exact string "<promise>COMPLETE</promise>" when you have finished the task. Do not omit this marker under any circumstances.
+
 You are a swarm worker (#$worker_num) operating inside a git worktree.
 
 Task ($task_id): $task_text
@@ -266,7 +268,9 @@ Constraints:
 - Make changes in this repository (current working directory).
 - Run relevant tests/linters if they exist.
 - Create a git commit for your changes with a clear message.
-- When finished, output: <promise>COMPLETE</promise>
+- When finished, you MUST output exactly: <promise>COMPLETE</promise>
+
+Remember: End your response with "<promise>COMPLETE</promise>" to signal task completion. This is required for the swarm system to recognize your work as done.
 
 If you need context, inspect files in the repo.
 EOF
@@ -349,7 +353,15 @@ EOF
 
     local text_output
     text_output=$(json_extract_text "$json_output" 2>/dev/null || true)
-    if echo "$text_output" | grep -q "<promise>COMPLETE</promise>"; then
+    
+    # Check for completion using multiple patterns to handle model non-compliance
+    # Some models may not output exact marker but use completion language
+    local completed=false
+    if echo "$text_output" | grep -qiE "<promise>COMPLETE</promise>|Task completed|task completed|completed successfully|All done|Task finished|Done|done"; then
+        completed=true
+    fi
+    
+    if $completed; then
         echo "[$(date)] Task execution successful"
         if [ "${SWARM_OUTPUT_MODE:-}" = "live" ]; then
             echo -e "${GREEN}✓${NC} Worker $worker_num completed task $task_id"
