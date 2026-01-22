@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
 
+# Color codes for live output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
 swarm_worker_apply_limits() {
     # Resource limits are DISABLED by default (0 = no limit)
     # These would cause "fork: Resource temporarily unavailable" errors if set too low
@@ -104,30 +112,34 @@ swarm_worker_spawn() {
     local ralph_dir_val="$RALPH_DIR"
     local llm_provider="${RALPH_LLM_PROVIDER:-}"
     local llm_model="${RALPH_LLM_MODEL:-}"
-    
+
     setsid bash -c '
         cd "'"$repo_dir"'" || exit 1
-        
+
         # Increase file descriptor limit
         ulimit -n 4096 2>/dev/null || true
-        
+
         echo "Worker '"$worker_num"' started (PID: $$, ID: '"$worker_id"')"
         echo "Run ID: '"$run_id"'"
         echo "Worker directory: '"$worker_dir"'"
-        
+
         # Export necessary variables
         export RALPH_DIR="'"$ralph_dir_val"'"
         export RALPH_LLM_PROVIDER="'"$llm_provider"'"
         export RALPH_LLM_MODEL="'"$llm_model"'"
-        
-        # Source the worker module and run main loop
+        export SWARM_OUTPUT_MODE="'"${SWARM_OUTPUT_MODE:-}"'"
+
+        # Redirect all output to log file
+        exec > "'"$log_full"'" 2>&1
+
+        # Source from worker module and run main loop
         source "'"$swarm_dir"'/lib/swarm_db.sh"
         source "'"$swarm_dir"'/lib/swarm_worker.sh"
-        
+
         swarm_worker_main_loop "'"$run_id"'" "'"$worker_num"'" "'"$worker_id"'" "'"$devplan_path"'" "'"$ralph_path"'" "'"$log_full"'"
-        
+
         echo "Worker '"$worker_num"' shutting down"
-    ' > "$log_full" 2>&1 &
+    ' >/dev/null 2>&1 &
 
     local worker_pid=$!
     sleep 1
@@ -180,6 +192,12 @@ swarm_worker_main_loop() {
         echo "[$(date)] Worker $worker_num claimed task $task_id"
         echo "[$(date)] Task: $task_text"
 
+        if [ "${SWARM_OUTPUT_MODE:-}" = "live" ]; then
+            echo -e "${CYAN}▶${NC} Worker $worker_num assigned task $task_id"
+            echo -e "${CYAN}▶${NC}   Task: ${task_text:0:80}..."
+            echo ""
+        fi
+
         swarm_db_worker_heartbeat "$worker_id"
 
         # Update global heartbeat before task execution
@@ -190,10 +208,18 @@ swarm_worker_main_loop() {
         if swarm_worker_execute_task "$run_id" "$worker_num" "$task_id" "$task_text" "$estimated_files" "$devplan_line" "$devplan_path" "$ralph_path" "$log_file"; then
             swarm_db_complete_task "$task_id" "$estimated_files" "$worker_id"
             echo "[$(date)] Task $task_id completed successfully"
+            if [ "${SWARM_OUTPUT_MODE:-}" = "live" ]; then
+                echo -e "${GREEN}✓${NC} Worker $worker_num marked task $task_id as complete"
+                echo ""
+            fi
         else
             local error_msg="Worker error on task $task_id"
             swarm_db_fail_task "$task_id" "$worker_id" "$error_msg"
             echo "[$(date)] Task $task_id failed: $error_msg"
+            if [ "${SWARM_OUTPUT_MODE:-}" = "live" ]; then
+                echo -e "${RED}✗${NC} Worker $worker_num task $task_id failed: $error_msg"
+                echo ""
+            fi
         fi
 
         swarm_db_worker_heartbeat "$worker_id"
@@ -248,6 +274,12 @@ EOF
 
     echo "[$(date)] Running OpenCode for task $task_id"
 
+    if [ "${SWARM_OUTPUT_MODE:-}" = "live" ]; then
+        echo -e "${YELLOW}▸${NC} Worker $worker_num executing task $task_id..."
+        echo -e "${YELLOW}▸${NC}   ${task_text:0:100}"
+        echo ""
+    fi
+
     local opencode_cmd="opencode run"
     local full_model=""
 
@@ -266,34 +298,83 @@ EOF
         opencode_cmd="$opencode_cmd --model $full_model"
     fi
 
+    echo "[$(date)] DEBUG: RALPH_LLM_PROVIDER=${RALPH_LLM_PROVIDER:-}, RALPH_LLM_MODEL=${RALPH_LLM_MODEL:-}"
+    echo "[$(date)] DEBUG: Command: $opencode_cmd"
+
+    local timeout_seconds="${SWARM_TASK_TIMEOUT:-180}"
     local json_output
-    if ! json_output=$(cd "$repo_dir" && $opencode_cmd --format json "$prompt" 2>&1); then
-        echo "[$(date)] Task execution failed (opencode error)" 1>&2
-        echo "$json_output" | head -c 300 1>&2
+
+    if ! json_output=$(cd "$repo_dir" && timeout "$timeout_seconds" $opencode_cmd --format json "$prompt" 2>&1); then
+        local exit_code=$?
+        if [ $exit_code -eq 124 ]; then
+            echo "[$(date)] Task execution failed (timeout after ${timeout_seconds}s)" 1>&2
+            if [ "${SWARM_OUTPUT_MODE:-}" = "live" ]; then
+                echo -e "${RED}✗${NC} Worker $worker_num task $task_id failed: timeout after ${timeout_seconds}s"
+            fi
+        else
+            echo "[$(date)] Task execution failed (opencode error)" 1>&2
+            echo "$json_output" | head -c 300 1>&2
+            if [ "${SWARM_OUTPUT_MODE:-}" = "live" ]; then
+                echo -e "${RED}✗${NC} Worker $worker_num task $task_id failed: opencode error"
+                echo -e "${RED}✗${NC}   $(echo "$json_output" | head -c 150)..."
+            fi
+        fi
         return 1
     fi
 
     # Best-effort: record token/cost stats if possible.
+    # Aggregate tokens from all step_finish events
     local prompt_tokens=0
     local completion_tokens=0
     local cost=0
     if command -v jq >/dev/null 2>&1; then
-        prompt_tokens=$(echo "$json_output" | jq -r '.part.tokens.input // .tokens.input // 0' 2>/dev/null | head -1) || prompt_tokens=0
-        completion_tokens=$(echo "$json_output" | jq -r '.part.tokens.output // .tokens.output // 0' 2>/dev/null | head -1) || completion_tokens=0
-        cost=$(echo "$json_output" | jq -r '.part.cost // .cost // 0' 2>/dev/null | head -1) || cost=0
+        # Sum tokens from all events that have them
+        prompt_tokens=$(echo "$json_output" | jq -s 'map(select(.part.tokens.input)) | map(.part.tokens.input) | add // 0' 2>/dev/null) || prompt_tokens=0
+        completion_tokens=$(echo "$json_output" | jq -s 'map(select(.part.tokens.output)) | map(.part.tokens.output) | add // 0' 2>/dev/null) || completion_tokens=0
+        # Get cost from first step_finish event or sum all
+        cost=$(echo "$json_output" | jq -s 'map(select(.part.cost)) | map(.part.cost) | add // 0' 2>/dev/null) || cost=0
     fi
     if command -v swarm_db_record_task_cost >/dev/null 2>&1; then
         swarm_db_record_task_cost "$run_id" "$task_id" "$prompt_tokens" "$completion_tokens" "$cost" >/dev/null 2>&1 || true
+    fi
+
+    if [ "${SWARM_OUTPUT_MODE:-}" = "live" ]; then
+        echo -e "${BLUE}✓${NC} API call complete: ${prompt_tokens}→${completion_tokens} tokens | \$${cost}"
+        if [ "$completion_tokens" -eq 0 ]; then
+            echo -e "${YELLOW}⚠${NC} Warning: 0 tokens returned. Full response saved to: ${repo_dir}/.swarm_debug_${task_id}.json"
+            echo "$json_output" > "${repo_dir}/.swarm_debug_${task_id}.json"
+        fi
+        echo ""
     fi
 
     local text_output
     text_output=$(json_extract_text "$json_output" 2>/dev/null || true)
     if echo "$text_output" | grep -q "<promise>COMPLETE</promise>"; then
         echo "[$(date)] Task execution successful"
+        if [ "${SWARM_OUTPUT_MODE:-}" = "live" ]; then
+            echo -e "${GREEN}✓${NC} Worker $worker_num completed task $task_id"
+            echo ""
+
+            # Show tool call summary
+            echo "$text_output" | tr '|' '\n' | grep -vE '^\[RALPH\]|^=== Task|^=================================|^[0-9]\+' | while IFS= read -r line; do
+                line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                [ -z "$line" ] && continue
+
+                if echo "$line" | grep -qE '^(Read|Write|Edit|Bash|grep|glob|task|webfetch|codesearch|websearch|todoread|todowrite)'; then
+                    echo -e "  ${CYAN}→ $line${NC}"
+                elif echo "$line" | grep -qE '^(✅|❌|⚠️)'; then
+                    echo -e "  ${GREEN}$line${NC}"
+                fi
+            done
+            echo ""
+        fi
         return 0
     fi
 
     echo "[$(date)] Task execution did not return completion promise" 1>&2
+    if [ "${SWARM_OUTPUT_MODE:-}" = "live" ]; then
+        echo -e "${YELLOW}⚠${NC} Worker $worker_num task $task_id did not complete (no promise)"
+    fi
     return 1
 }
 

@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
 
+# Color codes for live output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
 # Check if a process is running by PID
 swarm_scheduler_is_pid_alive() {
     local pid="$1"
@@ -107,7 +115,22 @@ swarm_scheduler_main_loop() {
     echo "Scheduler started for run $run_id"
     echo "Poll interval: 5 seconds"
     echo "Stop timeout: $stop_timeout seconds"
+    if [ "${SWARM_OUTPUT_MODE:-}" = "live" ]; then
+        echo "Output mode: live (verbose)"
+    fi
     echo ""
+
+    # In live mode, set up log file tailing for all workers
+    local worker_log_tails=()
+    if [ "${SWARM_OUTPUT_MODE:-}" = "live" ]; then
+        local worker_dir="$RALPH_DIR/swarm/runs/$run_id"
+        sleep 2  # Give workers time to start
+        for worker_log in "$worker_dir"/worker-*/logs/*.log; do
+            [ -f "$worker_log" ] || continue
+            tail -f "$worker_log" 2>/dev/null &
+            worker_log_tails+=($!)
+        done
+    fi
 
     local iteration=0
     local last_status_check=0
@@ -159,6 +182,26 @@ swarm_scheduler_main_loop() {
             echo "[${current_time}] Iteration $iteration: $pending_tasks pending, $alive_workers alive workers"
         fi
 
+        # In live mode, show more frequent updates about task progress
+        if [ "${SWARM_OUTPUT_MODE:-}" = "live" ] && [ $((iteration % 3)) -eq 0 ]; then
+            local task_stats
+            task_stats=$(swarm_db_get_task_count_by_status "$run_id" 2>/dev/null || echo "")
+            local pending completed in_progress failed
+            pending=$(echo "$task_stats" | awk -F'|' '$1=="pending"{print $2}' || echo 0)
+            in_progress=$(echo "$task_stats" | awk -F'|' '$1=="in_progress"{print $2}' || echo 0)
+            completed=$(echo "$task_stats" | awk -F'|' '$1=="completed"{print $2}' || echo 0)
+            failed=$(echo "$task_stats" | awk -F'|' '$1=="failed"{print $2}' || echo 0)
+
+            if [ -n "$completed" ] && [ -n "$in_progress" ] && [ -n "$pending" ]; then
+                local total=$((completed + in_progress + pending + failed))
+                local progress=0
+                if [ "$total" -gt 0 ]; then
+                    progress=$((completed * 100 / total))
+                fi
+                echo -e "${CYAN}[SCHEDULER]${NC} Progress: $completed/$total ($progress%) | $in_progress in progress | $pending pending | $failed failed"
+            fi
+        fi
+
         if [ $pending_tasks -eq 0 ]; then
             echo ""
             echo "No pending tasks remaining"
@@ -190,6 +233,11 @@ swarm_scheduler_main_loop() {
 
     echo ""
     echo "Scheduler finished for run $run_id"
+
+    # Cleanup tail processes
+    for tail_pid in "${worker_log_tails[@]:-}"; do
+        kill "$tail_pid" 2>/dev/null || true
+    done
 }
 
 swarm_scheduler_get_next_task() {
@@ -261,6 +309,11 @@ swarm_scheduler_assign_task() {
     echo "Estimated files: $estimated_files"
     echo "Devplan line: $devplan_line"
 
+    if [ "${SWARM_OUTPUT_MODE:-}" = "live" ]; then
+        echo -e "${CYAN}[SCHEDULER]${NC} Task $task_id assigned to worker (ID: $worker_id)"
+        echo -e "${CYAN}[SCHEDULER]${NC}   Task: ${task_text:0:80}..."
+    fi
+
     local lock_success
     lock_success=$(swarm_db_acquire_locks "$run_id" "$worker_id" "$task_id" $estimated_files 2>/dev/null)
 
@@ -281,6 +334,10 @@ swarm_scheduler_handle_completion() {
 
     echo "Handling task completion: $task_id (worker $worker_id)"
 
+    if [ "${SWARM_OUTPUT_MODE:-}" = "live" ]; then
+        echo -e "${GREEN}[SCHEDULER]${NC} Task $task_id completed by worker $worker_id"
+    fi
+
     local result_files
     result_files=$(swarm_db_complete_task "$task_id" "$worker_id" 2>/dev/null)
 
@@ -293,6 +350,10 @@ swarm_scheduler_handle_failure() {
     local error_message="$3"
 
     echo "Handling task failure: $task_id (worker $worker_id): $error_message"
+
+    if [ "${SWARM_OUTPUT_MODE:-}" = "live" ]; then
+        echo -e "${RED}[SCHEDULER]${NC} Task $task_id failed on worker $worker_id: ${error_message:0:60}"
+    fi
 
     swarm_db_fail_task "$task_id" "$worker_id" "$error_message" 2>/dev/null
 

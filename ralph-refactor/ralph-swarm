@@ -94,6 +94,44 @@ swarm_check_limits() {
     return 0
 }
 
+swarm_cleanup_orphaned_opencode() {
+    local run_id="${1:-}"
+
+    if [ -n "$run_id" ]; then
+        echo "Cleaning up orphaned opencode processes for run: $run_id"
+    else
+        echo "Cleaning up all orphaned opencode processes..."
+    fi
+
+    if command -v pgrep >/dev/null 2>&1; then
+        local killed=0
+
+        if [ -n "$run_id" ]; then
+            # Clean up processes for specific run
+            pgrep -f "opencode run.*swarm.*worker" 2>/dev/null | while read -r pid; do
+                local cmdline
+                cmdline=$(cat /proc/$pid/cmdline 2>/dev/null | tr '\0' ' ' || echo "")
+                if [[ "$cmdline" == *"$run_id"* ]]; then
+                    echo "Killing orphaned opencode process: $pid"
+                    kill -9 "$pid" 2>/dev/null || true
+                    killed=$((killed + 1))
+                fi
+            done
+        else
+            # Clean up all swarm-related opencode processes
+            pgrep -f "opencode run.*swarm" 2>/dev/null | while read -r pid; do
+                echo "Killing orphaned opencode process: $pid"
+                kill -9 "$pid" 2>/dev/null || true
+                killed=$((killed + 1))
+            done
+        fi
+
+        if [ $killed -gt 0 ]; then
+            echo "Killed $killed orphaned opencode process(es)"
+        fi
+    fi
+}
+
 swarm_emergency_stop() {
     echo "EMERGENCY STOP - Killing all swarm workers..."
 
@@ -134,15 +172,34 @@ swarm_orchestrator_start() {
     # Load configuration
     swarm_load_config
 
-    echo "Starting swarm run..."
-    echo "Run ID: $run_id"
-    echo "Mode: $mode"
-    echo "Workers: $worker_count"
-    echo "Timeout: $timeout_seconds seconds"
+    # Only print header if NOT resuming (resume path handles its own header)
+    if [ -z "$resume_from" ]; then
+        echo "Starting swarm run..."
+        echo "Run ID: $run_id"
+        echo "Mode: $mode"
+        echo "Workers: $worker_count"
+        echo "Timeout: $timeout_seconds seconds"
+
+        # Clean up orphaned opencode processes for new runs
+        if command -v swarm_cleanup_orphaned_opencode >/dev/null 2>&1; then
+            swarm_cleanup_orphaned_opencode "$run_id" || true
+        fi
+    fi
 
     # Validate worker count before proceeding
     if ! swarm_check_limits "$worker_count"; then
         return 1
+    fi
+
+    # Validate model before proceeding
+    if command -v validate_model >/dev/null 2>&1; then
+        if ! validate_model "${RALPH_LLM_PROVIDER:-}" "${RALPH_LLM_MODEL:-}"; then
+            log_error "Model validation failed. Please specify a valid provider/model."
+            echo "  Examples:"
+            echo "    --provider zai-coding-plan --model glm-4.7"
+            echo "    RALPH_LLM_PROVIDER=zai-coding-plan RALPH_LLM_MODEL=glm-4.7 ralph-swarm --devplan path/to/devplan.md"
+            return 1
+        fi
     fi
 
     # Calculate source hash for devplan mode
@@ -229,17 +286,24 @@ PY
     # If resuming, use the existing run_id and SKIP task re-parsing
     if [ -n "$resume_from" ]; then
         run_id_result="$resume_from"
+        echo "Resuming run: $run_id_result"
+        echo "Mode: $mode"
+        echo "Workers: $worker_count"
+        echo "Timeout: $timeout_seconds seconds"
+        echo ""
+
         # Resume the run
         swarm_db_resume_run "$run_id_result" >/dev/null
 
         # Update the started_at timestamp for proper timeout calculation
-        sqlite3 "$RALPH_DIR/swarm.db" "UPDATE swarm_runs SET started_at = datetime('now') WHERE run_id = '$run_id_result';"
-
-        # Clean up old workers before spawning new ones
-        sqlite3 "$RALPH_DIR/swarm.db" "UPDATE workers SET status = 'stopped', current_task_id = NULL WHERE run_id = '$run_id_result';"
-        
-        # Requeue any stuck in_progress tasks
-        sqlite3 "$RALPH_DIR/swarm.db" "UPDATE tasks SET status = 'pending', worker_id = NULL, started_at = NULL WHERE run_id = '$run_id_result' AND status = 'in_progress';"
+        # Use a transaction to avoid "database is locked" errors
+        sqlite3 "$RALPH_DIR/swarm.db" <<EOF
+BEGIN TRANSACTION;
+ UPDATE swarm_runs SET status = 'running', started_at = datetime('now') WHERE run_id = '$run_id_result';
+ UPDATE workers SET status = 'stopped', current_task_id = NULL WHERE run_id = '$run_id_result';
+ UPDATE tasks SET status = 'pending', worker_id = NULL, started_at = NULL WHERE run_id = '$run_id_result' AND status = 'in_progress';
+ COMMIT;
+EOF
 
         echo "Run ID: $run_id_result"
         
@@ -320,6 +384,11 @@ PY
     fi
 
     local spawn_result
+
+    # Export LLM settings so workers inherit them
+    export RALPH_LLM_PROVIDER="${RALPH_LLM_PROVIDER:-}"
+    export RALPH_LLM_MODEL="${RALPH_LLM_MODEL:-}"
+
     # Spawn N workers (worker_num=1..N) using the ralph entrypoint.
     # NOTE: swarm_worker_spawn currently expects a single worker number.
     local worker_num
@@ -327,6 +396,7 @@ PY
 
     for worker_num in $(seq 1 "$worker_count"); do
         echo "Spawning worker $worker_num of $worker_count..."
+        export SWARM_OUTPUT_MODE="${SWARM_OUTPUT_MODE:-}"
         swarm_worker_spawn "$run_id_result" "$worker_num" "main" "$__RALPH_SWARM_DIR__/ralph" "/tmp/swarm.log" >/dev/null
 
         # Add delay between spawns to prevent resource spikes
@@ -542,6 +612,7 @@ swarm_orchestrator_fix() {
 
 swarm_orchestrator_reset() {
     local run_id="$1"
+    local force="${SWARM_RESET_FORCE:-${RALPH_INTERACTIVE:-false}}"
 
     if [ -z "$run_id" ]; then
         run_id=$(sqlite3 "$RALPH_DIR/swarm.db" "SELECT run_id FROM swarm_runs ORDER BY id DESC LIMIT 1" 2>/dev/null || true)
@@ -560,10 +631,13 @@ swarm_orchestrator_reset() {
     echo "  - Reset the run to allow a fresh start"
     echo ""
 
-    read -r -p "Are you sure? (yes/no): " confirm
-    if [ "$confirm" != "yes" ]; then
-        echo "Cancelled"
-        return 1
+    # Check if we're in interactive mode (not running in TUI subprocess)
+    if [ "$force" != "true" ] && [ -t 0 ]; then
+        read -r -p "Are you sure? (yes/no): " confirm
+        if [ "$confirm" != "yes" ]; then
+            echo "Cancelled"
+            return 1
+        fi
     fi
 
     local db_path="$RALPH_DIR/swarm.db"
@@ -781,7 +855,7 @@ main() {
     local mode=""
     local devplan_path=""
     local prompt_text=""
-    local worker_count=4
+    local worker_count=2
     local timeout_seconds=3600
     local verbose=false
     local interactive=false
@@ -931,12 +1005,33 @@ main() {
                 ;;
             --reset)
                 action="reset"
-                if [ -n "${2:-}" ] && [ "${2#--}" = "${2}" ]; then
-                    run_id="$2"
-                    shift 2
-                else
-                    shift
-                fi
+                local force="false"
+
+                # Consume --reset, then parse optional flags and optional RUN_ID.
+                shift
+
+                while [ $# -gt 0 ]; do
+                    case "$1" in
+                        --force)
+                            force="true"
+                            shift
+                            ;;
+                        --)
+                            shift
+                            break
+                            ;;
+                        --*)
+                            break
+                            ;;
+                        *)
+                            run_id="$1"
+                            shift
+                            break
+                            ;;
+                    esac
+                done
+
+                export SWARM_RESET_FORCE="$force"
                 ;;
             -* )
                 echo "Unknown option: $1" 1>&2

@@ -53,16 +53,33 @@ The TUI allows you to:
 *   Manage your `devplan.md`.
 *   Monitor tool usage and logs in real-time.
 
-### Running a Swarm
+ ### Running a Swarm
 
-To execute multiple tasks in parallel (experimental):
+To execute multiple tasks in parallel:
 
 ```bash
-# Run 4 workers against the local devplan.md
+# Run 2 workers against a local devplan.md (default)
+RALPH_LLM_PROVIDER=zai-coding-plan RALPH_LLM_MODEL=glm-4.7 ./ralph-refactor/ralph-swarm --devplan ./devplan.md
+
+# Run with 4 workers
 ./ralph-refactor/ralph-swarm --devplan ./devplan.md --workers 4
+
+# Resume a previous run
+./ralph-refactor/ralph-swarm --resume <RUN_ID>
+
+# Show live output with token counting
+SWARM_OUTPUT_MODE=live ./ralph-refactor/ralph-swarm --devplan ./devplan.md
 ```
 
 *Note: Swarm mode creates temporary git worktrees to isolate worker contexts.*
+
+**Recent Improvements:**
+- ✅ Fixed token aggregation bug (was showing 0 tokens incorrectly)
+- ✅ Added model validation against enabled-models.json
+- ✅ Improved database locking with retry logic and WAL mode
+- ✅ Added timeout protection for long-running tasks (default: 3 min)
+- ✅ Automatic cleanup of orphaned processes
+- ✅ Resume functionality for interrupted runs
 
 ## 🛠️ Usage Guide
 

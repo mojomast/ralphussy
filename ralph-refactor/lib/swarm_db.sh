@@ -37,9 +37,11 @@ swarm_db_init() {
     # sqlite3 prints the new journal mode for PRAGMA journal_mode=WAL on some
     # builds; silence init output to keep tests clean.
     sqlite3 "$db_path" >/dev/null <<'EOF'
- PRAGMA journal_mode=WAL;
- PRAGMA synchronous=NORMAL;
- PRAGMA foreign_keys=ON;
+  PRAGMA journal_mode=WAL;
+  PRAGMA synchronous=NORMAL;
+  PRAGMA foreign_keys=ON;
+  PRAGMA busy_timeout=30000;
+  PRAGMA wal_autocheckpoint=1000;
 
 CREATE TABLE IF NOT EXISTS swarm_runs (
     id INTEGER PRIMARY KEY,
@@ -160,7 +162,7 @@ CREATE TABLE IF NOT EXISTS workers (
 
    CREATE INDEX IF NOT EXISTS idx_completed_tasks_hash ON completed_tasks(task_hash);
    CREATE INDEX IF NOT EXISTS idx_completed_tasks_source ON completed_tasks(source_hash);
-  EOF
+EOF
 
     # Migration: Add missing columns to existing tables (for schema upgrades)
     # These ALTER TABLE statements are safe even if columns already exist
@@ -322,7 +324,7 @@ EOF
     echo "$task_id"
 }
 
-swarm_db_claim_task() {
+ swarm_db_claim_task() {
     local db_path="$RALPH_DIR/swarm.db"
     local worker_id="$1"
 
@@ -331,8 +333,13 @@ swarm_db_claim_task() {
     local estimated_files
     local devplan_line
 
-    task_id=$(sqlite3 "$db_path" <<EOF
-BEGIN TRANSACTION;
+    local max_retries=20
+    local retry_delay=0.1
+    local retry_count=0
+
+    while [ $retry_count -lt $max_retries ]; do
+        task_id=$(sqlite3 "$db_path" <<EOF 2>/dev/null
+BEGIN IMMEDIATE TRANSACTION;
 
 UPDATE tasks
 SET status = 'in_progress',
@@ -350,6 +357,18 @@ RETURNING id;
 COMMIT;
 EOF
 )
+
+        local exit_code=$?
+        if [ $exit_code -eq 0 ] && [ -n "$task_id" ]; then
+            break
+        fi
+
+        retry_count=$((retry_count + 1))
+        if [ $retry_count -lt $max_retries ]; then
+            sleep $retry_delay
+            retry_delay=$(awk "BEGIN {print $retry_delay * 2}")
+        fi
+    done
 
     if [ -z "$task_id" ]; then
         # No pending tasks available.

@@ -599,6 +599,13 @@ STALLED TASK DETECTION:
     - Retried by changing [🔄] back to [ ] in devplan.md
     - Reset using: ralph --reset-task "task name" --devplan ./devplan.md
 
+RALPH-LIVE (Alternative CLI Mode):
+    For real-time streaming output with interactive commands while the agent runs,
+    use the ralph-live script:
+        ./ralph-live "Task description"
+        ./ralph-live --devplan ./devplan.md
+        ./ralph-live --help  # See interactive commands
+
 EXAMPLES:
     ralph "Create a hello.txt file. Output <promise>COMPLETE</promise> when done."
     ralph "Build a REST API with tests." --provider anthropic --model claude-sonnet-4-20250514
@@ -607,6 +614,7 @@ EXAMPLES:
     ralph --devplan-summary                  # Show devplan task summary
     ralph --reset-task "Implement X" --devplan ./devplan.md  # Reset stalled task
     ralph --status
+    ralph-live "Task with real-time streaming"  # Live mode example
 
 For more information, visit: https://github.com/anomalyco/opencode
 EOF

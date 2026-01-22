@@ -34,14 +34,16 @@ with open(path, 'r', encoding='utf-8', errors='replace') as f:
         # We only capture pending tasks (empty brackets)
         m = re.match(r'^\s*-\s*\[\s*\]\s+(.*)$', line)
         if not m:
-            # Fallback: check for the old ## Task format just in case
-            m = re.match(r'^\s*##\s+Task\s*(.*)\s*$', line)
-            
+            # Fallback: check for the old ## Task: format (with colon) just in case
+            # Require colon to avoid matching "## Tasks" headers
+            m = re.match(r'^\s*##\s+Task:\s*(.*)\s*$', line)
+
         if not m:
             continue
-            
+
         task = m.group(1).strip()
-        if task:
+        # Filter out single-character matches (likely parsing errors)
+        if len(task) > 1:
             tasks.append({"task": task, "line": idx})
 
 sys.stdout.write(json.dumps(tasks))

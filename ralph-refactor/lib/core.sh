@@ -32,8 +32,8 @@ PROMPT_FILE=""
 MAX_ITERATIONS="${MAX_ITERATIONS:-100}"
 COMPLETION_PROMISE="${COMPLETION_PROMISE:-COMPLETE}"
 VERBOSE="${VERBOSE:-false}"
-MODEL="${MODEL:-}"
-PROVIDER="${PROVIDER:-}"
+MODEL="${MODEL:-glm-4.7}"
+PROVIDER="${PROVIDER:-zai-coding-plan}"
 
 # Simple task threshold - tasks estimated under this complexity can be batched
 SIMPLE_TASK_THRESHOLD="${SIMPLE_TASK_THRESHOLD:-2}"
@@ -428,6 +428,52 @@ check_opencode() {
         exit 1
     fi
     log_success "OpenCode found: $(which opencode)"
+}
+
+validate_model() {
+    local provider="${1:-${RALPH_LLM_PROVIDER:-}}"
+    local model="${2:-${RALPH_LLM_MODEL:-}}"
+
+    if [ -z "$provider" ] && [ -z "$model" ]; then
+        log_info "No provider/model specified, will use opencode defaults"
+        return 0
+    fi
+
+    local full_model=""
+    if [ -n "$model" ]; then
+        if [[ "$model" == *"/"* ]]; then
+            full_model="$model"
+        elif [ -n "$provider" ]; then
+            full_model="${provider}/${model}"
+        else
+            full_model="$model"
+        fi
+    fi
+
+    if [ -n "$full_model" ]; then
+        log_info "Validating model: $full_model"
+
+        local enabled_models_file="$HOME/.opencode/enabled-models.json"
+        if [ -f "$enabled_models_file" ]; then
+            local provider_name="${full_model%%/*}"
+            local model_name="${full_model#*/}"
+
+            if command -v jq &> /dev/null; then
+                local enabled
+                enabled=$(jq -r --arg p "$provider_name" --arg m "$provider_name/$model_name" '.providers[$p].models[] | select(. == $m)' "$enabled_models_file" 2>/dev/null || echo "")
+                if [ -z "$enabled" ]; then
+                    log_error "Model '$full_model' is not enabled in $enabled_models_file"
+                    echo "  Available models for provider '$provider_name':"
+                    jq -r --arg p "$provider_name" '.providers[$p].models[]? // empty' "$enabled_models_file" 2>/dev/null | sed 's/^/    /' || echo "    (none)"
+                    return 1
+                fi
+            fi
+        fi
+
+        log_success "Model validated: $full_model"
+    fi
+
+    return 0
 }
 
 check_dependencies() {

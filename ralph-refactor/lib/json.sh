@@ -25,16 +25,24 @@ json_extract_text() {
               // (.completion)
               // (.text)
             ) // ""'
-            2>/dev/null | tr '\n' ' ' | sed 's/  */ /g' | sed 's/^ *//;s/ *$//' | head -1) || text=
+            2>/dev/null | head -1) || text=
     fi
 
     if [ -z "$text" ]; then
-        # Fallback: best-effort grep/sed extraction for older/unknown shapes
+        # Fallback 1: Extract from JSON array of messages
+        text=$(printf '%s' "$json" | jq -r '[.[] | select(.type == "text") | .text] | join("\n")' 2>/dev/null) || text=""
+    fi
+
+    if [ -z "$text" ]; then
+        # Fallback 2: Best-effort grep/sed extraction for older/unknown shapes
         text=$(printf '%s' "$json" | grep '"type":"text"' | grep -v '"role":"user"' | grep -o '"text":"[^"]*"' | sed 's/"text":"//;s/"$//' | head -1 | tr '\n' ' ' | sed 's/  */ /g')
         if [ -z "$text" ]; then
             text=$(printf '%s' "$json" | grep -o '"text":"[^"]*"' | sed 's/"text":"//;s/"$//' | tail -1 | tr '\n' ' ' | sed 's/  */ /g')
         fi
     fi
+
+    # Convert escaped newlines (\n) to actual newlines for models that output escaped strings
+    text=$(printf '%s' "$text" | sed 's/\\n/\n/g')
 
     printf '%s' "$text"
 }
