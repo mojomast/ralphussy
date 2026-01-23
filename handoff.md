@@ -5,21 +5,39 @@
 
 ## Current Status
 
-The ralph-live system has been extensively debugged and improved. The swarm functionality is now operational with proper:
+ The ralph-live system has been extensively debugged and improved. The swarm functionality is now operational with proper:
+ 
+ - **Project Isolation:** Swarms create independent repos in `~/projects/PROJECT_NAME/` (not ralphussy worktrees)
+ - **Artifact Extraction:** `swarm_extract_merged_artifacts()` extracts only changed files from completed runs
+ - **Model Configuration:** Default is `zai-coding-plan/glm-4.7` (fixed from broken `glm-4.7-free`)
+ - **Token Counting:** Correctly aggregates all API events (was showing 0→0)
+ - **JSON Text Extraction:** Fixed critical bug - now extracts LAST text message containing completion marker
+ - **Task Timeout:** Increased to 600s (10 minutes) - was killing tasks at 180s
+ - **Database Lock Handling:** Improved with 30s busy timeout, retries, WAL auto-checkpoint
+ - **Model Validation:** Validates models against `~/.opencode/enabled-models.json`
+ - **Orphaned Process Cleanup:** Automatically kills orphaned opencode processes before new runs
+ - **Worker Count:** Reduced to 2 (from 4) to reduce contention
+ - **Real-Time Verbosity:** Shows task assignments, executions, API calls, and completions as they happen
 
-- **Model Configuration:** Default is `zai-coding-plan/glm-4.7` (fixed from broken `glm-4.7-free`)
-- **Token Counting:** Correctly aggregates all API events (was showing 0→0)
-- **JSON Text Extraction:** Fixed critical bug - now extracts LAST text message containing completion marker
-- **Task Timeout:** Increased to 600s (10 minutes) - was killing tasks at 180s
-- **Database Lock Handling:** Improved with 30s busy timeout, retries, WAL auto-checkpoint
-- **Model Validation:** Validates models against `~/.opencode/enabled-models.json`
-- **Orphaned Process Cleanup:** Automatically kills orphaned opencode processes before new runs
-- **Worker Count:** Reduced to 2 (from 4) to reduce contention
-- **Real-Time Verbosity:** Shows task assignments, executions, API calls, and completions as they happen
-
-## Recent Critical Fixes
-
-###1. JSON Text Extraction (ralph-refactor/lib/json.sh:14)
+ ## Recent Critical Fixes
+ 
+ ###1. Project Isolation & Artifact Extraction (2026-01-23)
+ - **Problem:** Workers were creating git worktrees of ralphussy, mixing swarm commits with ralphussy history
+ - **Solution:** Workers now create independent repos in `~/projects/PROJECT_NAME/`
+ - **New Feature:** `--project NAME` flag for swarming on specific projects
+ - **New Feature:** `swarm_extract_merged_artifacts()` extracts only changed files (not full project)
+ - **Files Changed:** 
+   - `ralph-refactor/lib/swarm_worker.sh:82-150` - Project repo initialization logic
+   - `ralph-refactor/ralph-swarm:943-949` - `--project` parameter
+   - `ralph-refactor/lib/swarm_artifacts.sh:76-320` - Artifact extraction function
+ - **Usage:**
+   ```bash
+   ./ralph-refactor/ralph-swarm --devplan devplan.md --project my-app
+   source ralph-refactor/lib/swarm_artifacts.sh
+   swarm_extract_merged_artifacts "RUN_ID" "/home/mojo/projects"
+   ```
+ 
+ ###2. JSON Text Extraction (ralph-refactor/lib/json.sh:14)
 - Fixed critical jq syntax error causing all tasks to fail
 - Now correctly extracts LAST text message containing `<promise>COMPLETE</promise>` marker
 
@@ -61,31 +79,45 @@ The ralph-live system has been extensively debugged and improved. The swarm func
 | `ralph-refactor/ralph-swarm:467-507` | Status Display | Formatted output |
 
 ## Test Commands
-
-```bash
-# Run swarm with default model
-cd ralph-refactor
-./ralph-swarm --devplan ../devplan.md --workers 2
-
-# Run with live verbosity
-SWARM_OUTPUT_MODE=live ./ralph-swarm --devplan ../devplan.md --workers 2
-
-# Resume previous run (now checks for existing commits)
-SWARM_OUTPUT_MODE=live ./ralph-swarm --resume 20260122_230145
-
-# Run JSON extraction tests
-./tests/test_json.sh
-```
+ 
+ ```bash
+ # Run swarm on isolated project (NEW workflow)
+ cd ralph-refactor
+ ./ralph-swarm --devplan ../devplan.md --project warp-clone --workers 2
+ 
+ # Interactive mode (prompts for project name, workers, etc.)
+ ./ralph-swarm --interactive
+ 
+ # Run with live verbosity
+ SWARM_OUTPUT_MODE=live ./ralph-swarm --devplan ../devplan.md --project warp-clone --workers 2
+ 
+ # Resume previous run (now checks for existing commits)
+ SWARM_OUTPUT_MODE=live ./ralph-swarm --resume 20260122_230145
+ 
+ # Extract artifacts from completed run (NEW feature)
+ source lib/swarm_artifacts.sh
+ export RALPH_DIR="$HOME/.ralph"
+ swarm_list_runs
+ swarm_extract_merged_artifacts "RUN_ID" "/home/mojo/projects"
+ 
+ # Run JSON extraction tests
+ ./tests/test_json.sh
+ ```
 
 ## Next Steps
-
-1. Try alternative models for better instruction following:
-   - `opencode/gemini-3-flash`
-   - `opencode/claude-sonnet-4-5` (requires payment method)
-
-2. Consider dynamic timeout based on task complexity
-
-3. Monitor database lock errors and consider reducing to 1 worker if persistent
+ 
+ 1. Try alternative models for better instruction following:
+    - `opencode/gemini-3-flash`
+    - `opencode/claude-sonnet-4-5` (requires payment method)
+ 
+ 2. Consider dynamic timeout based on task complexity
+ 
+ 3. Monitor database lock errors and consider reducing to 1 worker if persistent
+ 
+ 4. Test artifact extraction on completed runs:
+    - Run `swarm_extract_merged_artifacts()` on a completed run
+    - Verify only changed files are extracted (not entire project)
+    - Check SWARM_SUMMARY.md for task status
 
 ---
 

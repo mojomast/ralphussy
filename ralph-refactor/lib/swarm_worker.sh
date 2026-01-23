@@ -85,6 +85,7 @@ swarm_worker_spawn() {
     local devplan_path="$3"
     local ralph_path="${4:-./ralph}"
     local log_file="${5:-/tmp/swarm_worker_$worker_num.log}"
+    local project_name="${SWARM_PROJECT_NAME:-}"
 
     local worker_dir="$RALPH_DIR/swarm/runs/$run_id/worker-$worker_num"
     mkdir -p "$worker_dir"
@@ -99,10 +100,33 @@ swarm_worker_spawn() {
 
     local repo_root
     repo_root="${SWARM_REPO_ROOT:-}"
+    
+    if [ -n "$project_name" ]; then
+        local projects_base="${SWARM_PROJECTS_BASE:-$HOME/projects}"
+        local project_dir="$projects_base/$project_name"
+        
+        if [ ! -d "$project_dir" ]; then
+            echo "Creating new project directory: $project_dir"
+            mkdir -p "$project_dir"
+            git -C "$project_dir" init >/dev/null
+            git -C "$project_dir" config user.name "Swarm" >/dev/null
+            git -C "$project_dir" config user.email "swarm@local" >/dev/null
+            
+            if [ -f "$devplan_path" ]; then
+                cp "$devplan_path" "$project_dir/devplan.md" 2>/dev/null || true
+            fi
+            
+            git -C "$project_dir" add . >/dev/null 2>&1 || true
+            git -C "$project_dir" commit -m "Initial commit" >/dev/null 2>&1 || true
+        fi
+        
+        repo_root="$project_dir"
+    fi
+    
     if [ -z "$repo_root" ]; then
         repo_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
     fi
-    # If no git repo found, initialize one in current dir if .git doesn't exist
+    
     if [ -z "$repo_root" ]; then
         if [ ! -d ".git" ]; then
              echo "Initializing new git repository for swarm..."
@@ -166,6 +190,8 @@ swarm_worker_spawn() {
         export RALPH_LLM_PROVIDER="'"$llm_provider"'"
         export RALPH_LLM_MODEL="'"$llm_model"'"
         export SWARM_OUTPUT_MODE="'"${SWARM_OUTPUT_MODE:-}"'"
+        export SWARM_PROJECT_NAME="'"${SWARM_PROJECT_NAME:-}"'"
+        export SWARM_PROJECTS_BASE="'"${SWARM_PROJECTS_BASE:-$HOME/projects}"'"
 
         # Redirect all output to log file
         exec > "'"$log_full"'" 2>&1

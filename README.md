@@ -53,63 +53,70 @@ The TUI allows you to:
 *   Manage your `devplan.md`.
 *   Monitor tool usage and logs in real-time.
 
- ### Running a Swarm
+  ### Running a Swarm
+ 
+ Ralphussy now runs swarms on **isolated projects** in `~/projects/`, keeping your devplan work separate from ralphussy itself.
+ 
+ ```bash
+ # Run swarm on a new project (creates ~/projects/my-project/)
+ RALPH_LLM_PROVIDER=zai-coding-plan RALPH_LLM_MODEL=glm-4.7 ./ralph-refactor/ralph-swarm --devplan ./devplan.md --project my-project
+ 
+ # Run with 4 workers
+ ./ralph-refactor/ralph-swarm --devplan ./devplan.md --project my-project --workers 4
+ 
+ # Interactive mode (prompts for project name, workers, etc.)
+ ./ralph-refactor/ralph-swarm --interactive
+ 
+ # Resume a previous run
+ ./ralph-refactor/ralph-swarm --resume <RUN_ID>
+ 
+ # Show live output with token counting
+ SWARM_OUTPUT_MODE=live ./ralph-refactor/ralph-swarm --devplan ./devplan.md --project my-project
+ ```
+ 
+ *Note: Swarm creates independent git repos in `~/projects/PROJECT_NAME/` with worker worktrees for isolation.*
 
-To execute multiple tasks in parallel:
-
-```bash
-# Run 2 workers against a local devplan.md (default)
-RALPH_LLM_PROVIDER=zai-coding-plan RALPH_LLM_MODEL=glm-4.7 ./ralph-refactor/ralph-swarm --devplan ./devplan.md
-
-# Run with 4 workers
-./ralph-refactor/ralph-swarm --devplan ./devplan.md --workers 4
-
-# Resume a previous run
-./ralph-refactor/ralph-swarm --resume <RUN_ID>
-
-# Show live output with token counting
-SWARM_OUTPUT_MODE=live ./ralph-refactor/ralph-swarm --devplan ./devplan.md
-```
-
-*Note: Swarm mode creates temporary git worktrees to isolate worker contexts.*
-
-**Recent Swarm Improvements:**
-- ✅ Fixed token aggregation bug (was showing 0 tokens incorrectly)
-- ✅ Added model validation against enabled-models.json
-- ✅ Improved database locking with retry logic and WAL mode
-- ✅ Added timeout protection for long-running tasks (increased to 10 min)
-- ✅ Automatic cleanup of orphaned processes
-- ✅ Resume functionality for interrupted runs
-- ✅ **NEW:** Commit-aware resume - workers check for existing git commits and skip completed work
-- ✅ **NEW:** Fixed display encoding in status output - now shows formatted, human-readable task lists
-- ✅ **NEW:** Default model is `zai-coding-plan/glm-4.7` (no longer broken free model)
+ **Recent Improvements:**
+ - ✅ **Project Isolation** - Swarms now create independent repos in `~/projects/` instead of worktrees on ralphussy
+ - ✅ **Artifact Extraction** - `swarm_extract_merged_artifacts()` extracts only changed files from completed swarm runs
+ - ✅ **Project-Based Workflow** - Use `--project NAME` to organize swarms by project
+ - ✅ Fixed token aggregation bug (was showing 0 tokens incorrectly)
+ - ✅ Added model validation against enabled-models.json
+ - ✅ Improved database locking with retry logic and WAL mode
+ - ✅ Added timeout protection for long-running tasks (default: 3 min)
+ - ✅ Automatic cleanup of orphaned processes
+ - ✅ Resume functionality for interrupted runs
 
 ## 🛠️ Usage Guide
 
-### The DevPlan Workflow
-
-Ralph shines when working with a `devplan.md`. Create a file named `devplan.md` in your project root:
-
-```markdown
-# My Project Plan
-
-- [ ] Create basic project structure
-- [ ] Implement user authentication
-- [ ] Add unit tests for auth
-```
-
-Then run Ralph pointing to this plan:
-
-```bash
-./ralph2 --devplan devplan.md
-```
-
-Ralph will:
-1.  Read the first pending task.
-2.  Execute the task using OpenCode.
-3.  Mark the task as `[✅]` when complete.
-4.  Move to the next task automatically.
-5.  If a task stalls, it marks it with `[🔄]` for your review.
+ ### The DevPlan Workflow
+ 
+ Ralph shines when working with a `devplan.md`. Create a file named `devplan.md` in your project root:
+ 
+ ```markdown
+ # My Project Plan
+ 
+ - [ ] Create basic project structure
+ - [ ] Implement user authentication
+ - [ ] Add unit tests for auth
+ ```
+ 
+ Then run Ralph pointing to this plan:
+ 
+ ```bash
+ # Single agent mode
+ ./ralph2 --devplan devplan.md
+ 
+ # Swarm mode on isolated project
+ ./ralph-refactor/ralph-swarm --devplan devplan.md --project my-project
+ ```
+ 
+ Ralph will:
+ 1.  Read the first pending task.
+ 2.  Execute the task using OpenCode.
+ 3.  Mark the task as `[✅]` when complete.
+ 4.  Move to the next task automatically.
+ 5.  If a task stalls, it marks it with `[🔄]` for your review.
 
 ### Command Line Options
 
@@ -122,9 +129,30 @@ Ralph will:
 | `--status` | Show the status of the current/last run |
 | `--detach` | Run Ralph in the background |
 | `--attach` | Attach to a running background instance |
-| `--add-context "..."` | Inject a hint or correction into the running agent |
-
-## 📂 Project Structure
+ | `--add-context "..."` | Inject a hint or correction into the running agent |
+ | `--project <name>` | Create isolated project in ~/projects/ for swarm runs |
+ 
+ ### Extracting Swarm Artifacts
+ 
+ After a swarm run completes, extract the merged results:
+ 
+ ```bash
+ # List all swarm runs
+ source ralph-refactor/lib/swarm_artifacts.sh
+ export RALPH_DIR="$HOME/.ralph"
+ swarm_list_runs
+ 
+ # Extract artifacts (only changes, not full project)
+ swarm_extract_merged_artifacts "RUN_ID" "/home/mojo/projects"
+ ```
+ 
+ This creates:
+ - `~/projects/swarm-RUN_ID/merged-repo/` - Merged code from all workers
+ - `~/projects/swarm-RUN_ID/SWARM_SUMMARY.md` - Run report with task status
+ 
+ See [SWARM_ARTIFACTS.md](SWARM_ARTIFACTS.md) for details.
+ 
+ ## 📂 Project Structure
 
 *   `ralph2`: CLI wrapper script.
 *   `ralph-tui`: TUI launcher script.

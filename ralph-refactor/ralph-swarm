@@ -862,9 +862,9 @@ swarm_usage() {
     cat <<EOF
  ralph-swarm - Parallel task runner for Ralph
 
- USAGE:
-    ralph-refactor/ralph-swarm --devplan PATH [--workers N] [--timeout SECONDS] [--verbose]
-    ralph-refactor/ralph-swarm "<prompt>" [--workers N] [--timeout SECONDS] [--verbose]
+  USAGE:
+    ralph-refactor/ralph-swarm --devplan PATH --project NAME [--workers N] [--timeout SECONDS] [--verbose]
+    ralph-refactor/ralph-swarm "<prompt>" --project NAME [--workers N] [--timeout SECONDS] [--verbose]
     ralph-refactor/ralph-swarm --analyze PATH [--verbose]
     ralph-refactor/ralph-swarm --status [RUN_ID]
     ralph-refactor/ralph-swarm --logs [RUN_ID] [--worker N] [--lines N]
@@ -877,16 +877,18 @@ swarm_usage() {
     ralph-refactor/ralph-swarm --interactive|-i    Start interactive configuration prompts
     ralph-refactor/ralph-swarm --inspect [RUN_ID]  Show artifacts and quick info for a run
     ralph-refactor/ralph-swarm --emergency-stop    Kill all running swarm workers immediately
-
- ENV:
-    RALPH_DIR            State directory (default: ~/.ralph)
-    RALPH_LLM_PROVIDER   Provider for analyzer (default: opencode)
-    RALPH_LLM_MODEL      Model for analyzer (default: opencode/claude-sonnet-4-5)
-    SWARM_MAX_WORKERS    Maximum workers per run (default: 8)
-    SWARM_SPAWN_DELAY    Seconds between worker spawns (default: 1)
-    SWARM_MAX_TOTAL_WORKERS  Max concurrent workers system-wide (default: 16)
-    SWARM_COLLECT_ARTIFACTS  If true, collect artifacts after run (or use --collect-artifacts)
-    SWARM_ARTIFACTS_DIR      Base folder for artifacts. Use %RUN_ID% to place run id in path
+ 
+  ENV:
+     RALPH_DIR            State directory (default: ~/.ralph)
+     RALPH_LLM_PROVIDER   Provider for analyzer (default: opencode)
+     RALPH_LLM_MODEL      Model for analyzer (default: opencode/claude-sonnet-4-5)
+     SWARM_MAX_WORKERS    Maximum workers per run (default: 8)
+     SWARM_SPAWN_DELAY    Seconds between worker spawns (default: 1)
+     SWARM_MAX_TOTAL_WORKERS  Max concurrent workers system-wide (default: 16)
+     SWARM_PROJECT_NAME     Project name (creates new project in ~/projects/ or uses existing)
+     SWARM_PROJECTS_BASE    Base directory for projects (default: ~/projects)
+     SWARM_COLLECT_ARTIFACTS  If true, collect artifacts after run (or use --collect-artifacts)
+     SWARM_ARTIFACTS_DIR      Base folder for artifacts. Use %RUN_ID% to place run id in path
 
  NOTES:
     - The analyzer uses OpenCode CLI: \`opencode run --format json\`.
@@ -942,6 +944,10 @@ main() {
                 ;;
             --model)
                 RALPH_LLM_MODEL="$2"
+                shift 2
+                ;;
+            --project)
+                export SWARM_PROJECT_NAME="$2"
                 shift 2
                 ;;
             --analyze)
@@ -1108,6 +1114,13 @@ main() {
     if [ "$interactive" = true ]; then
         # Interactive prompts for common options
         echo "Starting interactive swarm configuration"
+        
+        if [ -z "${SWARM_PROJECT_NAME:-}" ]; then
+            read -r -p "Project name (creates in ~/projects/): " input_project || true
+            if [ -n "$input_project" ]; then
+                export SWARM_PROJECT_NAME="$input_project"
+            fi
+        fi
 
         read -r -p "Number of workers [$worker_count]: " input_workers || true
         if [ -n "$input_workers" ]; then
