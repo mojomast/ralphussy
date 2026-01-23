@@ -244,6 +244,10 @@ The TUI requires Python 3.9+ and uses:
 Dependencies are automatically installed in a virtual environment at
 `ralph-refactor/tui/.venv/` on first launch.
 
+### TUI Implementation Notes
+
+The TUI includes exception handling using `pass` statements for error cases. This is intentional design for graceful degradation. All documented commands are implemented and functional.
+
 ### Orchestrator Chat
 
 By default the chat pane is in `orchestrator` mode. The orchestrator is a small

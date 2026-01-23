@@ -23,6 +23,7 @@ This repository contains a self-contained distribution of the Ralph tooling:
 *   **[OpenCode CLI](https://github.com/anomalyco/opencode)** installed and configured on your `PATH`.
 *   **`jq`** (recommended for JSON parsing)
 *   **`git`**
+*   **Node.js 18+** (for swarm dashboard and OpenCode plugins)
 
 ### Running the CLI Agent
 
@@ -52,6 +53,24 @@ The TUI allows you to:
 *   View active swarm workers.
 *   Manage your `devplan.md`.
 *   Monitor tool usage and logs in real-time.
+
+### Swarm Dashboard Setup
+
+For real-time swarm monitoring, set up the dashboard:
+
+```bash
+cd swarm-dashboard
+npm install
+npm run build
+
+# Run the simple CLI version (works in any terminal)
+./run-simple.sh
+
+# Or run the full TUI version
+./run.sh
+```
+
+The dashboard monitors worker status, task progress, and resource usage automatically.
 
   ### Running a Swarm
  
@@ -151,15 +170,38 @@ The TUI allows you to:
  - `~/projects/swarm-RUN_ID/SWARM_SUMMARY.md` - Run report with task status
  
  See [SWARM_ARTIFACTS.md](SWARM_ARTIFACTS.md) for details.
+
+### OpenCode Integration Setup
+
+To integrate Ralph into OpenCode as a plugin:
+
+```bash
+# Install Ralph plugin
+cd opencode-ralph
+./install-integrated.sh
+
+# Install slash commands
+cd ../opencode-ralph-slash
+npm install
+npm run build
+
+# Follow instructions in opencode-ralph/INTEGRATION.md
+```
+
+See [opencode-ralph/README.md](opencode-ralph/README.md) for detailed integration instructions.
  
  ## 📂 Project Structure
 
 *   `ralph2`: CLI wrapper script.
 *   `ralph-tui`: TUI launcher script.
+*   `ralph-live`: Real-time CLI with streaming output.
+*   `ralph.config`: Configuration file.
 *   `ralph-refactor/`: The core implementation.
     *   `ralph`: The actual bash script logic.
+    *   `ralph-swarm`: Parallel swarm execution.
     *   `lib/`: Modular libraries for the agent (monitoring, JSON handling, etc.).
     *   `tui/`: Python source code for the TUI.
+*   `swarm-dashboard/`: Real-time swarm monitoring with TUI and CLI versions.
 *   `opencode-ralph*/`: Plugins for integrating Ralph directly into OpenCode.
 
 ## 🤝 Contributing

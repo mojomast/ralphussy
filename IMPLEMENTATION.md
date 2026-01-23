@@ -18,59 +18,72 @@ Ralph is based on the **Ralph Wiggum** technique, named after the character from
 
 ### Core Implementation
 
-- **ralph** - Main bash CLI implementation for Linux/macOS
-- **ralph.ps1** - PowerShell implementation for Windows
+- **ralph2** - Main CLI entry point (wraps ralph-refactor/ralph)
+- **ralph-tui** - Terminal User Interface for Ralph
+- **ralph-live** - Real-time CLI with streaming output
 - **ralph.config** - Configuration file for customization
+
+### Core Libraries
+
+- **ralph-refactor/ralph** - Main bash CLI implementation for Linux/macOS
+- **ralph-refactor/ralph-swarm** - Parallel swarm execution
+- **ralph-refactor/lib/*** - Modular libraries (core, monitor, json, devplan, swarm_*)
 
 ### Installation & Testing
 
 - **install.sh** - Bash installation script
 - **install.ps1** - PowerShell installation script for Windows
-- **test.sh** - Comprehensive test suite
-- **completion.bash** - Bash completion script
+- **ralph-refactor/tests/** - Test suite (test_json.sh, test_swarm.sh)
 
 ### Documentation
 
 - **README.md** - Complete documentation
-- **examples/rest-api-project.md** - Step-by-step tutorial
-- **examples/prompts.md** - Collection of example prompts
+- **README-ralph.md** - Detailed Ralph documentation
+- **RALPH_HANDBOOK.md** - Comprehensive Ralph usage guide
+- **SWARM_ARTIFACTS.md** - Swarm artifact extraction guide
 
 ## Quick Start
 
 ### Installation
 
 ```bash
-# Option 1: Download directly
-curl -fsSL https://raw.githubusercontent.com/anomalyco/opencode/main/ralph -o ralph
-chmod +x ralph
-sudo mv ralph /usr/local/bin/
+# Clone the repository
+git clone <repository-url>
+cd ralphussy
 
-# Option 2: Clone and install
-git clone https://github.com/anomalyco/opencode
-cd opencode
-./install.sh
+# Make scripts executable
+chmod +x ralph2 ralph-tui ralph-live
 
-# Option 3: From source
-./ralph --help
+# Run Ralph
+./ralph2 "Create a hello.txt file with 'Hello World'. Output <promise>COMPLETE</promise> when done."
+
+# Run the TUI
+./ralph-tui
+
+# Run swarm on a devplan
+./ralph-refactor/ralph-swarm --devplan ./devplan.md --workers 2
 ```
 
 ### Basic Usage
 
 ```bash
 # Simple task
-ralph "Create a hello.txt file with 'Hello World'. Output <promise>COMPLETE</promise> when done."
+./ralph2 "Create a hello.txt file with 'Hello World'. Output <promise>COMPLETE</promise> when done."
 
 # Complex task with iterations
-ralph "Build a REST API with CRUD endpoints and tests. Output <promise>COMPLETE</promise> when all tests pass." --max-iterations 20
+./ralph2 "Build a REST API with CRUD endpoints and tests. Output <promise>COMPLETE</promise> when all tests pass." --max-iterations 20
 
 # From prompt file
-ralph --prompt-file task.txt
+./ralph2 --prompt-file task.txt
 
 # Monitor progress
-ralph --status
+./ralph2 --status
 
 # Add guidance mid-loop
-ralph --add-context "Focus on the authentication module first"
+./ralph2 --add-context "Focus on the authentication module first"
+
+# Run swarm
+./ralph-refactor/ralph-swarm --devplan ./devplan.md --workers 2
 ```
 
 ## Features
@@ -121,7 +134,7 @@ ralph --add-context "Focus on the authentication module first"
 
 ## Architecture
 
-### State Files (`~/.ralph/`)
+### State Files (`~/projects/.ralph/`)
 
 - **state.json** - Current loop state and iteration count
 - **history.json** - All iteration history with metrics
@@ -136,6 +149,50 @@ ralph --add-context "Focus on the authentication module first"
 3. **Context Manager**: Handles mid-loop context injection
 4. **Progress Tracker**: Records all activity and metrics
 5. **Struggle Detector**: Identifies when agent needs help
+
+### Project Structure
+
+```
+ralphussy/
+├── ralph2                        # Main CLI wrapper
+├── ralph-tui                     # Terminal User Interface
+├── ralph-live                    # Real-time CLI with streaming output
+├── ralph.config                  # Configuration file
+├── README.md                     # Main documentation
+├── README-ralph.md               # Ralph-specific documentation
+├── RALPH_HANDBOOK.md             # Comprehensive usage guide
+├── SWARM_ARTIFACTS.md            # Swarm artifact extraction guide
+├── IMPLEMENTATION.md             # This file
+├── ralph-refactor/
+│   ├── ralph                     # Core Ralph implementation
+│   ├── ralph-swarm               # Parallel swarm execution
+│   ├── ralph-live                # Live TUI for swarms
+│   ├── ralph-tui                # Python TUI implementation
+│   ├── lib/                      # Modular libraries
+│   │   ├── core.sh              # Core functionality
+│   │   ├── monitor.sh           # Live monitor
+│   │   ├── json.sh             # JSON extraction
+│   │   ├── devplan.sh          # Devplan parsing
+│   │   ├── swarm_worker.sh     # Worker management
+│   │   ├── swarm_db.sh         # Database operations
+│   │   ├── swarm_artifacts.sh   # Artifact extraction
+│   │   ├── swarm_git.sh        # Git operations
+│   │   ├── swarm_scheduler.sh   # Task scheduling
+│   │   ├── swarm_display.sh    # Progress display
+│   │   └── swarm_analyzer.sh   # Task analysis
+│   └── tests/                   # Test suite
+├── swarm-dashboard/               # Real-time swarm monitoring
+│   ├── src/                     # TypeScript source
+│   ├── dist/                    # Compiled JavaScript
+│   └── run-simple.sh            # Simple CLI launcher
+├── opencode-ralph/              # OpenCode plugin integration
+│   ├── src/                     # TypeScript source
+│   ├── dist/                    # Compiled JavaScript
+│   └── install-integrated.sh     # Installation script
+└── opencode-ralph-slash/        # OpenCode slash commands
+    ├── src/                     # TypeScript source
+    └── dist/                    # Compiled JavaScript
+```
 
 ## Writing Effective Prompts
 
@@ -217,14 +274,16 @@ export MODEL="claude-sonnet-4-20250514"
 Run the test suite:
 
 ```bash
-# Run all tests
-./test.sh
+# Run JSON extraction tests
+cd ralph-refactor
+./tests/test_json.sh
 
-# Test specific script
-RALPH_SCRIPT=/usr/local/bin/ralph ./test.sh
+# Run swarm tests
+./tests/test_swarm.sh
 
-# Test with verbose output
-./test.sh --verbose
+# Test ralph with syntax checking
+bash -n ralph-refactor/ralph
+bash -n ralf-refactor/ralph-swarm
 ```
 
 ## Troubleshooting
@@ -248,23 +307,23 @@ curl -fsSL https://opencode.ai/install | bash
 **Agent appears stuck**
 ```bash
 # Check status
-ralph --status
+./ralph2 --status
 
 # Add guidance
-ralph --add-context "Try looking at the utils/parser.ts file"
+./ralph2 --add-context "Try looking at the utils/parser.ts file"
 ```
 
 ### Debug Mode
 
 ```bash
 # Verbose output
-ralph "Your task" --verbose
+./ralph2 "Your task" --verbose
 
 # Check logs
-cat ~/.ralph/logs/iteration_*.log
+cat ~/projects/.ralph/logs/iteration_*.log
 
 # Check progress
-cat ~/.ralph/progress.md
+cat ~/projects/.ralph/progress.md
 ```
 
 ## Examples
@@ -272,19 +331,26 @@ cat ~/.ralph/progress.md
 ### Example 1: Simple File Creation
 
 ```bash
-ralph "Create a greeting.txt file with 'Hello, Ralph!'. Output <promise>COMPLETE</promise> when the file exists and contains the correct text."
+./ralph2 "Create a greeting.txt file with 'Hello, Ralph!'. Output <promise>COMPLETE</promise> when the file exists and contains the correct text."
 ```
 
 ### Example 2: REST API Development
 
 ```bash
-ralph "Build a REST API for managing todos. Include CRUD operations, input validation, and unit tests. Output <promise>COMPLETE</promise> when all tests pass." --max-iterations 25
+./ralph2 "Build a REST API for managing todos. Include CRUD operations, input validation, and unit tests. Output <promise>COMPLETE</promise> when all tests pass." --max-iterations 25
 ```
 
 ### Example 3: Code Refactoring
 
 ```bash
-ralph "Refactor the authentication module to use the singleton pattern. Add proper error handling and logging. Ensure all existing tests still pass. Output <promise>DONE</promise> when complete." --max-iterations 15
+./ralph2 "Refactor the authentication module to use the singleton pattern. Add proper error handling and logging. Ensure all existing tests still pass. Output <promise>DONE</promise> when complete." --max-iterations 15
+```
+
+### Example 4: Swarm Execution
+
+```bash
+# Create a devplan.md with tasks, then run swarm
+./ralph-refactor/ralph-swarm --devplan ./devplan.md --project my-app --workers 2
 ```
 
 ## Advanced Usage
@@ -292,13 +358,13 @@ ralph "Refactor the authentication module to use the singleton pattern. Add prop
 ### Custom Completion Promises
 
 ```bash
-ralph "Your task" --completion-promise "DONE"
+./ralph2 "Your task" --completion-promise "DONE"
 ```
 
 ### Specific Models
 
 ```bash
-ralph "Your task" --model "claude-sonnet-4-20250514"
+./ralph2 "Your task" --model "claude-sonnet-4-20250514"
 ```
 
 ### Batch Processing
@@ -306,17 +372,15 @@ ralph "Your task" --model "claude-sonnet-4-20250514"
 ```bash
 # Process multiple prompts
 for prompt in $(cat prompts.txt); do
-    ralph "$prompt" --max-iterations 10
+    ./ralph2 "$prompt" --max-iterations 10
 done
 ```
 
-### Parallel Loops
+### Parallel Loops (Swarm)
 
 ```bash
-# Run multiple independent Ralph loops
-ralph "Task A" --prompt-file task-a.txt &
-ralph "Task B" --prompt-file task-b.txt &
-wait
+# Run swarm with multiple workers for parallel task execution
+./ralph-refactor/ralph-swarm --devplan ./devplan.md --workers 4
 ```
 
 ## Performance Tips

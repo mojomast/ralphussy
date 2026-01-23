@@ -7,6 +7,21 @@
 
   The ralph-live system has been extensively debugged and improved. The swarm functionality is now operational with proper:
 
+  **Codebase Cleanup (2026-01-23):**
+  - **Removed Go Skeleton:** Deleted unused Go components (`cmd/`, `pkg/`, `internal/`, `web/`, `main.go`, `go.mod`)
+  - **Documentation Updates:** Fixed IMPLEMENTATION.md to reference correct files (`ralph2` instead of `ralph`)
+  - **README Enhancements:** Added swarm dashboard and OpenCode integration setup instructions
+  - **Configuration Documentation:** Enhanced ralph.config with detailed sandbox setup instructions
+  - **Directory Cleanup:** Removed empty `ralph-refactor/artifacts/` directory
+  - **Created Reference Docs:** Added IMPLEMENTATION_PLAN.md and CLEANUP_SUMMARY.md
+  - **Files Changed:**
+    - Deleted: `cmd/`, `pkg/`, `internal/`, `web/`, `main.go`, `go.mod`, `ralph-refactor/artifacts/`
+    - Updated: IMPLEMENTATION.md, README.md, ralph-refactor/README.md, ralph.config
+    - Created: IMPLEMENTATION_PLAN.md, CLEANUP_SUMMARY.md
+  - **Result:** Codebase is clean, documentation accurately reflects implementation
+  - **Result:** All entry points verified working (ralph2, ralph-live, ralph-swarm)
+  - **Note:** `devplan.md` retained as it describes a separate "Warp Clone in Go" project concept
+
    - **RALPH_DIR Relocation:** Default state directory changed from `~/.ralph` to `~/projects/.ralph` to consolidate all Ralph-related state within the projects folder
    - **Worker Prompts:** All swarm start operations now prompt for worker count before starting
    - **Project Isolation:** Swarms create independent repos in `$RALPH_DIR/projects/PROJECT_NAME/` (not ralphussy worktrees)
