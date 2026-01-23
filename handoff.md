@@ -1,10 +1,10 @@
 # Ralph Live - Handoff
 
 ## Date
-2026-01-22
+2026-01-23
 
 ## Current Status
-
+ 
  The ralph-live system has been extensively debugged and improved. The swarm functionality is now operational with proper:
  
  - **Project Isolation:** Swarms create independent repos in `~/projects/PROJECT_NAME/` (not ralphussy worktrees)
@@ -59,6 +59,36 @@
 - Workers check for existing git commits matching task description before executing
 - Tasks with matching commits are skipped and marked complete
 - Prevents redoing work from previous runs when resuming
+
+###6. Swarm Attach Mode (ralph-refactor/ralph-live:1973-2200)
+- **New Feature:** `ralph-live --attach [RUN_ID]` attaches to running swarms
+- **New Feature:** Interactive selection from list of running swarms
+- **Display:** Real-time progress bar, worker status, task counts
+- **Controls:** `r` to refresh, `q` to quit
+- **Usage:** Read-only, does not interfere with running swarms
+- **Files Changed:**
+   - `ralph-refactor/ralph-live:1973-2200` - `attach_swarm_live()` and `list_running_swarm()` functions
+   - `ralph-refactor/ralph-live:90` - `read_key()` fixed for non-TTY environments
+   - `ralph-refactor/ralph-live:2372` - menu option `a` for attach mode
+
+###7. Swarm Artifacts to Projects (ralph-refactor/ralph-live:2032-2120, 1973-2030)
+- **New Feature:** `ralph-live` menu option `m` to move artifacts to projects folder
+- **Function:** `move_swarm_artifacts()` lists completed swarms and copies artifacts
+- **Function:** `move_artifacts_for_run()` copies worker repos, logs, and creates SWARM_SUMMARY.md
+- **Destination:** `/projects/swarm-RUN_ID/`
+- **Files Changed:**
+   - `ralph-refactor/ralph-live:1973-2030` - `move_swarm_artifacts()` and `move_artifacts_for_run()`
+   - `ralph-refactor/ralph-live:2435` - menu option `m` added
+- **Tested:** Successfully extracted artifacts from run `20260123_022949` to `/projects/swarm-20260123_022949/`
+- **Usage:** 
+   ```bash
+   # Interactive mode - select swarm from list
+   ./ralph-live
+   # Then select option 'm'
+   
+   # Direct move (pipe selection)
+   echo "1" | ./ralph-live
+   ```
 
 ## Known Issues
 
@@ -126,7 +156,7 @@
 Historical context has been moved to [handoffarchive.md](./handoffarchive.md). Feel free to move stale sections from this file to the archive to keep handoff.md concise.
 
 - [📦 Fixed Model Selection Wizard Exit/Hang](./handoffarchive.md#fixed-model-selection-wizard-exithang)
-- [📦 Added Project Menu + New Project](./handoffarchive.md#added-project-menu--new-project-devplan--swarm)
+- [📦 Added Project Menu + New Project Wizard](./handoffarchive.md#added-project-menu--new-project-devplan--swarm)
 - [📦 UX: Single-Key Menus + Cooler ASCII Branding](./handoffarchive.md#ux-single-key-menus--cooler-ascii-branding)
 - [📦 Real-Time Verbosity Implementation](./handoffarchive.md#handoff-ralph-live-swarm-verbosity-implementation)
 - [📦 Swarm Cleanup & Bug Fixes](./handoffarchive.md#handoff-swarm-cleanup--bug-fixes)
@@ -135,6 +165,7 @@ Historical context has been moved to [handoffarchive.md](./handoffarchive.md). F
 - [📦 Swarm Run 20260122_213126 - Timeout Investigation](./handoffarchive.md#handoff-swarm-run-20260122_213126---timeout-investigation)
 - [📦 JSON Text Extraction Critical Bug Fix](./handoffarchive.md#handoff-json-text-extraction-critical-bug-fix)
 - [📦 Swarm Resume & Display Fixes](./handoffarchive.md#handoff-swarm-resume--display-fixes)
+- [📦 Swarm Attach Mode & Artifacts Move (2026-01-23)](#handoff-swarm-attach-mode--artifacts-move-2026-01-23)
 
 ---
 
@@ -143,3 +174,9 @@ Historical context has been moved to [handoffarchive.md](./handoffarchive.md). F
 - Move resolved issues, detailed root cause analysis, and historical context to handoffarchive.md
 - Update archive index when moving content
 - Add anchors (`## Section Name`) to archived sections for linking
+
+---
+
+## Archive Index
+
+- [📦 Swarm Attach Mode & Artifacts Move (2026-01-23)](#handoff-swarm-attach-mode--artifacts-move-2026-01-23) - Today's changes added to archive

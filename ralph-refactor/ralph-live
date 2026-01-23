@@ -21,6 +21,10 @@ LIVE_STATE_FILE=""
 LIVE_AGENT_PID=""
 LIVE_INTERACTIVE=true
 
+# Swarm attach mode state
+ATTACH_MODE_RUN_ID=""
+ATTACH_MODE_REFRESH=2
+
 # Projects
 PROJECTS_DIR="$RALPH_DIR/projects"
 CURRENT_PROJECT_FILE="$PROJECTS_DIR/current"
@@ -89,13 +93,15 @@ read_key() {
     local var_name="${1:?}"
     local key=""
 
-    if [ -t 0 ]; then
-        IFS= read -rsn1 key || true
-    elif { exec 3</dev/tty; } 2>/dev/null; then
-        IFS= read -rsn1 -u 3 key || true
-        exec 3<&-
+    if [ ! -t 0 ]; then
+        printf -v "$var_name" '' 2>/dev/null
+        return 0
+    fi
+
+    if IFS= read -rsn1 key 2>/dev/null; then
+        :
     else
-        IFS= read -rsn1 key || true
+        IFS= read -rsn1 key 2>/dev/null || true
     fi
 
     printf -v "$var_name" '%s' "$key"
@@ -322,6 +328,99 @@ EOF
     return 0
 }
 
+project_reiterate_devplan_with_opencode() {
+    local path="$1"
+    local title="$2"
+    local user_feedback="$3"
+
+    if ! command -v opencode >/dev/null 2>&1; then
+        echo -e "${RED}opencode not found${NC}"
+        return 1
+    fi
+
+    if [ ! -f "$path" ]; then
+        echo -e "${RED}DevPlan not found: $path${NC}"
+        return 1
+    fi
+
+    local existing_devplan
+    existing_devplan=$(cat "$path")
+
+    local opencode_cmd="opencode run"
+    local use_model="${MODEL:-glm-4.7}"
+    if [ -n "${PROVIDER:-}" ]; then
+        use_model="${PROVIDER}/${MODEL:-glm-4.7}"
+    else
+        use_model="zai-coding-plan/${MODEL:-glm-4.7}"
+    fi
+    opencode_cmd="$opencode_cmd --model $use_model"
+
+    local prompt
+    prompt=$(cat <<EOF
+You are improving an existing DevPlan based on user feedback. Write markdown output ONLY - no tools, no code blocks, no explanations.
+
+Project name: $title
+
+User feedback/iteration request:
+$user_feedback
+
+CURRENT DEVPLAN:
+$existing_devplan
+
+REQUIREMENTS:
+1. Output ONLY pure markdown - maintain the existing structure
+2. Use these sections: Goal, Constraints, Tasks
+3. Under Tasks, use format: "- [ ] task description"
+4. Each task on a NEW LINE with "- [ ] " prefix
+5. Keep 10-15 tasks suitable for parallel swarm agents
+6. Organize: setup -> core -> advanced -> testing -> docs
+7. Each task completable in 10-30 minutes
+8. Be specific: "Create user authentication endpoint" not "Work on auth"
+9. Group related tasks with blank lines
+
+RESPOND WITH THE UPDATED DEVPLAN IN THIS FORMAT:
+
+# DevPlan: $title
+
+## Goal
+[One-sentence goal]
+
+## Constraints
+[Key constraints]
+
+## Tasks
+- [ ] Setup task 1
+- [ ] Setup task 2
+
+- [ ] Core feature task 1
+- [ ] Core feature task 2
+
+- [ ] Testing task 1
+- [ ] Testing task 2
+
+DO NOT use tools, code blocks, or markdown fences. Just plain markdown text.
+EOF
+)
+
+    echo -e "${CYAN}Reiterating DevPlan with opencode...${NC}"
+
+    local json_output=""
+    if ! json_output=$($opencode_cmd --format json "$prompt" 2>&1); then
+        echo -e "${RED}DevPlan reiteration failed${NC}"
+        return 1
+    fi
+
+    local text_output=""
+    text_output=$(json_extract_text "$json_output") || text_output=""
+    if [ -z "$text_output" ]; then
+        echo -e "${RED}DevPlan reiteration returned empty output${NC}"
+        return 1
+    fi
+
+    printf '%s\n' "$text_output" > "$path"
+    return 0
+}
+
 project_start_swarm_devplan() {
     if [ -z "$CURRENT_PROJECT" ] || [ -z "$CURRENT_PROJECT_DEVPLAN" ]; then
         echo -e "${RED}No current project/devplan selected${NC}"
@@ -425,7 +524,7 @@ EOF
 
         echo -e "${CYAN}Options:${NC}"
         echo -e "  ${GREEN}e${NC}  Edit devplan"
-        echo -e "  ${GREEN}r${NC}  Regenerate with opencode"
+        echo -e "  ${GREEN}r${NC}  Reiterate devplan"
         echo -e "  ${GREEN}c${NC}  Continue to swarm"
         echo -e "  ${GREEN}q${NC}  Cancel"
 
@@ -445,11 +544,11 @@ EOF
                 ;;
             r|R)
                 echo ""
-                echo -e "${CYAN}Describe the project goal/requirements (Ctrl+D when done, or Enter to keep existing):${NC}"
-                local new_goal
-                new_goal=$(read_multiline_input)
-                if [ -n "$new_goal" ]; then
-                    project_generate_devplan_with_opencode "$devplan_path" "$name" "$new_goal" || true
+                echo -e "${CYAN}Enter your feedback to iterate on the DevPlan (Ctrl+D when done):${NC}"
+                local user_feedback
+                user_feedback=$(read_multiline_input)
+                if [ -n "$user_feedback" ]; then
+                    project_reiterate_devplan_with_opencode "$devplan_path" "$name" "$user_feedback" || true
                 fi
                 ;;
             c|C)
@@ -1869,6 +1968,380 @@ stop_agent() {
     echo -e "${YELLOW}Agent stopped${NC}"
 }
 
+# ============================================================================
+# Swarm Artifacts
+# ============================================================================
+
+move_swarm_artifacts() {
+    ui_banner "MOVE SWARM ARTIFACTS"
+
+    local db_path="$RALPH_DIR/swarm.db"
+    if [ ! -f "$db_path" ]; then
+        echo -e "${RED}Swarm database not found${NC}"
+        return 1
+    fi
+
+    local runs
+    runs=$(sqlite3 "$db_path" "SELECT run_id, status, total_tasks, completed_tasks, source_path FROM swarm_runs WHERE status = 'completed' ORDER BY id DESC LIMIT 10;" 2>/dev/null || true)
+
+    if [ -z "$runs" ]; then
+        echo "  No completed swarms found"
+        echo ""
+        return 1
+    fi
+
+    local count=0
+    local run_array=()
+
+    echo -e "  ${CYAN}#  Run ID${NC}        ${CYAN}Tasks${NC}  ${CYAN}Done${NC}  ${CYAN}Source${NC}"
+    echo -e "  ${CYAN}─────────────────────────────────────────────────────────────────${NC}"
+
+    while IFS='|' read -r run_id status total completed source_path; do
+        [ -z "$run_id" ] && continue
+        count=$((count + 1))
+        run_array+=("$run_id")
+
+        local path_display="${source_path##*/}"
+        if [ ${#path_display} -gt 25 ]; then
+            path_display="${path_display:0:22}..."
+        fi
+
+        printf "  ${CYAN}%2d${NC}  %-15s  %3s/%-3s  %s\n" \
+            "$count" "${run_id:0:16}" "$completed" "$total" "$path_display"
+    done <<< "$runs"
+
+    echo ""
+    echo -e "  ${CYAN}[0]${NC} Cancel"
+    echo ""
+
+    local selection
+    echo -n -e "  ${YELLOW}Select swarm to move artifacts (1-$count or 0): ${NC}"
+    read_user_input selection
+
+    if [ -z "$selection" ] || [ "$selection" = "0" ]; then
+        return 1
+    fi
+
+    if ! [[ "$selection" =~ ^[0-9]+$ ]] || [ "$selection" -lt 1 ] || [ "$selection" -gt "$count" ]; then
+        echo -e "${RED}Invalid selection${NC}"
+        return 1
+    fi
+
+    local selected_run="${run_array[$((selection - 1))]}"
+    move_artifacts_for_run "$selected_run"
+}
+
+move_artifacts_for_run() {
+    local run_id="$1"
+
+    echo ""
+    echo -e "${BLUE}[RALPH-LIVE]${NC} Moving artifacts for swarm: $run_id"
+
+    local run_dir="$RALPH_DIR/swarm/runs/$run_id"
+    if [ ! -d "$run_dir" ]; then
+        echo -e "${RED}Run directory not found: $run_dir${NC}"
+        return 1
+    fi
+
+    local project_base="${PROJECTS_DIR:-$HOME/projects}"
+    local dest_dir="$project_base/swarm-$run_id"
+
+    if [ -d "$dest_dir" ]; then
+        echo ""
+        echo -e "${YELLOW}Destination already exists: $dest_dir${NC}"
+        echo -e "  ${CYAN}[o]${NC}  Overwrite"
+        echo -e "  ${CYAN}[c]${NC}  Cancel"
+        echo ""
+        echo -n -e "  ${YELLOW}Choose option (o/c): ${NC}"
+        local choice
+        read_user_input choice
+        case "$choice" in
+            o|O) ;;
+            *) return 1 ;;
+        esac
+    fi
+
+    mkdir -p "$dest_dir"
+
+    echo ""
+    echo "Copying artifacts from $run_dir to $dest_dir"
+    echo ""
+
+    for worker_dir in "$run_dir"/worker-*; do
+        [ -d "$worker_dir" ] || continue
+        local worker_name
+        worker_name=$(basename "$worker_dir")
+        echo -e "  ${CYAN}Copying${NC} $worker_name..."
+
+        local dest_worker="$dest_dir/$worker_name"
+        mkdir -p "$dest_worker"
+
+        if [ -d "$worker_dir/repo" ]; then
+            local repo_dir="$worker_dir/repo"
+            if command -v rsync >/dev/null 2>&1; then
+                rsync -a --exclude='.git' --exclude='node_modules' "$repo_dir"/ "$dest_worker/" 2>/dev/null || true
+            else
+                cp -a "$repo_dir"/. "$dest_worker/" 2>/dev/null || true
+            fi
+
+            if [ -d "$repo_dir/.git" ]; then
+                git -C "$repo_dir" log --oneline -n 100 > "$dest_worker/commits.txt" 2>/dev/null || true
+            fi
+        fi
+
+        if [ -d "$worker_dir/logs" ]; then
+            mkdir -p "$dest_worker/logs"
+            cp -a "$worker_dir"/logs/* "$dest_worker/logs/" 2>/dev/null || true
+        fi
+    done
+
+    if [ -d "$run_dir/artifacts" ]; then
+        echo -e "  ${CYAN}Copying${NC} artifacts folder..."
+        cp -a "$run_dir/artifacts"/. "$dest_dir/" 2>/dev/null || true
+    fi
+
+    local summary_file="$dest_dir/SWARM_SUMMARY.md"
+    {
+        echo "# Swarm Run Summary: $run_id"
+        echo
+        echo "## Run Status"
+
+        local db_path="$RALPH_DIR/swarm.db"
+        local run_status total_tasks completed_tasks failed_tasks started_at completed_at
+        run_status=$(sqlite3 "$db_path" "SELECT status FROM swarm_runs WHERE run_id = '$run_id';" 2>/dev/null || echo "unknown")
+        total_tasks=$(sqlite3 "$db_path" "SELECT total_tasks FROM swarm_runs WHERE run_id = '$run_id';" 2>/dev/null || echo "0")
+        completed_tasks=$(sqlite3 "$db_path" "SELECT completed_tasks FROM swarm_runs WHERE run_id = '$run_id';" 2>/dev/null || echo "0")
+        failed_tasks=$(sqlite3 "$db_path" "SELECT failed_tasks FROM swarm_runs WHERE run_id = '$run_id';" 2>/dev/null || echo "0")
+        started_at=$(sqlite3 "$db_path" "SELECT datetime(started_at) FROM swarm_runs WHERE run_id = '$run_id';" 2>/dev/null || echo "N/A")
+        completed_at=$(sqlite3 "$db_path" "SELECT datetime(completed_at) FROM swarm_runs WHERE run_id = '$run_id';" 2>/dev/null || echo "N/A")
+
+        echo "- **Status**: $run_status"
+        echo "- **Total Tasks**: $total_tasks"
+        echo "- **Completed**: $completed_tasks"
+        echo "- **Failed**: $failed_tasks"
+        echo "- **Started**: $started_at"
+        echo "- **Completed**: $completed_at"
+    } > "$summary_file"
+
+    echo ""
+    echo -e "${GREEN}[RALPH-LIVE]${NC} Artifacts moved successfully!"
+    echo "  Destination: $dest_dir"
+    echo "  Summary: $summary_file"
+    echo ""
+
+    echo -e "${CYAN}To explore artifacts:${NC}"
+    echo "  cd $dest_dir"
+    echo ""
+}
+
+# ============================================================================
+# Swarm Attach Mode
+# ============================================================================
+
+list_running_swarm_runs() {
+    ui_banner "RUNNING SWARMS"
+
+    local runs
+    runs=$(sqlite3 "$RALPH_DIR/swarm.db" "SELECT run_id, source_type, source_path, worker_count, status, started_at FROM swarm_runs WHERE status IN ('running', 'interrupted') ORDER BY id DESC LIMIT 10;" 2>/dev/null || true)
+
+    if [ -z "$runs" ]; then
+        echo "  No running swarms found"
+        echo ""
+        return 1
+    fi
+
+    local count=0
+    local run_array=()
+
+    echo -e "  ${CYAN}#  Run ID${NC}        ${CYAN}Type${NC}  ${CYAN}Workers${NC}  ${CYAN}Status${NC}       ${CYAN}Started${NC}"
+    echo -e "  ${CYAN}────────────────────────────────────────────────────────────────────────────${NC}"
+
+    while IFS='|' read -r run_id source_type source_path worker_count status started_at; do
+        [ -z "$run_id" ] && continue
+        count=$((count + 1))
+        run_array+=("$run_id")
+
+        local type_display="${source_type:0:4}"
+        local path_display="${source_path##*/}"
+        if [ ${#path_display} -gt 20 ]; then
+            path_display="${path_display:0:17}..."
+        fi
+
+        local status_display="$status"
+        case "$status" in
+            running) status_display="${GREEN}running${NC}" ;;
+            interrupted) status_display="${YELLOW}paused${NC}" ;;
+        esac
+
+        printf "  ${CYAN}%2d${NC}  %-15s  %-4s  %-8s  %s  %s\n" \
+            "$count" "${run_id:0:16}" "$type_display" "$worker_count" "$status_display" "${started_at:5:16}"
+    done <<< "$runs"
+
+    echo ""
+    echo -e "  ${CYAN}[0]${NC} Cancel"
+    echo ""
+
+    local selection
+    echo -n -e "  ${YELLOW}Select swarm to attach (1-$count or 0): ${NC}"
+    read_user_input selection
+
+    if [ -z "$selection" ] || [ "$selection" = "0" ]; then
+        return 1
+    fi
+
+    if ! [[ "$selection" =~ ^[0-9]+$ ]] || [ "$selection" -lt 1 ] || [ "$selection" -gt "$count" ]; then
+        echo -e "${RED}Invalid selection${NC}"
+        return 1
+    fi
+
+    echo "${run_array[$((selection - 1))]}"
+}
+
+attach_swarm_live() {
+    local run_id="$1"
+
+    if [ -z "$run_id" ]; then
+        run_id=$(list_running_swarm_runs)
+        if [ -z "$run_id" ]; then
+            return 1
+        fi
+    fi
+
+    echo ""
+    echo -e "${BLUE}[RALPH-LIVE]${NC} Attaching to swarm: $run_id"
+    echo -e "${CYAN}Press 'r' to refresh, 'q' to quit${NC}"
+    echo ""
+
+    local last_display=""
+    local running=true
+
+    while $running; do
+        local display=""
+        local run_status
+        run_status=$(swarm_db_get_run_status "$run_id" 2>/dev/null || true)
+
+        if [ -z "$run_status" ]; then
+            echo -e "${RED}Swarm run not found: $run_id${NC}"
+            running=false
+            break
+        fi
+
+        local status total completed failed started_at completed_at
+        status=$(echo "$run_status" | cut -d'|' -f1)
+        total=$(echo "$run_status" | cut -d'|' -f2)
+        completed=$(echo "$run_status" | cut -d'|' -f3)
+        failed=$(echo "$run_status" | cut -d'|' -f4)
+        started_at=$(echo "$run_status" | cut -d'|' -f5)
+
+        local percentage=0
+        if [ "$total" -gt 0 ] && [ "$total" != "NULL" ]; then
+            percentage=$((completed * 100 / total))
+        fi
+
+        local bar_length=30
+        local filled=$((percentage * bar_length / 100))
+        local bar
+        bar=$(printf '%0.s█' $(seq 1 $filled))
+        local empty=$((bar_length - filled))
+        bar="${bar}$(printf '%0.s░' $(seq 1 $empty))"
+
+        display+="\r"
+        display+="╔════════════════════════════════════════════════════════════════╗\n"
+        display+="║                      RALPH SWARM LIVE                       ║\n"
+        display+="╠════════════════════════════════════════════════════════════════╣\n"
+        display+="║ Run: ${run_id:0:20}                                              ║\n"
+        display+="╠════════════════════════════════════════════════════════════════╣\n"
+
+        local status_color
+        case "$status" in
+            running) status_color="${GREEN}" ;;
+            completed) status_color="${GREEN}" ;;
+            interrupted) status_color="${YELLOW}" ;;
+            *) status_color="${RED}" ;;
+        esac
+
+        display+="║ Progress: ${bar}  ${completed}/${total} (${percentage}%)        ║\n"
+        display+="║ Status: ${status_color}${status^^}${NC}  Failed: ${failed}                                       ║\n"
+
+        local task_stats
+        task_stats=$(swarm_db_get_task_count_by_status "$run_id" 2>/dev/null || true)
+
+        local pending=0 in_progress=0
+        pending=$(echo "$task_stats" | awk -F'|' '$1=="pending"{print $2}' || echo "0")
+        in_progress=$(echo "$task_stats" | awk -F'|' '$1=="in_progress"{print $2}' || echo "0")
+
+        display+="╠════════════════════════════════════════════════════════════════╣\n"
+        display+="║ Pending: ${pending}  In Progress: ${in_progress}  Completed: ${completed}        ║\n"
+        display+="╠════════════════════════════════════════════════════════════════╣\n"
+
+        display+="║ Workers:\n"
+
+        local workers_info
+        workers_info=$(swarm_db_list_workers "$run_id" 2>/dev/null || true)
+        local worker_count=0
+
+        while IFS='|' read -r id worker_num pid branch_name status current_task_id started_at last_heartbeat; do
+            [ -z "$worker_num" ] && continue
+            worker_count=$((worker_count + 1))
+
+            if [ $worker_count -le 5 ]; then
+                local worker_status_color
+                case "$status" in
+                    working|in_progress) worker_status_color="${GREEN}" ;;
+                    idle) worker_status_color="${YELLOW}" ;;
+                    stopped) worker_status_color="${RED}" ;;
+                    *) worker_status_color="${CYAN}" ;;
+                esac
+
+                local task_display="${current_task_id:-Idle}"
+                if [ -n "$current_task_id" ] && [ "$current_task_id" != "NULL" ]; then
+                    task_display="#${current_task_id}"
+                fi
+
+                display+="║   Worker #${worker_num}: ${worker_status_color}${status}${NC} Task: ${task_display}\n"
+            fi
+        done <<< "$workers_info"
+
+        if [ "$worker_count" -gt 5 ]; then
+            display+="║   ... and $((worker_count - 5)) more workers\n"
+        fi
+
+        display+="╠════════════════════════════════════════════════════════════════╣\n"
+
+        if [ "$status" = "completed" ]; then
+            display+="║ ${GREEN}Swarm completed!${NC}                                                ║\n"
+        fi
+
+        display+="╚════════════════════════════════════════════════════════════════╝\n"
+
+        if [ "$display" != "$last_display" ]; then
+            echo -e "$display"
+            last_display="$display"
+        fi
+
+        if [ "$status" = "completed" ]; then
+            echo ""
+            echo -e "${GREEN}[RALPH-LIVE]${NC} Swarm completed!"
+            running=false
+            break
+        fi
+
+        if read -t "$ATTACH_MODE_REFRESH" -r cmd 2>/dev/null; then
+            case "$cmd" in
+                q|Q)
+                    echo ""
+                    echo -e "${YELLOW}Detaching from swarm${NC}"
+                    running=false
+                    break
+                    ;;
+                r|R)
+                    last_display=""
+                    ;;
+            esac
+        fi
+    done
+}
+
 show_help() {
     cat << EOF
 $(ui_logo)
@@ -1937,6 +2410,8 @@ show_main_menu() {
     echo -e "  ${CYAN}7${NC}) Project menu"
     echo -e "  ${CYAN}8${NC}) New project (DevPlan -> swarm)"
     echo -e "  ${CYAN}9${NC}) View all projects with swarm progress"
+    echo -e "  ${CYAN}a${NC}) Attach to running swarm"
+    echo -e "  ${CYAN}m${NC}) Move swarm artifacts to projects"
     echo ""
     echo -e "  ${CYAN}q${NC}) Quit"
     echo ""
@@ -2044,6 +2519,12 @@ run_interactive_app() {
                 echo -e "${CYAN}Press Enter to continue...${NC}"
                 read_user_input
                 ;;
+            a|A)
+                attach_swarm_live "$ATTACH_MODE_RUN_ID" || true
+                ;;
+            m|M)
+                move_swarm_artifacts || true
+                ;;
             q|Q)
                 echo -e "${GREEN}Goodbye!${NC}"
                 exit 0
@@ -2090,6 +2571,10 @@ main() {
                 ;;
             --swarm)
                 swarm_task="$2"
+                shift 2
+                ;;
+            --attach)
+                ATTACH_MODE_RUN_ID="${2:-}"
                 shift 2
                 ;;
             --model)
@@ -2143,6 +2628,7 @@ USAGE:
 OPTIONS:
     --devplan PATH        Work on DevPlan file
     --swarm TASK          Run in Swarm mode (parallel workers)
+    --attach [RUN_ID]     Attach to running swarm (optional run_id for direct attach)
     --model MODEL         Set model (e.g., claude-sonnet-4-20250514)
     --provider PROVIDER   Set provider (e.g., anthropic, opencode)
     --select-model        Interactive model/provider selection
@@ -2168,6 +2654,7 @@ INTERACTIVE COMMANDS (while agent runs):
     sd          Start swarm on current DevPlan
     pp          View all projects with swarm progress
     pr          Resume swarm for a project
+    m           Move swarm artifacts to projects folder
     interrupt/i  Interrupt agent
     stop/x      Stop agent
     help/?      Show this help
@@ -2178,9 +2665,18 @@ EXAMPLES:
     ralph-live --select-model
     ralph-live --provider anthropic "Build a React component"
     ralph-live --swarm "Refactor entire codebase"
+    ralph-live --attach              # Interactive: select running swarm to watch
+    ralph-live --attach 20250123_123456  # Direct attach to specific run
     ralph-live (launch interactive menu)
 
 EOF
+        exit 0
+    fi
+
+    if [ -n "$ATTACH_MODE_RUN_ID" ]; then
+        init_ralph
+        swarm_db_init >/dev/null 2>&1 || true
+        attach_swarm_live "$ATTACH_MODE_RUN_ID"
         exit 0
     fi
 
