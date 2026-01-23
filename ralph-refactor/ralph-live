@@ -1,0 +1,2297 @@
+#!/bin/bash
+
+# Ralph Live - Real-time CLI with streaming output and interactive control
+# Usage: ralph-live [options] [prompt|devplan]
+# Supports: --devplan PATH, --model MODEL, --provider PROVIDER, --select-model
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+source "$SCRIPT_DIR/lib/core.sh"
+source "$SCRIPT_DIR/lib/monitor.sh"
+source "$SCRIPT_DIR/lib/json.sh"
+source "$SCRIPT_DIR/lib/devplan.sh"
+source "$SCRIPT_DIR/lib/swarm_db.sh"
+
+# Live mode state
+LIVE_PID_FILE=""
+LIVE_OUTPUT_FIFO=""
+LIVE_STATE_FILE=""
+LIVE_AGENT_PID=""
+LIVE_INTERACTIVE=true
+
+# Projects
+PROJECTS_DIR="$RALPH_DIR/projects"
+CURRENT_PROJECT_FILE="$PROJECTS_DIR/current"
+CURRENT_PROJECT=""
+CURRENT_PROJECT_DIR=""
+CURRENT_PROJECT_WORKDIR=""
+CURRENT_PROJECT_DEVPLAN=""
+
+# Function to read user input safely.
+# Never propagates read EOF/errors (set -e safe).
+read_user_input() {
+    local var_name="${1:-}"
+    local _input=""
+
+    if [ -t 0 ]; then
+        if [ -n "$var_name" ]; then
+            read -r _input || _input=""
+            printf -v "$var_name" '%s' "$_input"
+        else
+            read -r || true
+        fi
+        return 0
+    fi
+
+    if { exec 3</dev/tty; } 2>/dev/null; then
+        if [ -n "$var_name" ]; then
+            read -r _input <&3 || _input=""
+            printf -v "$var_name" '%s' "$_input"
+        else
+            read -r <&3 || true
+        fi
+        exec 3<&-
+        return 0
+    fi
+
+    if [ -n "$var_name" ]; then
+        read -r _input || _input=""
+        printf -v "$var_name" '%s' "$_input"
+    else
+        read -r || true
+    fi
+    return 0
+}
+
+# Function to read multi-line user input (end with Ctrl+D).
+# Never propagates read errors (set -e safe).
+read_multiline_input() {
+    if [ -t 0 ]; then
+        cat || true
+        return 0
+    fi
+
+    if { exec 3</dev/tty; } 2>/dev/null; then
+        cat <&3 || true
+        exec 3<&-
+        return 0
+    fi
+
+    cat || true
+    return 0
+}
+
+# Function to read a single keystroke (no Enter needed).
+# Writes the key to the variable name passed in.
+read_key() {
+    local var_name="${1:?}"
+    local key=""
+
+    if [ -t 0 ]; then
+        IFS= read -rsn1 key || true
+    elif { exec 3</dev/tty; } 2>/dev/null; then
+        IFS= read -rsn1 -u 3 key || true
+        exec 3<&-
+    else
+        IFS= read -rsn1 key || true
+    fi
+
+    printf -v "$var_name" '%s' "$key"
+    return 0
+}
+
+# ============================================================================
+# Project management
+# ============================================================================
+
+project_dir() {
+    local name="$1"
+    echo "$PROJECTS_DIR/$name"
+}
+
+project_load() {
+    local name="$1"
+    local dir
+    dir=$(project_dir "$name")
+    local cfg="$dir/project.env"
+
+    if [ ! -d "$dir" ] || [ ! -f "$cfg" ]; then
+        return 1
+    fi
+
+    # shellcheck disable=SC1090
+    source "$cfg"
+
+    CURRENT_PROJECT="$name"
+    CURRENT_PROJECT_DIR="$dir"
+    CURRENT_PROJECT_WORKDIR="${WORKDIR:-}"
+    CURRENT_PROJECT_DEVPLAN="${DEVPLAN_PATH:-$dir/devplan.md}"
+    return 0
+}
+
+project_set_current() {
+    local name="$1"
+    if ! project_load "$name"; then
+        echo -e "${RED}Project not found or invalid: $name${NC}"
+        return 1
+    fi
+    mkdir -p "$PROJECTS_DIR"
+    printf '%s\n' "$name" > "$CURRENT_PROJECT_FILE"
+    echo -e "${GREEN}Current project: $CURRENT_PROJECT${NC}"
+    return 0
+}
+
+projects_init() {
+    mkdir -p "$PROJECTS_DIR"
+    if [ -f "$CURRENT_PROJECT_FILE" ]; then
+        local name
+        name=$(cat "$CURRENT_PROJECT_FILE" 2>/dev/null || true)
+        if [ -n "$name" ]; then
+            project_load "$name" || true
+        fi
+    fi
+}
+
+projects_list() {
+    if [ ! -d "$PROJECTS_DIR" ]; then
+        return 0
+    fi
+    find "$PROJECTS_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort || true
+}
+
+project_print_current() {
+    if [ -n "$CURRENT_PROJECT" ]; then
+        echo -e "${CYAN}Project:${NC} $CURRENT_PROJECT"
+        echo -e "${CYAN}Workdir:${NC} ${CURRENT_PROJECT_WORKDIR:-"(unset)"}"
+        echo -e "${CYAN}DevPlan:${NC} ${CURRENT_PROJECT_DEVPLAN:-"(unset)"}"
+    else
+        echo -e "${CYAN}Project:${NC} (none)"
+    fi
+}
+
+project_select_interactive() {
+    local projects
+    projects=$(projects_list)
+
+    if [ -z "$projects" ]; then
+        echo -e "${YELLOW}No projects yet. Use New Project.${NC}"
+        return 1
+    fi
+
+    ui_banner "PROJECTS"
+
+    local count=0
+    local project_array=()
+    while IFS= read -r name; do
+        [ -z "$name" ] && continue
+        count=$((count + 1))
+        project_array+=("$name")
+        if [ "$name" = "$CURRENT_PROJECT" ]; then
+            echo -e "  ${CYAN}[$count]${NC} $name ${GREEN}(current)${NC}"
+        else
+            echo -e "  ${CYAN}[$count]${NC} $name"
+        fi
+    done <<< "$projects"
+
+    echo ""
+    echo -e "  ${CYAN}[0]${NC} Cancel"
+    echo ""
+    echo -n -e "  ${YELLOW}Select project (1-$count or 0): ${NC}"
+
+    local selection
+    read_user_input selection
+
+    if [ -z "$selection" ] || [ "$selection" = "0" ]; then
+        return 1
+    fi
+
+    if ! [[ "$selection" =~ ^[0-9]+$ ]] || [ "$selection" -lt 1 ] || [ "$selection" -gt "$count" ]; then
+        echo -e "${RED}Invalid selection${NC}"
+        return 1
+    fi
+
+    project_set_current "${project_array[$((selection - 1))]}"
+}
+
+project_write_devplan_template() {
+    local path="$1"
+    local title="$2"
+    cat > "$path" <<EOF
+# DevPlan: $title
+
+## Goal
+-
+
+## Constraints
+-
+
+## Tasks
+- [ ] Define requirements and acceptance criteria
+- [ ] Identify existing code/architecture touchpoints
+- [ ] Implement core functionality
+- [ ] Add tests
+- [ ] Run lint/build and fix issues
+- [ ] Write handoff.md update
+EOF
+}
+
+project_generate_devplan_with_opencode() {
+    local path="$1"
+    local title="$2"
+    local goal="$3"
+
+    if ! command -v opencode >/dev/null 2>&1; then
+        echo -e "${RED}opencode not found; writing template instead${NC}"
+        project_write_devplan_template "$path" "$title"
+        return 1
+    fi
+
+    local opencode_cmd="opencode run"
+    local use_model="${MODEL:-glm-4.7}"
+    if [ -n "${PROVIDER:-}" ]; then
+        use_model="${PROVIDER}/${MODEL:-glm-4.7}"
+    else
+        use_model="zai-coding-plan/${MODEL:-glm-4.7}"
+    fi
+    opencode_cmd="$opencode_cmd --model $use_model"
+
+    local prompt
+    prompt=$(cat <<EOF
+You are a DevPlan generator. Write markdown output ONLY - no tools, no code blocks, no explanations.
+
+Project name: $title
+
+Project goal/requirements:
+$goal
+
+REQUIREMENTS:
+1. Output ONLY pure markdown - start with "# DevPlan:" header
+2. Use these sections in order: Goal, Constraints, Tasks
+3. Under Tasks, use format: "- [ ] task description"
+4. Each task on a NEW LINE with "- [ ] " prefix
+5. Create 10-15 tasks suitable for parallel swarm agents
+6. Organize: setup -> core -> advanced -> testing -> docs
+7. Each task completable in 10-30 minutes
+8. Be specific: "Create user authentication endpoint" not "Work on auth"
+9. Group related tasks with blank lines
+
+OUTPUT THIS EXACT FORMAT:
+
+# DevPlan: $title
+
+## Goal
+[One-sentence goal]
+
+## Constraints
+[Key constraints]
+
+## Tasks
+- [ ] Setup task 1
+- [ ] Setup task 2
+
+- [ ] Core feature task 1
+- [ ] Core feature task 2
+
+- [ ] Testing task 1
+- [ ] Testing task 2
+
+DO NOT use tools, code blocks, or markdown fences. Just plain markdown text.
+EOF
+)
+
+    echo -e "${CYAN}Generating DevPlan with opencode...${NC}"
+
+    local json_output=""
+    if ! json_output=$($opencode_cmd --format json "$prompt" 2>&1); then
+        echo -e "${RED}DevPlan generation failed; writing template instead${NC}"
+        project_write_devplan_template "$path" "$title"
+        return 1
+    fi
+
+    local text_output=""
+    text_output=$(json_extract_text "$json_output") || text_output=""
+    if [ -z "$text_output" ]; then
+        echo -e "${RED}DevPlan generation returned empty output; writing template instead${NC}"
+        project_write_devplan_template "$path" "$title"
+        return 1
+    fi
+
+    printf '%s\n' "$text_output" > "$path"
+    return 0
+}
+
+project_start_swarm_devplan() {
+    if [ -z "$CURRENT_PROJECT" ] || [ -z "$CURRENT_PROJECT_DEVPLAN" ]; then
+        echo -e "${RED}No current project/devplan selected${NC}"
+        return 1
+    fi
+    if [ ! -f "$CURRENT_PROJECT_DEVPLAN" ]; then
+        echo -e "${RED}DevPlan not found: $CURRENT_PROJECT_DEVPLAN${NC}"
+        return 1
+    fi
+
+    if [ -n "$CURRENT_PROJECT_WORKDIR" ] && [ -d "$CURRENT_PROJECT_WORKDIR" ]; then
+        echo -e "${CYAN}Workdir:${NC} $CURRENT_PROJECT_WORKDIR"
+        (cd "$CURRENT_PROJECT_WORKDIR" && "$SCRIPT_DIR/ralph-swarm" --devplan "$CURRENT_PROJECT_DEVPLAN" \
+            ${SWARM_PROVIDER:+--provider "$SWARM_PROVIDER"} \
+            ${SWARM_MODEL:+--model "$SWARM_MODEL"} \
+            ${MODEL:+--model "$MODEL"} \
+            ${PROVIDER:+--provider "$PROVIDER"})
+    else
+        "$SCRIPT_DIR/ralph-swarm" --devplan "$CURRENT_PROJECT_DEVPLAN" \
+            ${SWARM_PROVIDER:+--provider "$SWARM_PROVIDER"} \
+            ${SWARM_MODEL:+--model "$SWARM_MODEL"} \
+            ${MODEL:+--model "$MODEL"} \
+            ${PROVIDER:+--provider "$PROVIDER"}
+    fi
+}
+
+new_project_wizard() {
+    projects_init
+
+    ui_banner "NEW PROJECT"
+
+    local name
+    echo -n -e "${YELLOW}Project name (folder name): ${NC}"
+    read_user_input name
+    if [ -z "$name" ]; then
+        echo -e "${YELLOW}Cancelled${NC}"
+        return 1
+    fi
+    if ! [[ "$name" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+        echo -e "${RED}Invalid name (use letters/numbers/._-)${NC}"
+        return 1
+    fi
+
+    local dir
+    dir=$(project_dir "$name")
+    if [ -e "$dir" ]; then
+        echo -e "${RED}Project already exists: $dir${NC}"
+        return 1
+    fi
+
+    local dir
+    dir=$(project_dir "$name")
+    if [ -e "$dir" ]; then
+        echo -e "${RED}Project already exists: $dir${NC}"
+        return 1
+    fi
+
+    mkdir -p "$dir"
+
+    local workdir
+    workdir=$(pwd)
+
+    local devplan_path="$dir/devplan.md"
+
+    echo ""
+    echo -n -e "${YELLOW}Generate DevPlan with opencode? (Y/n): ${NC}"
+    local gen
+    read_user_input gen
+    if [[ "${gen:-}" =~ ^[Nn]$ ]]; then
+        project_write_devplan_template "$devplan_path" "$name"
+    else
+        echo ""
+        echo -e "${CYAN}Describe the project goal/requirements (Ctrl+D when done):${NC}"
+        local goal
+        goal=$(read_multiline_input)
+        if [ -z "$goal" ]; then
+            goal="$name"
+        fi
+        project_generate_devplan_with_opencode "$devplan_path" "$name" "$goal" || true
+    fi
+
+    cat > "$dir/project.env" <<EOF
+NAME="$name"
+WORKDIR="$workdir"
+DEVPLAN_PATH="$devplan_path"
+EOF
+
+    project_set_current "$name" || true
+
+    echo ""
+    echo -e "${GREEN}Created project:${NC} $name"
+
+    while true; do
+        echo ""
+        echo -e "${CYAN}═════════════════════════════════════════════════════════${NC}"
+        echo -e "${CYAN}DevPlan Preview: $devplan_path${NC}"
+        echo -e "${CYAN}═════════════════════════════════════════════════════════${NC}"
+        cat "$devplan_path"
+        echo -e "${CYAN}═════════════════════════════════════════════════════════${NC}"
+        echo ""
+
+        echo -e "${CYAN}Options:${NC}"
+        echo -e "  ${GREEN}e${NC}  Edit devplan"
+        echo -e "  ${GREEN}r${NC}  Regenerate with opencode"
+        echo -e "  ${GREEN}c${NC}  Continue to swarm"
+        echo -e "  ${GREEN}q${NC}  Cancel"
+
+        echo ""
+        echo -n -e "${YELLOW}Choose option (e/r/c/q): ${NC}"
+        local choice
+        read_user_input choice
+
+        case "$choice" in
+            e|E)
+                local editor_cmd="${EDITOR-}"
+                if [ -n "$editor_cmd" ]; then
+                    "$editor_cmd" "$devplan_path" || true
+                else
+                    echo -e "${RED}No EDITOR set${NC}"
+                fi
+                ;;
+            r|R)
+                echo ""
+                echo -e "${CYAN}Describe the project goal/requirements (Ctrl+D when done, or Enter to keep existing):${NC}"
+                local new_goal
+                new_goal=$(read_multiline_input)
+                if [ -n "$new_goal" ]; then
+                    project_generate_devplan_with_opencode "$devplan_path" "$name" "$new_goal" || true
+                fi
+                ;;
+            c|C)
+                echo ""
+                echo -e "${GREEN}DevPlan finalized${NC}"
+                break
+                ;;
+            q|Q)
+                echo -e "${YELLOW}Cancelled${NC}"
+                return 1
+                ;;
+            *)
+                echo -e "${RED}Invalid option${NC}"
+                ;;
+        esac
+    done
+
+    echo ""
+    echo -e "${CYAN}Would you like to select a model/provider for the swarm? (Y/n): ${NC}"
+    local select_model
+    read_user_input select_model
+    if [[ ! "${select_model:-}" =~ ^[Nn]$ ]]; then
+        echo ""
+        select_swarm_model || true
+    fi
+
+    echo ""
+    echo -n -e "${YELLOW}Start swarm on this DevPlan now? (y/N): ${NC}"
+    local yn
+    read_user_input yn
+    if [[ "$yn" =~ ^[Yy]$ ]]; then
+        project_start_swarm_devplan
+    else
+        echo -e "${YELLOW}Swarm not started. You can run it later from Project Menu.${NC}"
+    fi
+}
+
+projects_list_with_progress() {
+    projects_init
+
+    ui_banner "PROJECTS WITH SWARM PROGRESS"
+
+    local projects
+    projects=$(projects_list)
+
+    if [ -z "$projects" ]; then
+        echo "  No projects found"
+        echo ""
+        return 0
+    fi
+
+    local count=0
+    local project_array=()
+
+    echo -e "  ${CYAN}#  Project${NC}                            ${CYAN}DevPlan${NC}     ${CYAN}Swarm${NC}       ${CYAN}Status${NC}"
+    echo -e "  ${CYAN}─────────────────────────────────────────────────────────────────────────────${NC}"
+
+    while IFS= read -r name; do
+        [ -z "$name" ] && continue
+        count=$((count + 1))
+        project_array+=("$name")
+
+        local dir
+        dir=$(project_dir "$name")
+        local cfg="$dir/project.env"
+
+        local devplan_path=""
+        local devplan_total=0
+        local devplan_complete=0
+        local devplan_pct=0
+
+        if [ -f "$cfg" ]; then
+            source "$cfg" 2>/dev/null || true
+            devplan_path="${DEVPLAN_PATH:-$dir/devplan.md}"
+
+            if [ -f "$devplan_path" ]; then
+                local counts
+                counts=$(count_devplan_tasks "$devplan_path")
+                local pending in_progress complete needs_review
+                pending=$(echo "$counts" | cut -d' ' -f1)
+                in_progress=$(echo "$counts" | cut -d' ' -f2)
+                complete=$(echo "$counts" | cut -d' ' -f3)
+                needs_review=$(echo "$counts" | cut -d' ' -f4)
+                devplan_total=$((pending + in_progress + complete + needs_review))
+                devplan_complete=$((complete + needs_review))
+                if [ "$devplan_total" -gt 0 ]; then
+                    devplan_pct=$((devplan_complete * 100 / devplan_total))
+                fi
+            fi
+        fi
+
+        local swarm_total=0
+        local swarm_complete=0
+        local swarm_status="—"
+        local swarm_run_id=""
+
+        if [ -f "$devplan_path" ]; then
+            local source_hash
+            source_hash=$(swarm_db_get_source_hash "$devplan_path")
+
+            if [ -n "$source_hash" ]; then
+                local run_info
+                run_info=$(swarm_db_get_run_by_source "$source_hash" 2>/dev/null || true)
+
+                if [ -n "$run_info" ] && [ "$run_info" != "" ]; then
+                    swarm_run_id=$(echo "$run_info" | cut -d'|' -f1)
+                    swarm_status=$(echo "$run_info" | cut -d'|' -f2)
+                    swarm_complete=$(echo "$run_info" | cut -d'|' -f3)
+                    swarm_total=$(echo "$run_info" | cut -d'|' -f4)
+
+                    if [ "$swarm_total" = "" ] || [ "$swarm_total" = "0" ]; then
+                        swarm_total=0
+                        swarm_complete=0
+                        swarm_status="—"
+                    fi
+                fi
+            fi
+        fi
+
+        local name_display="$name"
+        if [ "$name" = "$CURRENT_PROJECT" ]; then
+            name_display="${GREEN}$name${NC} *"
+        fi
+
+        local devplan_display="${devplan_complete}/${devplan_total}"
+        if [ "$devplan_total" -gt 0 ]; then
+            devplan_display="${devplan_complete}/${devplan_total} (${devplan_pct}%)"
+        fi
+
+        local swarm_display="—"
+        if [ "$swarm_total" -gt 0 ]; then
+            local swarm_pct=0
+            if [ "$swarm_total" -gt 0 ]; then
+                swarm_pct=$((swarm_complete * 100 / swarm_total))
+            fi
+            swarm_display="${swarm_complete}/${swarm_total} (${swarm_pct}%)"
+        fi
+
+        local status_display="—"
+        case "$swarm_status" in
+            running) status_display="${GREEN}running${NC}" ;;
+            completed) status_display="${GREEN}done${NC}" ;;
+            interrupted) status_display="${YELLOW}paused${NC}" ;;
+            "") status_display="—" ;;
+            *) status_display="$swarm_status" ;;
+        esac
+
+        printf "  ${CYAN}%2d${NC}  %-35s  %-18s  %-18s  %s\n" \
+            "$count" "$name_display" "$devplan_display" "$swarm_display" "$status_display"
+    done <<< "$projects"
+
+    echo ""
+    echo -e "  ${GREEN}*${NC} = current project"
+    echo -e "  ${CYAN}DevPlan${NC}  = tasks marked complete in devplan file"
+    echo -e "  ${CYAN}Swarm${NC}   = tasks completed in swarm database"
+    echo ""
+}
+
+project_swarm_select_resume() {
+    projects_init
+
+    ui_banner "RESUME SWARM FOR PROJECT"
+
+    local projects
+    projects=$(projects_list)
+
+    if [ -z "$projects" ]; then
+        echo "  No projects found"
+        echo ""
+        return 1
+    fi
+
+    local count=0
+    local project_array=()
+    local has_swarm_projects=0
+
+    echo -e "  ${CYAN}#  Project${NC}                            ${CYAN}Progress${NC}      ${CYAN}Run ID${NC}       ${CYAN}Status${NC}"
+    echo -e "  ${CYAN}─────────────────────────────────────────────────────────────────────────────${NC}"
+
+    while IFS= read -r name; do
+        [ -z "$name" ] && continue
+        count=$((count + 1))
+        project_array+=("$name")
+
+        local dir
+        dir=$(project_dir "$name")
+        local cfg="$dir/project.env"
+
+        local devplan_path=""
+        local swarm_total=0
+        local swarm_complete=0
+        local swarm_status="—"
+        local swarm_run_id=""
+
+        if [ -f "$cfg" ]; then
+            source "$cfg" 2>/dev/null || true
+            devplan_path="${DEVPLAN_PATH:-$dir/devplan.md}"
+
+            if [ -f "$devplan_path" ]; then
+                local source_hash
+                source_hash=$(swarm_db_get_source_hash "$devplan_path")
+
+                if [ -n "$source_hash" ]; then
+                    local run_info
+                    run_info=$(swarm_db_get_run_by_source "$source_hash" 2>/dev/null || true)
+
+                    if [ -n "$run_info" ] && [ "$run_info" != "" ]; then
+                        swarm_run_id=$(echo "$run_info" | cut -d'|' -f1)
+                        swarm_status=$(echo "$run_info" | cut -d'|' -f2)
+                        swarm_complete=$(echo "$run_info" | cut -d'|' -f3)
+                        swarm_total=$(echo "$run_info" | cut -d'|' -f4)
+
+                        if [ "$swarm_total" != "" ] && [ "$swarm_total" != "0" ]; then
+                            has_swarm_projects=1
+
+                            local swarm_pct=0
+                            if [ "$swarm_total" -gt 0 ]; then
+                                swarm_pct=$((swarm_complete * 100 / swarm_total))
+                            fi
+
+                            local progress_display="${swarm_complete}/${swarm_total} (${swarm_pct}%)"
+                            local run_id_display="${swarm_run_id:0:16}"
+
+                            local status_display="—"
+                            case "$swarm_status" in
+                                running) status_display="${GREEN}running${NC}" ;;
+                                completed) status_display="${GREEN}done${NC}" ;;
+                                interrupted) status_display="${YELLOW}paused${NC}" ;;
+                                *) status_display="$swarm_status" ;;
+                            esac
+
+                            local name_display="$name"
+                            if [ "$name" = "$CURRENT_PROJECT" ]; then
+                                name_display="${GREEN}$name${NC} *"
+                            fi
+
+                            printf "  ${CYAN}%2d${NC}  %-35s  %-14s  %-14s  %s\n" \
+                                "$count" "$name_display" "$progress_display" "$run_id_display" "$status_display"
+                        else
+                            project_array[$((count-1))]=""
+                        fi
+                    else
+                        project_array[$((count-1))]=""
+                    fi
+                else
+                    project_array[$((count-1))]=""
+                fi
+            else
+                project_array[$((count-1))]=""
+            fi
+        else
+            project_array[$((count-1))]=""
+        fi
+    done <<< "$projects"
+
+    if [ "$has_swarm_projects" = 0 ]; then
+        echo ""
+        echo "  No projects with swarm runs found"
+        echo ""
+        return 1
+    fi
+
+    echo ""
+    echo -e "  ${CYAN}[0]${NC} Cancel"
+    echo ""
+    echo -n -e "  ${YELLOW}Select project to resume (1-$count or 0): ${NC}"
+
+    local selection
+    read_user_input selection
+
+    if [ -z "$selection" ] || [ "$selection" = "0" ]; then
+        return 1
+    fi
+
+    if ! [[ "$selection" =~ ^[0-9]+$ ]] || [ "$selection" -lt 1 ] || [ "$selection" -gt "$count" ]; then
+        echo -e "${RED}Invalid selection${NC}"
+        return 1
+    fi
+
+    local selected_name="${project_array[$((selection - 1))]}"
+    if [ -z "$selected_name" ]; then
+        echo -e "${RED}Project has no swarm run${NC}"
+        return 1
+    fi
+
+    project_load "$selected_name" || true
+    project_set_current "$selected_name" || true
+
+    echo ""
+    echo -e "${GREEN}Project: $CURRENT_PROJECT${NC}"
+    echo -e "${CYAN}DevPlan: ${CURRENT_PROJECT_DEVPLAN}${NC}"
+
+    local source_hash
+    source_hash=$(swarm_db_get_source_hash "$CURRENT_PROJECT_DEVPLAN")
+    local run_id
+    run_id=$(swarm_db_get_latest_run_for_source "$source_hash")
+
+    if [ -z "$run_id" ]; then
+        echo -e "${RED}No swarm run found${NC}"
+        return 1
+    fi
+
+    echo -e "${CYAN}Run ID: ${run_id}${NC}"
+    echo ""
+
+    local run_status
+    run_status=$(swarm_db_get_run_status "$run_id" 2>/dev/null | head -1 || true)
+
+    if echo "$run_status" | grep -q "completed"; then
+        echo -e "${YELLOW}Swarm run is already complete${NC}"
+        echo ""
+        echo -e "  Would you like to start a new swarm run? (y/N)"
+        echo -n -e "  ${YELLOW}> ${NC}"
+        local yn
+        read_user_input yn
+        if [[ "$yn" =~ ^[Yy]$ ]]; then
+            project_start_swarm_devplan
+        fi
+        return 0
+    fi
+
+    echo -e "${GREEN}Resuming swarm...${NC}"
+    echo ""
+
+    local workers
+    workers="2"
+
+    if [ -n "$CURRENT_PROJECT_WORKDIR" ] && [ -d "$CURRENT_PROJECT_WORKDIR" ]; then
+        echo -e "${CYAN}Workdir:${NC} $CURRENT_PROJECT_WORKDIR"
+        (cd "$CURRENT_PROJECT_WORKDIR" && "$SCRIPT_DIR/ralph-swarm" --resume "$run_id" \
+            ${SWARM_PROVIDER:+--provider "$SWARM_PROVIDER"} \
+            ${SWARM_MODEL:+--model "$SWARM_MODEL"} \
+            ${MODEL:+--model "$MODEL"} \
+            ${PROVIDER:+--provider "$PROVIDER"})
+    else
+        "$SCRIPT_DIR/ralph-swarm" --resume "$run_id" \
+            ${SWARM_PROVIDER:+--provider "$SWARM_PROVIDER"} \
+            ${SWARM_MODEL:+--model "$SWARM_MODEL"} \
+            ${MODEL:+--model "$MODEL"} \
+            ${PROVIDER:+--provider "$PROVIDER"}
+    fi
+
+    return 0
+}
+
+project_menu() {
+    projects_init
+
+    while true; do
+        clear
+        echo ""
+        ui_logo | while IFS= read -r line; do echo -e "${MAGENTA}$line${NC}"; done
+        echo ""
+        ui_banner "PROJECT MENU"
+        project_print_current
+        echo ""
+        echo -e "  ${CYAN}1${NC}) Switch project"
+        echo -e "  ${CYAN}2${NC}) New project (create DevPlan)"
+        echo -e "  ${CYAN}3${NC}) Start swarm on current DevPlan"
+        echo -e "  ${CYAN}4${NC}) View all projects with swarm progress"
+        echo -e "  ${CYAN}5${NC}) Resume swarm for a project"
+        echo ""
+        echo -e "  ${CYAN}b${NC}) Back"
+        echo ""
+        echo -n -e "  ${YELLOW}Select an option: ${NC}"
+
+        local sel
+        read_key sel
+        echo ""
+
+        case "$sel" in
+            1)
+                project_select_interactive || true
+                echo ""
+                echo -e "${CYAN}Press Enter to continue...${NC}"
+                read_user_input
+                ;;
+            2)
+                new_project_wizard || true
+                echo ""
+                echo -e "${CYAN}Press Enter to continue...${NC}"
+                read_user_input
+                ;;
+            3)
+                project_start_swarm_devplan || true
+                echo ""
+                echo -e "${CYAN}Press Enter to continue...${NC}"
+                read_user_input
+                ;;
+            4)
+                projects_list_with_progress
+                echo ""
+                echo -e "${CYAN}Press Enter to continue...${NC}"
+                read_user_input
+                ;;
+            5)
+                project_swarm_select_resume || true
+                echo ""
+                echo -e "${CYAN}Press Enter to continue...${NC}"
+                read_user_input
+                ;;
+            b|B)
+                return 0
+                ;;
+            "")
+                ;;
+            *)
+                echo -e "${RED}Invalid option: $sel${NC}"
+                echo ""
+                echo -e "${CYAN}Press Enter to continue...${NC}"
+                read_user_input
+                ;;
+        esac
+    done
+}
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+UI_WIDTH=67
+
+ui_banner() {
+    local title="$1"
+    local fd="${2:-1}"
+    local width="$UI_WIDTH"
+    local border
+    border=$(printf '%*s' "$width" '' | tr ' ' '=')
+
+    printf "\n${MAGENTA}/%s\\${NC}\n" "$border" >&"$fd"
+    printf "${MAGENTA}| %-*s |${NC}\n" "$width" "$title" >&"$fd"
+    printf "${MAGENTA}\\%s/${NC}\n\n" "$border" >&"$fd"
+}
+
+ui_logo() {
+    cat <<'EOF'
+ ____        _       _     _       _
+|  _ \  __ _| | ___ | |__ | |     (_)_   _____
+| |_) |/ _` | |/ _ \| '_ \| |     | \ \ / / _ \
+|  _ <| (_| | | (_) | |_) | |___  | |\ V /  __/
+|_| \_\\__,_|_|\___/|_.__/|_____| |_| \_/ \___|
+EOF
+}
+
+# ============================================================================
+# Provider/Model Management
+# ============================================================================
+
+get_all_providers() {
+    opencode models 2>/dev/null | cut -d'/' -f1 | sort -u | grep -v '^$' || echo "opencode"
+}
+
+get_models_for_provider() {
+    local provider="$1"
+    opencode models 2>/dev/null | grep "^${provider}/" || echo ""
+}
+
+# Interactive selection results.
+# Avoid command substitution pitfalls under set -euo pipefail.
+SELECTED_PROVIDER=""
+SELECTED_MODEL=""
+
+select_provider_interactive() {
+    local providers
+    providers=$(get_all_providers)
+
+    ui_banner "SELECT PROVIDER" 2
+
+    local count=0
+    local provider_array=()
+
+    while IFS= read -r provider; do
+        [ -z "$provider" ] && continue
+        count=$((count + 1))
+        provider_array+=("$provider")
+        echo -e "  ${CYAN}[$count]${NC} $provider" >&2
+    done <<< "$providers"
+
+    echo "" >&2
+    echo -e "  ${CYAN}[0]${NC} Cancel / Use default" >&2
+
+    echo "" >&2
+    echo -n -e "  ${YELLOW}Select provider (1-$count or 0): ${NC}" >&2
+
+    local selection=""
+    read_user_input selection
+
+    if [ -z "$selection" ] || [ "$selection" = "0" ]; then
+        echo "" >&2
+        echo -e "  ${YELLOW}Using default provider${NC}" >&2
+        SELECTED_PROVIDER=""
+        return 1
+    fi
+
+    if ! [[ "$selection" =~ ^[0-9]+$ ]] || [ "$selection" -lt 1 ] || [ "$selection" -gt "$count" ]; then
+        echo "" >&2
+        echo -e "  ${RED}Invalid selection${NC}" >&2
+        SELECTED_PROVIDER=""
+        return 1
+    fi
+
+    local selected_provider="${provider_array[$((selection - 1))]}"
+    echo "" >&2
+    echo -e "  ${GREEN}Selected provider: $selected_provider${NC}" >&2
+    SELECTED_PROVIDER="$selected_provider"
+    return 0
+}
+
+select_model_interactive() {
+    local provider="$1"
+    local models
+    models=$(get_models_for_provider "$provider")
+
+    if [ -z "$models" ]; then
+        echo -e "${RED}No models found for provider: $provider${NC}" >&2
+        return 1
+    fi
+
+    ui_banner "SELECT MODEL" 2
+    echo -e "  ${CYAN}Provider:${NC} $provider" >&2
+    echo "" >&2
+
+    local count=0
+    local model_array=()
+
+    while IFS= read -r model; do
+        [ -z "$model" ] && continue
+        count=$((count + 1))
+        model_array+=("$model")
+        local display_model="${model##*/}"
+        echo -e "  ${CYAN}[$count]${NC} $display_model" >&2
+    done <<< "$models"
+
+    echo "" >&2
+    echo -e "  ${CYAN}[0]${NC} Cancel" >&2
+
+    echo "" >&2
+    echo -n -e "  ${YELLOW}Select model (1-$count or 0): ${NC}" >&2
+
+    local selection=""
+    read_user_input selection
+
+    if [ -z "$selection" ] || [ "$selection" = "0" ]; then
+        echo "" >&2
+        echo -e "  ${YELLOW}Cancelled${NC}" >&2
+        SELECTED_MODEL=""
+        return 1
+    fi
+
+    if ! [[ "$selection" =~ ^[0-9]+$ ]] || [ "$selection" -lt 1 ] || [ "$selection" -gt "$count" ]; then
+        echo "" >&2
+        echo -e "  ${RED}Invalid selection${NC}" >&2
+        SELECTED_MODEL=""
+        return 1
+    fi
+
+    local selected_model="${model_array[$((selection - 1))]}"
+    echo "" >&2
+    echo -e "  ${GREEN}Selected model: ${selected_model##*/}${NC}" >&2
+    SELECTED_MODEL="$selected_model"
+    return 0
+}
+
+select_model_step_by_step() {
+    ui_banner "MODEL SELECTION WIZARD"
+
+    local provider=""
+    SELECTED_PROVIDER=""
+    if ! select_provider_interactive; then
+        echo ""
+        echo -e "${YELLOW}Model selection cancelled${NC}"
+        return 2
+    fi
+
+    provider="$SELECTED_PROVIDER"
+
+    if [ -z "$provider" ]; then
+        echo ""
+        echo -e "${YELLOW}Model selection cancelled${NC}"
+        return 2
+    fi
+
+    local model=""
+    SELECTED_MODEL=""
+    if ! select_model_interactive "$provider"; then
+        echo ""
+        echo -e "${YELLOW}Model selection cancelled${NC}"
+        return 2
+    fi
+
+    model="$SELECTED_MODEL"
+
+    if [ -z "$model" ]; then
+        echo ""
+        echo -e "${YELLOW}Model selection cancelled${NC}"
+        return 2
+    fi
+
+    echo ""
+    echo -e "${GREEN}Provider: $provider${NC}"
+    echo -e "${GREEN}Model: ${model##*/}${NC}"
+
+    PROVIDER="$provider"
+    MODEL="$model"
+
+    return 0
+}
+
+show_current_model() {
+    ui_banner "CURRENT MODEL"
+
+    if [ -n "$PROVIDER" ]; then
+        echo -e "  ${CYAN}Provider:${NC} $PROVIDER"
+    else
+        echo -e "  ${CYAN}Provider:${NC} (default)"
+    fi
+
+    if [ -n "$MODEL" ]; then
+        echo -e "  ${CYAN}Model:${NC} ${MODEL##*/}"
+    else
+        echo -e "  ${CYAN}Model:${NC} (default)"
+    fi
+
+    if [ -n "$PROVIDER" ] && [ -n "$MODEL" ]; then
+        echo ""
+        local model_count
+        model_count=$(get_models_for_provider "$PROVIDER" | wc -l)
+        echo -e "  ${CYAN}Available models for $PROVIDER:${NC} $model_count"
+    fi
+
+    echo ""
+}
+
+list_providers() {
+    ui_banner "AVAILABLE PROVIDERS"
+
+    local providers
+    providers=$(get_all_providers)
+
+    while IFS= read -r provider; do
+        [ -z "$provider" ] && continue
+        local model_count
+        model_count=$(get_models_for_provider "$provider" | wc -l)
+        echo -e "  ${CYAN}$provider${NC} - ${model_count} models"
+    done <<< "$providers"
+
+    echo ""
+}
+
+list_models_for_provider() {
+    local provider="$1"
+
+    if [ -z "$provider" ]; then
+        echo -e "${RED}Provider not specified${NC}"
+        return 1
+    fi
+
+    ui_banner "MODELS: $provider"
+
+    local models
+    models=$(get_models_for_provider "$provider")
+
+    if [ -z "$models" ]; then
+        echo -e "  ${YELLOW}No models found${NC}"
+        echo ""
+        return 1
+    fi
+
+    while IFS= read -r model; do
+        [ -z "$model" ] && continue
+        local display_model="${model##*/}"
+        echo -e "  ${CYAN}$display_model${NC}"
+    done <<< "$models"
+
+    echo ""
+}
+
+# ============================================================================
+# Swarm-specific provider/model
+# ============================================================================
+
+SWARM_PROVIDER="${SWARM_PROVIDER:-}"
+SWARM_MODEL="${SWARM_MODEL:-}"
+
+set_swarm_model() {
+    local provider="$1"
+    local model="$2"
+    SWARM_PROVIDER="$provider"
+    SWARM_MODEL="$model"
+}
+
+get_swarm_model_string() {
+    if [ -n "$SWARM_MODEL" ]; then
+        if [ -n "$SWARM_PROVIDER" ]; then
+            echo "${SWARM_PROVIDER}/${SWARM_MODEL}"
+        else
+            echo "$SWARM_MODEL"
+        fi
+    fi
+}
+
+show_swarm_model() {
+    ui_banner "SWARM MODEL SETTINGS"
+
+    if [ -n "$SWARM_PROVIDER" ]; then
+        echo -e "  ${CYAN}Swarm Provider:${NC} $SWARM_PROVIDER"
+    else
+        echo -e "  ${CYAN}Swarm Provider:${NC} (uses agent provider)"
+    fi
+
+    if [ -n "$SWARM_MODEL" ]; then
+        echo -e "  ${CYAN}Swarm Model:${NC} $SWARM_MODEL"
+    else
+        echo -e "  ${CYAN}Swarm Model:${NC} (uses agent model)"
+    fi
+
+    echo ""
+}
+
+select_swarm_model() {
+    ui_banner "SWARM MODEL SELECTION"
+
+    local provider=""
+    SELECTED_PROVIDER=""
+    if ! select_provider_interactive; then
+        echo ""
+        echo -e "${YELLOW}Swarm model selection cancelled${NC}"
+        return 2
+    fi
+
+    provider="$SELECTED_PROVIDER"
+
+    if [ -z "$provider" ]; then
+        echo ""
+        echo -e "${YELLOW}Swarm model selection cancelled${NC}"
+        return 2
+    fi
+
+    local model=""
+    SELECTED_MODEL=""
+    if ! select_model_interactive "$provider"; then
+        echo ""
+        echo -e "${YELLOW}Swarm model selection cancelled${NC}"
+        return 2
+    fi
+
+    model="$SELECTED_MODEL"
+
+    if [ -z "$model" ]; then
+        echo ""
+        echo -e "${YELLOW}Swarm model selection cancelled${NC}"
+        return 2
+    fi
+
+    set_swarm_model "${provider}" "${model##*/}"
+
+    echo ""
+    echo -e "${GREEN}Swarm model set:${NC}"
+    show_swarm_model
+
+    return 0
+}
+
+# ============================================================================
+# Live mode state management
+# ============================================================================
+
+init_live_mode() {
+    mkdir -p "$RALPH_DIR/live"
+    LIVE_PID_FILE="$RALPH_DIR/live/agent.pid"
+    LIVE_OUTPUT_FIFO="$RALPH_DIR/live/output.fifo"
+    LIVE_STATE_FILE="$RALPH_DIR/live/state.json"
+
+    rm -f "$LIVE_PID_FILE" "$LIVE_OUTPUT_FIFO" 2>/dev/null || true
+    mkfifo "$LIVE_OUTPUT_FIFO" 2>/dev/null || true
+
+    cat > "$LIVE_STATE_FILE" << EOF
+{
+  "status": "idle",
+  "mode": "",
+  "prompt": "",
+  "iteration": 0,
+  "start_time": null,
+  "last_update": null,
+  "message": ""
+}
+EOF
+}
+
+update_live_state() {
+    local status="$1"
+    local mode="$2"
+    local prompt="$3"
+    local message="$4"
+
+    if [ -z "${LIVE_STATE_FILE:-}" ]; then
+        LIVE_STATE_FILE="$RALPH_DIR/live/state.json"
+    fi
+
+    mkdir -p "$(dirname "$LIVE_STATE_FILE")" 2>/dev/null || true
+
+    local iteration
+    iteration=$(jq -r '.iteration' "$LIVE_STATE_FILE" 2>/dev/null || echo "0")
+
+    if [ "$status" = "running" ] && [ "$iteration" -eq 0 ]; then
+        local start_time
+        start_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    else
+        start_time=$(jq -r '.start_time' "$LIVE_STATE_FILE" 2>/dev/null || echo "null")
+    fi
+
+    cat > "$LIVE_STATE_FILE" << EOF
+{
+  "status": "$status",
+  "mode": "$mode",
+  "prompt": "$(echo "$prompt" | sed 's/"/\\"/g' | tr '\n' ' ')",
+  "iteration": $iteration,
+  "start_time": "$start_time",
+  "last_update": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+  "message": "$(echo "$message" | sed 's/"/\\"/g' | tr '\n' ' ')"
+}
+EOF
+}
+
+# ============================================================================
+# Agent runner (background process)
+# ============================================================================
+
+run_agent_background() {
+    local mode="$1"
+    local prompt="$2"
+
+    if [ -z "${LIVE_OUTPUT_FIFO:-}" ]; then
+        LIVE_OUTPUT_FIFO="$RALPH_DIR/live/output.fifo"
+    fi
+
+    exec > >(while IFS= read -r line; do echo "$line"; done > "$LIVE_OUTPUT_FIFO") 2>&1
+
+    if [ "$mode" = "swarm" ]; then
+        run_swarm_live "$prompt"
+    elif [ "$mode" = "devplan" ]; then
+        run_devplan_live "$prompt"
+    else
+        run_loop_live "$prompt"
+    fi
+}
+
+run_loop_live() {
+    local prompt="$1"
+    local iteration=0
+    local success=false
+
+    echo -e "${BLUE}[RALPH-LIVE]${NC} Starting agent loop..."
+    echo -e "${BLUE}[RALPH-LIVE]${NC} Prompt: $(echo "$prompt" | head -c 80)..."
+    echo ""
+
+    while [ $iteration -lt $MAX_ITERATIONS ]; do
+        iteration=$((iteration + 1))
+        update_live_state "running" "loop" "$prompt" "Iteration $iteration"
+
+        echo -e "${YELLOW}═══════════════════════════════════════════════════════════${NC}"
+        echo -e "${YELLOW}  Iteration $iteration / $MAX_ITERATIONS${NC}"
+        echo -e "${YELLOW}═══════════════════════════════════════════════════════════${NC}"
+        echo ""
+
+        if run_iteration_live "$prompt" $iteration; then
+            success=true
+            break
+        fi
+
+        echo ""
+        echo -e "${BLUE}[RALPH-LIVE]${NC} Iteration $iteration complete, continuing..."
+        echo ""
+    done
+
+    if [ "$success" = true ]; then
+        echo ""
+        echo -e "${GREEN}[RALPH-LIVE]${NC} Agent completed successfully!"
+        update_live_state "completed" "loop" "$prompt" "Completed in $iteration iteration(s)"
+    else
+        echo ""
+        echo -e "${YELLOW}[RALPH-LIVE]${NC} Reached max iterations"
+        update_live_state "completed" "loop" "$prompt" "Max iterations reached"
+    fi
+}
+
+run_devplan_live() {
+    local devfile="$1"
+
+    echo -e "${BLUE}[RALPH-LIVE]${NC} Starting DevPlan mode..."
+    echo -e "${BLUE}[RALPH-LIVE]${NC} DevPlan: $devfile"
+    echo ""
+
+    local task_count=0
+    local max_tasks="${MAX_ITERATIONS:-100}"
+    local completed_count=0
+    local stalled_count=0
+
+    while [ $task_count -lt $max_tasks ]; do
+        local task
+        task=$(get_next_pending_task "$devfile")
+
+        if [ -z "$task" ]; then
+            if ! has_pending_tasks "$devfile"; then
+                echo ""
+                echo -e "${GREEN}[RALPH-LIVE]${NC} All DevPlan tasks complete!"
+                update_live_state "completed" "devplan" "$devfile" "All tasks completed"
+                break
+            fi
+        fi
+
+        task_count=$((task_count + 1))
+        local current_counts
+        current_counts=$(count_devplan_tasks "$devfile")
+        local completed_now
+        completed_now=$(echo "$current_counts" | cut -d' ' -f3)
+        local total_init
+        total_init=$(echo "$current_counts" | awk '{print $1+$2+$3+$4}')
+        local progress_pct=0
+        if [ "$total_init" -gt 0 ]; then
+            progress_pct=$((completed_now * 100 / total_init))
+        fi
+
+        echo -e "${MAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo -e "${MAGENTA}  Progress: $completed_now/$total_init ($progress_pct%) | Task: $task_count${NC}"
+        echo -e "${MAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo ""
+
+        update_live_state "running" "devplan" "$devfile" "Task: $task"
+
+        mark_task_in_progress "$devfile" "$task"
+
+        local devplan_prompt="# Ralph Task Execution
+
+## Task
+$task
+
+## DevPlan Location
+$devfile
+
+## Instructions
+1. Complete the task listed above thoroughly
+2. Write high-quality, well-documented code
+3. After completing, update $devfile to mark task as done:
+   - Change \`- [ ] task\` to \`- [✅] task\`
+4. When done, output \`<promise>$COMPLETION_PROMISE</promise>\`
+
+## Quality Standards
+- Write clean, maintainable code
+- Add appropriate comments
+- Consider edge cases
+- Test your changes if applicable
+
+Begin work now."
+
+        if run_devplan_iteration_live "$devplan_prompt" $task_count "$devfile" "$task"; then
+            mark_task_complete "$devfile" "$task"
+            echo -e "${GREEN}[RALPH-LIVE]${NC} Task completed: $task"
+            completed_count=$((completed_count + 1))
+        else
+            stalled_count=$((stalled_count + 1))
+            echo -e "${YELLOW}[RALPH-LIVE]${NC} Task stalled: $task"
+        fi
+
+        echo ""
+    done
+
+    echo -e "${BLUE}[RALPH-LIVE]${NC} Session complete: $completed_count done, $stalled_count stalled"
+    update_live_state "completed" "devplan" "$devfile" "Done: $completed_count, Stalled: $stalled_count"
+}
+
+run_swarm_live() {
+    local task="$1"
+
+    echo -e "${BLUE}[RALPH-LIVE]${NC} Starting Swarm mode..."
+    echo -e "${BLUE}[RALPH-LIVE]${NC} Task: $(echo "$task" | head -c 50)..."
+    echo ""
+
+    local swarm_model_string
+    swarm_model_string=$(get_swarm_model_string)
+
+    if [ -n "$swarm_model_string" ]; then
+        echo -e "${CYAN}Swarm using model: $swarm_model_string${NC}"
+    fi
+
+    export RALPH_DIR
+    export SWARM_OUTPUT_MODE="live"
+
+    "$SCRIPT_DIR/ralph-swarm" "$task" \
+        ${SWARM_PROVIDER:+--provider "$SWARM_PROVIDER"} \
+        ${SWARM_MODEL:+--model "$SWARM_MODEL"} \
+        ${MODEL:+--model "$MODEL"} \
+        ${PROVIDER:+--provider "$PROVIDER"}
+
+    update_live_state "completed" "swarm" "$task" "Swarm completed"
+}
+
+run_iteration_live() {
+    local prompt="$1"
+    local iteration="$2"
+    local context
+    context=$(get_and_clear_context)
+
+    local full_prompt="$prompt
+IMPORTANT: Output <promise>$COMPLETION_PROMISE</powershell> when complete."
+
+    if [ -n "$context" ]; then
+        full_prompt="$prompt
+
+Additional context:
+$context"
+    fi
+
+    echo -e "${CYAN}Sending request...${NC}"
+    echo -e "${CYAN}   Provider: ${PROVIDER:-default} | Model: ${MODEL:-default}${NC}"
+    echo ""
+
+    local start_time
+    start_time=$(date +%s)
+
+    local opencode_cmd="opencode run"
+    if [ -n "$PROVIDER" ]; then
+        opencode_cmd="$opencode_cmd --provider $PROVIDER"
+    fi
+    if [ -n "$MODEL" ]; then
+        opencode_cmd="$opencode_cmd --model $MODEL"
+    fi
+
+    local json_output
+    json_output=$($opencode_cmd --format json "$full_prompt" 2>&1)
+    local exit_code=$?
+    local end_time
+    end_time=$(date +%s)
+    local duration=$((end_time - start_time))
+
+    echo -e "${GREEN}Response received (${duration}s)${NC}"
+    echo ""
+
+    if [ $exit_code -ne 0 ]; then
+        echo -e "${RED}API Error (exit $exit_code)${NC}"
+        echo "$json_output" | head -20
+        return 1
+    fi
+
+    local text_output
+    text_output=$(json_extract_text "$json_output") || text_output=""
+
+    echo -e "${CYAN}┌─ Tool Activity ───────────────────────────────────────────────${NC}"
+
+    echo "$text_output" | tr '|' '\n' | grep -vE '^\[RALPH\]|^=== Task|^=================================|^[0-9]\+' | while IFS= read -r line; do
+        line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        [ -z "$line" ] && continue
+
+        if echo "$line" | grep -qE '^(Read|Write|Edit|Bash|grep|glob|task|webfetch|codesearch|websearch|todoread|todowrite)'; then
+            echo -e "  ${CYAN}🔧 $line${NC}"
+        elif echo "$line" | grep -qE '^(✅|❌|⚠️|ℹ️)'; then
+            echo -e "  ${GREEN}$line${NC}"
+        elif echo "$line" | grep -qE '^Thinking|^Analyzing|^Searching'; then
+            echo -e "  ${YELLOW}💭 $line${NC}"
+        else
+            echo -e "  $line"
+        fi
+    done
+
+    echo -e "${CYAN}└──────────────────────────────────────────────────────────────${NC}"
+    echo ""
+
+    if command -v jq &> /dev/null; then
+        local prompt_tokens
+        local completion_tokens
+        prompt_tokens=$(echo "$json_output" | jq -r '.part.tokens.input // .tokens.input // 0' 2>/dev/null | head -1) || 0
+        completion_tokens=$(echo "$json_output" | jq -r '.part.tokens.output // .tokens.output // 0' 2>/dev/null | head -1) || 0
+        local cost
+        cost=$(echo "$json_output" | jq -r '.part.cost // .cost // 0' 2>/dev/null | head -1) || 0
+
+        echo -e "${BLUE}Stats: ${prompt_tokens}→${completion_tokens} tokens | \$${cost} | ${duration}s${NC}"
+    fi
+
+    if echo "$text_output" | grep -q "<promise>$COMPLETION_PROMISE</powershell>"; then
+        echo -e "${GREEN}Completion promise detected${NC}"
+        return 0
+    fi
+
+    echo -e "${YELLOW}No completion promise${NC}"
+    return 1
+}
+
+run_devplan_iteration_live() {
+    local prompt="$1"
+    local iteration="$2"
+    local devfile="$3"
+    local task="$4"
+
+    local context
+    context=$(get_and_clear_context)
+
+    local full_prompt="$prompt
+
+IMPORTANT: Output <promise>$COMPLETION_PROMISE</powershell> when the task is complete."
+
+    echo -e "${CYAN}Processing task: ${task:0:50}...${NC}"
+    echo ""
+
+    local start_time
+    start_time=$(date +%s)
+
+    local opencode_cmd="opencode run"
+    if [ -n "$PROVIDER" ]; then
+        opencode_cmd="$opencode_cmd --provider $PROVIDER"
+    fi
+    if [ -n "$MODEL" ]; then
+        opencode_cmd="$opencode_cmd --model $MODEL"
+    fi
+
+    local json_output
+    json_output=$($opencode_cmd --format json "$full_prompt" 2>&1)
+    local exit_code=$?
+    local duration=$(($(date +%s) - start_time))
+
+    if [ $exit_code -ne 0 ]; then
+        echo -e "${RED}API Error${NC}"
+        return 2
+    fi
+
+    local text_output
+    text_output=$(json_extract_text "$json_output") || text_output=""
+
+    echo -e "${CYAN}┌─ Activity ─────────────────────────────────────────────────${NC}"
+
+    echo "$text_output" | tr '|' '\n' | grep -vE '^\[RALPH\]|^=== Task|^=================================' | while IFS= read -r line; do
+        line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        [ -z "$line" ] && continue
+
+        if echo "$line" | grep -qE '^(Read|Write|Edit|Bash|grep|glob|task)'; then
+            echo -e "  ${CYAN}🔧 $line${NC}"
+        elif echo "$line" | grep -qE '^(✅|❌|⚠️)'; then
+            echo -e "  ${GREEN}$line${NC}"
+        else
+            echo -e "  $line"
+        fi
+    done
+
+    echo -e "${CYAN}└────────────────────────────────────────────────────────────${NC}"
+    echo ""
+
+    if echo "$text_output" | grep -q "<promise>$COMPLETION_PROMISE</powershell>"; then
+        return 0
+    fi
+
+    return 1
+}
+
+# ============================================================================
+# Output streamer
+# ============================================================================
+
+stream_output() {
+    local fifo="$1"
+    local buffer=""
+    local line_num=0
+
+    if [ ! -p "$fifo" ]; then
+        return 0
+    fi
+
+    while IFS= read -r line; do
+        line_num=$((line_num + 1))
+
+        if [ -z "$line" ]; then
+            echo ""
+            continue
+        fi
+
+        if echo "$line" | grep -qE '^\[RALPH-LIVE\]'; then
+            echo -e "${CYAN}$line${NC}"
+        elif echo "$line" | grep -qE '^(✅|🎉|✨)'; then
+            echo -e "${GREEN}$line${NC}"
+        elif echo "$line" | grep -qE '^(❌|ERROR|Error:)'; then
+            echo -e "${RED}$line${NC}"
+        elif echo "$line" | grep -qE '^(⚠️|⚠️|Warning:)'; then
+            echo -e "${YELLOW}$line${NC}"
+        elif echo "$line" | grep -qE '^(📤|📥|📊|🔧|💭|📝)'; then
+            echo -e "${CYAN}$line${NC}"
+        elif echo "$line" | grep -qE '^═|^─|^━'; then
+            echo -e "${MAGENTA}$line${NC}"
+        elif echo "$line" | grep -qE '^(Read|Write|Edit|Bash|grep|glob|task|webfetch)'; then
+            echo -e "  ${CYAN}🔧 $line${NC}"
+        else
+            echo "$line"
+        fi
+    done < "$fifo"
+}
+
+# ============================================================================
+# Interactive command processor
+# ============================================================================
+
+process_command() {
+    local cmd="$1"
+
+    case "$cmd" in
+        status|s)
+            show_live_status
+            ;;
+        model|m)
+            show_current_model
+            ;;
+        select|sel)
+            select_model_step_by_step || true
+            ;;
+        provider|pv)
+            list_providers
+            ;;
+        models|ml)
+            list_models_for_provider "${PROVIDER:-opencode}"
+            ;;
+        context|c)
+            show_context_menu
+            ;;
+         add|a)
+            echo -e "${YELLOW}Enter context (end with Ctrl+D):${NC}"
+            read_multiline_input >> "$CONTEXT_FILE"
+            echo -e "${GREEN}Context added${NC}"
+            ;;
+        progress|p)
+            show_progress
+            ;;
+        history|h)
+            show_history
+            ;;
+        swarm|sw)
+            show_swarm_menu
+            ;;
+        project|proj|pj)
+            project_menu
+            ;;
+        newproject|np)
+            new_project_wizard
+            ;;
+        swarmdev|sd)
+            project_start_swarm_devplan
+            ;;
+        projprogress|pp)
+            projects_list_with_progress
+            ;;
+        projresume|pr)
+            project_swarm_select_resume || true
+            ;;
+        sprovider|sp)
+            select_swarm_model
+            ;;
+        smodel|sm)
+            show_swarm_model
+            ;;
+        interrupt|i|ctrl-c)
+            echo -e "${YELLOW}Interrupting agent...${NC}"
+            interrupt_agent
+            ;;
+        stop|x)
+            echo -e "${YELLOW}Stopping agent...${NC}"
+            stop_agent
+            ;;
+        resume|r)
+            echo -e "${YELLOW}Resume not supported in live mode${NC}"
+            ;;
+        help|?)
+            show_help
+            ;;
+        "")
+            ;;
+        *)
+            echo -e "${RED}Unknown command: $cmd${NC}"
+            echo "Type 'help' for commands"
+            ;;
+    esac
+}
+
+show_swarm_menu() {
+    ui_banner "SWARM COMMANDS"
+
+    show_swarm_model
+
+    echo -e "  ${CYAN}sw${NC}        Switch to Swarm mode"
+    echo -e "  ${CYAN}sp${NC}        Select swarm provider/model"
+    echo -e "  ${CYAN}sm${NC}        Show swarm model settings"
+    echo ""
+    echo -e "  Swarm mode runs multiple workers in parallel for large tasks."
+    echo ""
+}
+
+show_live_status() {
+    ui_banner "RALPH-LIVE STATUS"
+
+    if [ -f "$LIVE_STATE_FILE" ]; then
+        local status mode iteration start_time message
+        status=$(jq -r '.status' "$LIVE_STATE_FILE")
+        mode=$(jq -r '.mode' "$LIVE_STATE_FILE")
+        iteration=$(jq -r '.iteration' "$LIVE_STATE_FILE")
+        start_time=$(jq -r '.start_time' "$LIVE_STATE_FILE")
+        message=$(jq -r '.message' "$LIVE_STATE_FILE")
+
+        echo -e "  ${CYAN}Status:${NC}    $status"
+        echo -e "  ${CYAN}Mode:${NC}     $mode"
+        echo -e "  ${CYAN}Iteration:${NC} $iteration"
+
+        if [ "$start_time" != "null" ]; then
+            local elapsed=$(($(date +%s) - $(date -d "$start_time" +%s) 2>/dev/null || echo "0"))
+            local minutes=$((elapsed / 60))
+            local seconds=$((elapsed % 60))
+            echo -e "  ${CYAN}Elapsed:${NC}   ${minutes}m ${seconds}s"
+        fi
+
+        if [ -n "$message" ]; then
+            echo -e "  ${CYAN}Message:${NC}  $message"
+        fi
+
+        echo ""
+    fi
+
+    show_current_model
+
+    if [ -f "$LIVE_PID_FILE" ]; then
+        local pid
+        pid=$(cat "$LIVE_PID_FILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            echo -e "  ${GREEN}Agent:${NC}    Running (PID $pid)"
+        else
+            echo -e "  ${YELLOW}Agent:${NC}    Not running"
+        fi
+    else
+        echo -e "  ${YELLOW}Agent:${NC}    Not started"
+    fi
+
+    echo ""
+}
+
+show_context_menu() {
+    ui_banner "CONTEXT MENU"
+
+    if [ -f "$CONTEXT_FILE" ] && [ -s "$CONTEXT_FILE" ]; then
+        echo -e "  ${YELLOW}Pending context:${NC}"
+        echo ""
+        cat "$CONTEXT_FILE" | sed 's/^/    /'
+        echo ""
+    else
+        echo "  No pending context"
+        echo ""
+    fi
+
+    echo -e "  Commands: ${CYAN}a${NC}dd context, ${CYAN}c${NC}lear context"
+    echo ""
+}
+
+show_progress() {
+    ui_banner "PROGRESS"
+
+    if [ -f "$PROGRESS_FILE" ]; then
+        tail -20 "$PROGRESS_FILE" | sed 's/^/  /'
+        echo ""
+    else
+        echo "  No progress yet"
+        echo ""
+    fi
+}
+
+show_history() {
+    ui_banner "HISTORY"
+
+    if [ -f "$HISTORY_FILE" ]; then
+        local count
+        count=$(jq '.iterations | length' "$HISTORY_FILE" 2>/dev/null || echo "0")
+        echo "  $count iterations"
+
+        if [ "$count" -gt 0 ]; then
+            echo ""
+            jq -r '.iterations[-10:] | .[] | "  Iteration \(.iteration): \(.duration)s | \(.tools_used // "none")"' "$HISTORY_FILE" 2>/dev/null || true
+        fi
+        echo ""
+    else
+        echo "  No history yet"
+        echo ""
+    fi
+}
+
+interrupt_agent() {
+    if [ -z "${LIVE_PID_FILE:-}" ]; then
+        LIVE_PID_FILE="$RALPH_DIR/live/agent.pid"
+    fi
+    if [ -f "$LIVE_PID_FILE" ]; then
+        local pid
+        pid=$(cat "$LIVE_PID_FILE" 2>/dev/null || true)
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -INT "$pid" 2>/dev/null || true
+            echo -e "${YELLOW}Interrupt signal sent${NC}"
+        fi
+    fi
+}
+
+stop_agent() {
+    if [ -z "${LIVE_PID_FILE:-}" ]; then
+        LIVE_PID_FILE="$RALPH_DIR/live/agent.pid"
+    fi
+    if [ -f "$LIVE_PID_FILE" ]; then
+        local pid
+        pid=$(cat "$LIVE_PID_FILE" 2>/dev/null || true)
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -TERM "$pid" 2>/dev/null || true
+            sleep 1
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+        rm -f "$LIVE_PID_FILE"
+    fi
+    echo -e "${YELLOW}Agent stopped${NC}"
+}
+
+show_help() {
+    cat << EOF
+$(ui_logo)
+
+${MAGENTA}/===================================================================\\${NC}
+${MAGENTA}| RALPH-LIVE COMMANDS                                               |${NC}
+${MAGENTA}\\===================================================================/${NC}
+
+${CYAN}Agent Control:${NC}
+  status/s    Show agent status
+  interrupt/i Interrupt agent gracefully
+  stop/x      Force stop agent
+
+${CYAN}Model/Provider:${NC}
+  model/m     Show current model settings
+  select/sel  Interactive model selection wizard
+  provider/pv List all available providers
+  models/ml   List models for current provider
+
+${CYAN}Context:${NC}
+  context/c   Show context menu
+  add/a       Add context for next iteration
+  progress/p  Show progress log
+  history/h   Show iteration history
+
+${CYAN}Swarm Mode:${NC}
+  swarm/sw    Show swarm menu
+  sp          Select swarm provider/model
+  sm          Show swarm model settings
+
+${CYAN}Projects:${NC}
+  project/pj  Project menu (switch/new/start)
+  np          New project wizard
+  sd          Start swarm on current DevPlan
+  pp          View all projects with swarm progress
+  pr          Resume swarm for a project
+
+${CYAN}Note:${NC}
+  - In interactive menus, you usually don't need Enter (single-key selection)
+
+${CYAN}Tips:${NC}
+  - Output streams in real-time
+  - Commands work while agent runs
+  - Use 'select' for guided model selection
+  - Swarm mode for parallel workers
+
+EOF
+}
+
+# ============================================================================
+# Interactive App Menu
+# ============================================================================
+
+show_main_menu() {
+    clear
+    echo ""
+    ui_logo | while IFS= read -r line; do echo -e "${MAGENTA}$line${NC}"; done
+    echo ""
+    ui_banner "MAIN MENU"
+    echo -e "  ${CYAN}1${NC}) Enter a task prompt"
+    echo -e "  ${CYAN}2${NC}) Work on a DevPlan file"
+    echo -e "  ${CYAN}3${NC}) Swarm mode (parallel workers)"
+    echo -e "  ${CYAN}4${NC}) Select model/provider"
+    echo -e "  ${CYAN}5${NC}) Show current settings"
+    echo -e "  ${CYAN}6${NC}) List available providers"
+    echo -e "  ${CYAN}7${NC}) Project menu"
+    echo -e "  ${CYAN}8${NC}) New project (DevPlan -> swarm)"
+    echo -e "  ${CYAN}9${NC}) View all projects with swarm progress"
+    echo ""
+    echo -e "  ${CYAN}q${NC}) Quit"
+    echo ""
+    echo -n -e "  ${YELLOW}Select an option: ${NC}"
+}
+
+run_interactive_app() {
+    init_ralph
+    projects_init
+    check_opencode
+    check_dependencies
+    init_live_mode
+
+    while true; do
+        show_main_menu
+
+        local selection
+        read_key selection
+        echo ""
+
+        case "$selection" in
+             1)
+                echo -e "${CYAN}Enter your task prompt (end with Ctrl+D):${NC}"
+                local prompt
+                prompt=$(read_multiline_input)
+                if [ -n "$prompt" ]; then
+                    echo ""
+                    echo -e "${GREEN}Starting agent...${NC}"
+                    echo ""
+                    run_loop_live "$prompt"
+                else
+                    echo -e "${YELLOW}No prompt entered${NC}"
+                fi
+                echo ""
+                echo -e "${CYAN}Press Enter to continue...${NC}"
+                read_user_input
+                ;;
+            2)
+                local default_devplan
+                default_devplan="${CURRENT_PROJECT_DEVPLAN:-./devplan.md}"
+                echo -e "${CYAN}Enter DevPlan file path (or press Enter for $default_devplan):${NC}"
+                read_user_input devplan_path
+                if [ -z "$devplan_path" ]; then
+                    devplan_path="$default_devplan"
+                fi
+                if [ -f "$devplan_path" ]; then
+                    echo ""
+                    echo -e "${GREEN}Starting DevPlan mode...${NC}"
+                    echo ""
+                    run_devplan_live "$devplan_path"
+                else
+                    echo -e "${RED}DevPlan file not found: $devplan_path${NC}"
+                fi
+                echo ""
+                echo -e "${CYAN}Press Enter to continue...${NC}"
+                read_user_input
+                ;;
+            3)
+                echo -e "${CYAN}Enter swarm task description (end with Ctrl+D):${NC}"
+                local task
+                task=$(read_multiline_input)
+                if [ -n "$task" ]; then
+                    echo ""
+                    echo -e "${GREEN}Starting swarm...${NC}"
+                    echo ""
+                    run_swarm_live "$task"
+                else
+                    echo -e "${YELLOW}No task entered${NC}"
+                fi
+                echo ""
+                echo -e "${CYAN}Press Enter to continue...${NC}"
+                read_user_input
+                ;;
+            4)
+                select_model_step_by_step || true
+                echo ""
+                echo -e "${CYAN}Press Enter to continue...${NC}"
+                read_user_input
+                ;;
+            5)
+                show_current_model
+                show_swarm_model
+                echo ""
+                echo -e "${CYAN}Press Enter to continue...${NC}"
+                read_user_input
+                ;;
+            6)
+                list_providers
+                echo ""
+                echo -e "${CYAN}Press Enter to continue...${NC}"
+                read_user_input
+                ;;
+            7)
+                project_menu
+                ;;
+            8)
+                new_project_wizard || true
+                echo ""
+                echo -e "${CYAN}Press Enter to continue...${NC}"
+                read_user_input
+                ;;
+            9)
+                projects_list_with_progress
+                echo ""
+                echo -e "${CYAN}Press Enter to continue...${NC}"
+                read_user_input
+                ;;
+            q|Q)
+                echo -e "${GREEN}Goodbye!${NC}"
+                exit 0
+                ;;
+            "")
+                ;;
+            *)
+                echo -e "${RED}Invalid option: $selection${NC}"
+                echo ""
+                echo -e "${CYAN}Press Enter to continue...${NC}"
+                read_user_input
+                ;;
+        esac
+    done
+}
+
+# ============================================================================
+# Main entry point
+# ============================================================================
+
+main() {
+    local prompt=""
+    local show_help=false
+    local devplan_path=""
+    local swarm_task=""
+    local select_model=false
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --run-agent-background)
+                shift
+                local mode="$1"
+                local prompt="$2"
+                run_agent_background "$mode" "$prompt"
+                exit 0
+                ;;
+            --help|-h)
+                show_help=true
+                shift
+                ;;
+            --devplan)
+                devplan_path="$2"
+                shift 2
+                ;;
+            --swarm)
+                swarm_task="$2"
+                shift 2
+                ;;
+            --model)
+                MODEL="$2"
+                shift 2
+                ;;
+            --provider)
+                PROVIDER="$2"
+                shift 2
+                ;;
+            --select-model)
+                select_model=true
+                shift
+                ;;
+            --max-iterations)
+                MAX_ITERATIONS="$2"
+                shift 2
+                ;;
+            --swarm-provider)
+                SWARM_PROVIDER="$2"
+                shift 2
+                ;;
+            --swarm-model)
+                SWARM_MODEL="$2"
+                shift 2
+                ;;
+            -*)
+                echo -e "${RED}Unknown option: $1${NC}"
+                exit 1
+                ;;
+            *)
+                prompt="$1"
+                shift
+                ;;
+        esac
+    done
+
+    if [ "$show_help" = true ]; then
+        cat << EOF
+
+$(ui_logo)
+
+Ralph Live - Real-time CLI with streaming output
+
+USAGE:
+    ralph-live "<prompt>" [options]
+    ralph-live --devplan ./devplan.md [options]
+    ralph-live --swarm "task description" [options]
+    ralph-live (no arguments for interactive mode)
+
+OPTIONS:
+    --devplan PATH        Work on DevPlan file
+    --swarm TASK          Run in Swarm mode (parallel workers)
+    --model MODEL         Set model (e.g., claude-sonnet-4-20250514)
+    --provider PROVIDER   Set provider (e.g., anthropic, opencode)
+    --select-model        Interactive model/provider selection
+    --swarm-provider P    Swarm worker provider
+    --swarm-model M       Swarm worker model
+    --max-iterations N    Max iterations (default: 100)
+
+INTERACTIVE COMMANDS (while agent runs):
+    status/s    Show agent status
+    model/m     Show current model
+    select/sel  Interactive model selection
+    provider/pv List all providers
+    models/ml   List models for current provider
+    context/c   Show context menu
+    add/a       Add context
+    progress/p  Show progress log
+    history/h   Show iteration history
+    swarm/sw    Show swarm commands
+    sp          Select swarm model
+    sm          Show swarm settings
+    project/pj  Project menu
+    np          New project wizard
+    sd          Start swarm on current DevPlan
+    pp          View all projects with swarm progress
+    pr          Resume swarm for a project
+    interrupt/i  Interrupt agent
+    stop/x      Stop agent
+    help/?      Show this help
+
+EXAMPLES:
+    ralph-live "Create a REST API"
+    ralph-live --devplan ./devplan.md --model claude-sonnet-4-20250514
+    ralph-live --select-model
+    ralph-live --provider anthropic "Build a React component"
+    ralph-live --swarm "Refactor entire codebase"
+    ralph-live (launch interactive menu)
+
+EOF
+        exit 0
+    fi
+
+    if [ -n "$swarm_task" ] || [ -n "$devplan_path" ] || [ -n "$prompt" ] || [ "$select_model" = true ]; then
+        init_ralph
+        check_opencode
+        check_dependencies
+        init_live_mode
+
+        if [ "$select_model" = true ]; then
+            if select_model_step_by_step; then
+                echo ""
+                echo -e "${GREEN}Model selection complete. Starting agent...${NC}"
+                echo ""
+            else
+                echo ""
+                echo -e "${YELLOW}Model selection skipped. Using default settings...${NC}"
+                echo ""
+            fi
+        fi
+
+    local mode="loop"
+    local target=""
+
+        if [ -n "$swarm_task" ]; then
+            mode="swarm"
+            target="$swarm_task"
+            echo -e "${BLUE}[RALPH-LIVE]${NC} Swarm mode: $(echo "$target" | head -c 50)..."
+        elif [ -n "$devplan_path" ]; then
+            mode="devplan"
+            target="$devplan_path"
+            if [ ! -f "$target" ]; then
+                echo -e "${RED}DevPlan file not found: $target${NC}"
+                exit 1
+            fi
+            echo -e "${BLUE}[RALPH-LIVE]${NC} DevPlan mode: $target"
+        else
+            target="$prompt"
+            echo -e "${BLUE}[RALPH-LIVE]${NC} Loop mode: $(echo "$target" | head -c 50)..."
+        fi
+
+        ui_banner "SESSION" 
+        echo -e "  ${CYAN}Mode:${NC}     $mode"
+        echo -e "  ${CYAN}Model:${NC}   ${MODEL:-default}"
+        echo -e "  ${CYAN}Provider:${NC} ${PROVIDER:-default}"
+
+        if [ -n "$SWARM_MODEL" ]; then
+            echo -e "  ${CYAN}Swarm:${NC}   ${SWARM_PROVIDER:-default}/${SWARM_MODEL}"
+        fi
+
+        echo ""
+
+        if [ "$mode" = "devplan" ]; then
+            local counts
+            counts=$(count_devplan_tasks "$target")
+            local pending
+            pending=$(echo "$counts" | cut -d' ' -f1)
+            echo -e "  ${CYAN}Tasks:${NC}   $pending pending"
+        fi
+
+    echo ""
+    echo -e "${GREEN}Agent starting... (type 'help' for commands)${NC}"
+    echo ""
+
+    "$0" --run-agent-background "$mode" "$target" > "$LIVE_OUTPUT_FIFO" 2>&1 &
+    LIVE_AGENT_PID=$!
+    echo "$LIVE_AGENT_PID" > "$LIVE_PID_FILE"
+
+    local agent_running=true
+
+    local streamer_pid=""
+    stream_output "$LIVE_OUTPUT_FIFO" &
+    streamer_pid=$!
+
+    cleanup() {
+        stop_agent
+        if [ -n "${streamer_pid:-}" ]; then
+            kill "$streamer_pid" 2>/dev/null || true
+        fi
+        rm -f "$LIVE_OUTPUT_FIFO" "$LIVE_PID_FILE" 2>/dev/null || true
+    }
+    trap cleanup EXIT INT TERM
+
+    while $agent_running; do
+        if ! kill -0 "$LIVE_AGENT_PID" 2>/dev/null; then
+            agent_running=false
+            break
+        fi
+
+        if read -t 1 -r cmd 2>/dev/null; then
+            process_command "$cmd"
+            echo ""
+        fi
+    done
+
+    wait "$LIVE_AGENT_PID" 2>/dev/null || true
+    sleep 0.5
+
+    local drain_pid=""
+    stream_output "$LIVE_OUTPUT_FIFO" &
+    drain_pid=$!
+    sleep 1
+    if [ -n "${drain_pid:-}" ]; then
+        kill "$drain_pid" 2>/dev/null || true
+    fi
+
+    echo ""
+    echo -e "${BLUE}[RALPH-LIVE]${NC} Session ended"
+    else
+        run_interactive_app
+    fi
+}
+
+main "$@"
