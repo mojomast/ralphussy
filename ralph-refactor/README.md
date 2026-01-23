@@ -158,16 +158,38 @@ It provides a visual IDE-like experience with multiple panes:
 
 ### Project Management
 
-The TUI uses a project-based workflow. Projects are stored in `~/.ralph/projects/`:
+The TUI and ralph-live use a project-based workflow. Projects are stored in `~/projects/` by default (configurable via `SWARM_PROJECTS_BASE`):
 
 ```
-~/.ralph/projects/<project-name>/
+~/projects/<project-name>/
 ├── src/          # Source code
 ├── docs/         # Documentation
 ├── artifacts/    # Swarm run artifacts
 ├── output/       # Ralph output files
-└── devplan.md    # Development plan
+├── devplan.md    # Development plan
+└── project.env   # Project configuration
 ```
+
+### DevPlan Review with Another Model
+
+When creating or editing a devplan in `ralph-live`, you can get a second opinion from a different AI model:
+
+1. After devplan generation, select **a** (Analyze with another model)
+2. Choose a provider and model for the review
+3. The reviewer analyzes for:
+   - Missing tasks or gaps
+   - Potential blockers and dependencies
+   - Technical incompatibilities
+   - Task quality issues
+   - Missing non-functional requirements
+4. Choose to apply suggestions, edit manually, save review, or ignore
+
+### Failed Task Retry
+
+When resuming a swarm run with `--resume`, the system will:
+1. Detect failed tasks that haven't exceeded retry limit (default: 3 attempts)
+2. Prompt to retry failed tasks
+3. Reset retryable tasks to pending status for workers to pick up
 
 ### TUI Commands
 

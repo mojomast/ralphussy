@@ -101,6 +101,8 @@ swarm_worker_spawn() {
     local repo_root
     repo_root="${SWARM_REPO_ROOT:-}"
     
+    # CRITICAL: When SWARM_PROJECT_NAME is set, ALWAYS use the project directory
+    # This prevents ralphussy files from leaking into generated projects
     if [ -n "$project_name" ]; then
         local projects_base="${SWARM_PROJECTS_BASE:-$HOME/projects}"
         local project_dir="$projects_base/$project_name"
@@ -108,21 +110,55 @@ swarm_worker_spawn() {
         if [ ! -d "$project_dir" ]; then
             echo "Creating new project directory: $project_dir"
             mkdir -p "$project_dir"
+            
+            # Create a fresh git repo - do NOT copy from current directory
             git -C "$project_dir" init >/dev/null
             git -C "$project_dir" config user.name "Swarm" >/dev/null
             git -C "$project_dir" config user.email "swarm@local" >/dev/null
             
+            # Only copy devplan, nothing else
             if [ -f "$devplan_path" ]; then
                 cp "$devplan_path" "$project_dir/devplan.md" 2>/dev/null || true
             fi
             
+            # Create a minimal .gitignore - also exclude ralphussy internal files
+            cat > "$project_dir/.gitignore" <<'GITIGNORE'
+node_modules/
+.env
+*.log
+__pycache__/
+.DS_Store
+# Exclude ralphussy internal files (should never be in project)
+ralph-refactor/
+ralph-tui/
+swarm-dashboard/
+opencode-ralph*/
+*.db
+GITIGNORE
+            
             git -C "$project_dir" add . >/dev/null 2>&1 || true
-            git -C "$project_dir" commit -m "Initial commit" >/dev/null 2>&1 || true
+            git -C "$project_dir" commit -m "Initial project setup" >/dev/null 2>&1 || true
+        elif [ ! -d "$project_dir/.git" ]; then
+            echo "Initializing git repository in existing project: $project_dir"
+            git -C "$project_dir" init >/dev/null
+            git -C "$project_dir" config user.name "Swarm" >/dev/null
+            git -C "$project_dir" config user.email "swarm@local" >/dev/null
+            git -C "$project_dir" checkout -b main 2>/dev/null || true
+            
+            if [ -f "$devplan_path" ] && [ ! -f "$project_dir/devplan.md" ]; then
+                cp "$devplan_path" "$project_dir/devplan.md" 2>/dev/null || true
+            fi
+            
+            git -C "$project_dir" add . >/dev/null 2>&1 || true
+            git -C "$project_dir" commit -m "Initial commit by swarm" >/dev/null 2>&1 || true
         fi
         
+        # ALWAYS use project_dir as repo_root when project_name is set
         repo_root="$project_dir"
+        echo "Using project directory as repo root: $repo_root"
     fi
     
+    # Only fall back to current directory if no project_name was specified
     if [ -z "$repo_root" ]; then
         repo_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
     fi
@@ -192,6 +228,7 @@ swarm_worker_spawn() {
         export SWARM_OUTPUT_MODE="'"${SWARM_OUTPUT_MODE:-}"'"
         export SWARM_PROJECT_NAME="'"${SWARM_PROJECT_NAME:-}"'"
         export SWARM_PROJECTS_BASE="'"${SWARM_PROJECTS_BASE:-$HOME/projects}"'"
+        export SWARM_REPO_ROOT="'"${repo_root}"'"
 
         # Redirect all output to log file
         exec > "'"$log_full"'" 2>&1
@@ -353,19 +390,21 @@ swarm_worker_execute_task() {
     prompt=$(cat <<EOF
 CRITICAL INSTRUCTION: You MUST end your response with the exact string "<promise>COMPLETE</promise>" when you have finished the task. Do not omit this marker under any circumstances.
 
-You are a swarm worker (#$worker_num) operating inside a git worktree.
+You are a swarm worker (#$worker_num) operating inside a git worktree for a NEW PROJECT.
 
 Task ($task_id): $task_text
 
 Constraints:
-- Make changes in this repository (current working directory).
+- Make changes ONLY in this repository (current working directory).
+- This is a fresh project - create the necessary files and structure for the task.
+- DO NOT reference, copy, or include any files from ralph-refactor/, ralph-tui/, swarm-dashboard/, or opencode-ralph* directories - these are internal tooling files and must NOT be included in the project.
 - Run relevant tests/linters if they exist.
 - Create a git commit for your changes with a clear message.
 - When finished, you MUST output exactly: <promise>COMPLETE</promise>
 
 Remember: End your response with "<promise>COMPLETE</promise>" to signal task completion. This is required for the swarm system to recognize your work as done.
 
-If you need context, inspect files in the repo.
+If you need context, inspect files in the repo. Focus on building the requested functionality from scratch.
 EOF
 )
 

@@ -63,7 +63,8 @@ except Exception:  # pragma: no cover
 
 # Configuration
 RALPH_DIR = Path(os.environ.get("RALPH_DIR", Path.home() / ".ralph"))
-PROJECTS_DIR = RALPH_DIR / "projects"
+# Projects should be in ~/projects not ~/.ralph/projects
+PROJECTS_DIR = Path(os.environ.get("SWARM_PROJECTS_BASE", Path.home() / "projects"))
 SWARM_DB = RALPH_DIR / "swarm.db"
 TUI_CONFIG_PATH = RALPH_DIR / "tui_settings.json"
 

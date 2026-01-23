@@ -1299,9 +1299,26 @@ main() {
             swarm_orchestrator_status "$run_id"
             echo ""
 
-            # Get worker count from the run
+            # Check for failed tasks that can be retried
+            local retryable_count
+            retryable_count=$(swarm_db_get_retryable_task_count "$run_id" 3 2>/dev/null || echo "0")
+            if [ "$retryable_count" -gt 0 ]; then
+                echo ""
+                echo "Found $retryable_count failed tasks that can be retried (max 3 attempts each)."
+                read -r -p "Retry failed tasks? (y/N): " retry_answer || true
+                if [[ "${retry_answer,,}" =~ ^y ]]; then
+                    swarm_db_retry_failed_tasks "$run_id" 3
+                fi
+                echo ""
+            fi
+
+            # Get worker count from run or use provided value
             local resume_workers
-            resume_workers=$(sqlite3 "$RALPH_DIR/swarm.db" "SELECT worker_count FROM swarm_runs WHERE run_id = '$run_id';" 2>/dev/null || echo "4")
+            if [ "$worker_count" -ne 2 ]; then
+                resume_workers="$worker_count"
+            else
+                resume_workers=$(sqlite3 "$RALPH_DIR/swarm.db" "SELECT worker_count FROM swarm_runs WHERE run_id = '$run_id';" 2>/dev/null || echo "4")
+            fi
 
             echo "Continuing with $resume_workers workers..."
             swarm_orchestrator_start "" "devplan" "$resume_devplan" "" "$resume_workers" "$timeout_seconds" "$verbose" "$run_id"
@@ -1315,6 +1332,15 @@ main() {
                 echo "Error: Provide --devplan PATH or a prompt string" 1>&2
                 swarm_usage
                 exit 1
+            fi
+
+            # Prompt for workers if not specified
+            if [ "$interactive" = false ] && [ "$worker_count" -eq 2 ]; then
+                echo ""
+                read -r -p "Number of workers [$worker_count]: " input_workers || true
+                if [ -n "$input_workers" ]; then
+                    worker_count="$input_workers"
+                fi
             fi
 
             swarm_orchestrator_start "" "$mode" "$devplan_path" "$prompt_text" "$worker_count" "$timeout_seconds" "$verbose"

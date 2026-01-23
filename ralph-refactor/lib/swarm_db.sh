@@ -1058,3 +1058,58 @@ FROM swarm_runs sr
 WHERE sr.run_id = '$run_id';
 EOF
 }
+
+# Retry failed tasks by resetting their status to pending
+# Optionally filter by stall_count to only retry tasks that haven't failed too many times
+swarm_db_retry_failed_tasks() {
+    local db_path="$RALPH_DIR/swarm.db"
+    local run_id="$1"
+    local max_retries="${2:-3}"  # Default max retries is 3
+
+    if [ -z "$run_id" ]; then
+        echo "Error: run_id required"
+        return 1
+    fi
+
+    # Count how many failed tasks we're retrying
+    local retry_count
+    retry_count=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM tasks WHERE run_id = '$run_id' AND status = 'failed' AND COALESCE(stall_count, 0) < $max_retries;")
+
+    if [ "$retry_count" = "0" ]; then
+        echo "No failed tasks eligible for retry (max_retries: $max_retries)"
+        return 0
+    fi
+
+    sqlite3 "$db_path" <<EOF
+BEGIN TRANSACTION;
+
+-- Reset failed tasks to pending (only if under max retry limit)
+UPDATE tasks
+SET status = 'pending',
+    worker_id = NULL,
+    started_at = NULL,
+    completed_at = NULL,
+    stall_count = COALESCE(stall_count, 0) + 1
+WHERE run_id = '$run_id' 
+    AND status = 'failed'
+    AND COALESCE(stall_count, 0) < $max_retries;
+
+-- Update the run's failed_tasks count
+UPDATE swarm_runs
+SET failed_tasks = (SELECT COUNT(*) FROM tasks WHERE run_id = '$run_id' AND status = 'failed')
+WHERE run_id = '$run_id';
+
+COMMIT;
+EOF
+
+    echo "Retried $retry_count failed tasks"
+}
+
+# Get count of tasks that can be retried (failed but under max retry limit)
+swarm_db_get_retryable_task_count() {
+    local db_path="$RALPH_DIR/swarm.db"
+    local run_id="$1"
+    local max_retries="${2:-3}"
+
+    sqlite3 "$db_path" "SELECT COUNT(*) FROM tasks WHERE run_id = '$run_id' AND status = 'failed' AND COALESCE(stall_count, 0) < $max_retries;"
+}

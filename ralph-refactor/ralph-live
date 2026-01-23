@@ -13,6 +13,7 @@ source "$SCRIPT_DIR/lib/monitor.sh"
 source "$SCRIPT_DIR/lib/json.sh"
 source "$SCRIPT_DIR/lib/devplan.sh"
 source "$SCRIPT_DIR/lib/swarm_db.sh"
+source "$SCRIPT_DIR/lib/swarm_git.sh"
 
 # Live mode state
 LIVE_PID_FILE=""
@@ -25,8 +26,8 @@ LIVE_INTERACTIVE=true
 ATTACH_MODE_RUN_ID=""
 ATTACH_MODE_REFRESH=2
 
-# Projects
-PROJECTS_DIR="$RALPH_DIR/projects"
+# Projects - store in ~/projects not ~/.ralph/projects
+PROJECTS_DIR="${SWARM_PROJECTS_BASE:-$HOME/projects}"
 CURRENT_PROJECT_FILE="$PROJECTS_DIR/current"
 CURRENT_PROJECT=""
 CURRENT_PROJECT_DIR=""
@@ -421,6 +422,283 @@ EOF
     return 0
 }
 
+project_review_devplan_with_model() {
+    local path="$1"
+    local title="$2"
+
+    if ! command -v opencode >/dev/null 2>&1; then
+        echo -e "${RED}opencode not found${NC}"
+        return 1
+    fi
+
+    if [ ! -f "$path" ]; then
+        echo -e "${RED}DevPlan not found: $path${NC}"
+        return 1
+    fi
+
+    echo ""
+    echo -e "${CYAN}═════════════════════════════════════════════════════════${NC}"
+    echo -e "${CYAN}Review DevPlan with Another Model${NC}"
+    echo -e "${CYAN}═════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "This will send your DevPlan to a different AI model for review."
+    echo -e "The reviewer will analyze for:"
+    echo -e "  ${GREEN}•${NC} Missing tasks or gaps in coverage"
+    echo -e "  ${GREEN}•${NC} Potential blockers or dependencies"
+    echo -e "  ${GREEN}•${NC} Technical incompatibilities"
+    echo -e "  ${GREEN}•${NC} Task ordering issues"
+    echo -e "  ${GREEN}•${NC} Ambiguous or overly complex tasks"
+    echo ""
+
+    # Select provider and model for review
+    local review_provider=""
+    local review_model=""
+
+    SELECTED_PROVIDER=""
+    if ! select_provider_interactive; then
+        echo -e "${YELLOW}Review cancelled${NC}"
+        return 1
+    fi
+    review_provider="$SELECTED_PROVIDER"
+
+    if [ -z "$review_provider" ]; then
+        echo -e "${YELLOW}Review cancelled${NC}"
+        return 1
+    fi
+
+    SELECTED_MODEL=""
+    if ! select_model_interactive "$review_provider"; then
+        echo -e "${YELLOW}Review cancelled${NC}"
+        return 1
+    fi
+    review_model="$SELECTED_MODEL"
+
+    if [ -z "$review_model" ]; then
+        echo -e "${YELLOW}Review cancelled${NC}"
+        return 1
+    fi
+
+    echo ""
+    echo -e "${CYAN}Reviewing DevPlan with: ${GREEN}$review_model${NC}"
+    echo ""
+
+    local existing_devplan
+    existing_devplan=$(cat "$path")
+
+    local opencode_cmd="opencode run --model $review_model"
+
+    local prompt
+    prompt=$(cat <<'REVIEWPROMPT'
+You are an expert software architect and project planner reviewing a DevPlan. Your job is to analyze the plan and provide EITHER:
+
+1. A list of issues/improvements (if you find problems), OR
+2. Confirmation that the plan is solid (if it looks good)
+
+PROJECT NAME: TITLE_PLACEHOLDER
+
+CURRENT DEVPLAN:
+DEVPLAN_PLACEHOLDER
+
+ANALYZE THE DEVPLAN FOR:
+
+1. **Missing Tasks or Gaps**
+   - Are there obvious steps missing?
+   - Are there tasks that should be split into smaller pieces?
+   - Are there integration/glue tasks missing between components?
+
+2. **Potential Blockers & Dependencies**
+   - Are there tasks that depend on external services/APIs not mentioned?
+   - Are there tasks that should be done before others but aren't ordered that way?
+   - Are there potential bottlenecks where multiple tasks need the same resource?
+
+3. **Technical Incompatibilities**
+   - Are the technologies/frameworks mentioned compatible?
+   - Are there version conflicts or deprecated approaches?
+   - Are there tasks that contradict each other?
+
+4. **Task Quality Issues**
+   - Are any tasks too vague to be actionable?
+   - Are any tasks too large (should take >30 min)?
+   - Are any tasks duplicated or redundant?
+
+5. **Missing Non-Functional Requirements**
+   - Error handling / validation tasks?
+   - Security considerations?
+   - Performance / scalability tasks?
+   - Documentation / handoff tasks?
+
+RESPOND IN THIS FORMAT:
+
+## DevPlan Review Summary
+
+**Overall Assessment:** [GOOD / NEEDS WORK / MAJOR ISSUES]
+
+### Issues Found (if any)
+
+1. **[Issue Category]**: [Description]
+   - Suggestion: [How to fix]
+
+2. **[Issue Category]**: [Description]
+   - Suggestion: [How to fix]
+
+### Recommended Additional Tasks (if any)
+
+- [ ] [New task description]
+- [ ] [New task description]
+
+### Tasks That Should Be Modified (if any)
+
+- Original: "[original task]"
+  Modified: "[improved version]"
+
+### Dependency Order Issues (if any)
+
+- Task X should come before Task Y because...
+
+---
+
+If the DevPlan looks solid, simply say:
+
+## DevPlan Review Summary
+
+**Overall Assessment:** GOOD
+
+The DevPlan is well-structured and ready for execution. No significant issues found.
+
+DO NOT output a new devplan. Just provide the review/analysis.
+REVIEWPROMPT
+)
+
+    # Replace placeholders
+    prompt="${prompt//TITLE_PLACEHOLDER/$title}"
+    prompt="${prompt//DEVPLAN_PLACEHOLDER/$existing_devplan}"
+
+    echo -e "${CYAN}Analyzing DevPlan...${NC}"
+    echo ""
+
+    local json_output=""
+    if ! json_output=$($opencode_cmd --format json "$prompt" 2>&1); then
+        echo -e "${RED}DevPlan review failed${NC}"
+        return 1
+    fi
+
+    local review_output=""
+    review_output=$(json_extract_text "$json_output") || review_output=""
+    if [ -z "$review_output" ]; then
+        echo -e "${RED}DevPlan review returned empty output${NC}"
+        return 1
+    fi
+
+    # Display the review
+    echo -e "${CYAN}═════════════════════════════════════════════════════════${NC}"
+    echo -e "${CYAN}Review Results from: ${GREEN}$review_model${NC}"
+    echo -e "${CYAN}═════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo "$review_output"
+    echo ""
+    echo -e "${CYAN}═════════════════════════════════════════════════════════${NC}"
+    echo ""
+
+    # Ask if user wants to apply suggestions
+    echo -e "${YELLOW}What would you like to do with this review?${NC}"
+    echo -e "  ${GREEN}a${NC}  Apply suggestions automatically (send to model to update DevPlan)"
+    echo -e "  ${GREEN}m${NC}  Manually edit the DevPlan yourself"
+    echo -e "  ${GREEN}s${NC}  Save review to file and continue"
+    echo -e "  ${GREEN}i${NC}  Ignore review and continue"
+    echo ""
+    echo -n -e "${YELLOW}Choose option (a/m/s/i): ${NC}"
+
+    local review_choice
+    read_user_input review_choice
+
+    case "$review_choice" in
+        a|A)
+            echo ""
+            echo -e "${CYAN}Applying review suggestions to DevPlan...${NC}"
+            
+            local apply_prompt
+            apply_prompt=$(cat <<APPLYPROMPT
+You are updating a DevPlan based on a review. Apply the suggestions from the review to improve the DevPlan.
+
+PROJECT NAME: $title
+
+CURRENT DEVPLAN:
+$existing_devplan
+
+REVIEW FEEDBACK TO APPLY:
+$review_output
+
+REQUIREMENTS:
+1. Output ONLY pure markdown - the updated DevPlan
+2. Use these sections: Goal, Constraints, Tasks
+3. Under Tasks, use format: "- [ ] task description"
+4. Each task on a NEW LINE with "- [ ] " prefix
+5. Apply the review suggestions where appropriate
+6. Keep tasks suitable for parallel swarm agents (10-30 min each)
+7. Organize: setup -> core -> advanced -> testing -> docs
+8. Group related tasks with blank lines
+
+OUTPUT THE UPDATED DEVPLAN:
+
+# DevPlan: $title
+
+## Goal
+[Goal]
+
+## Constraints
+[Constraints]
+
+## Tasks
+[Updated tasks applying the review feedback]
+
+DO NOT include any explanations or commentary. Just the updated DevPlan in markdown.
+APPLYPROMPT
+)
+
+            local apply_output=""
+            if ! apply_output=$($opencode_cmd --format json "$apply_prompt" 2>&1); then
+                echo -e "${RED}Failed to apply suggestions${NC}"
+                return 1
+            fi
+
+            local updated_devplan=""
+            updated_devplan=$(json_extract_text "$apply_output") || updated_devplan=""
+            if [ -z "$updated_devplan" ]; then
+                echo -e "${RED}Failed to generate updated DevPlan${NC}"
+                return 1
+            fi
+
+            printf '%s\n' "$updated_devplan" > "$path"
+            echo -e "${GREEN}DevPlan updated with review suggestions!${NC}"
+            ;;
+        m|M)
+            local editor_cmd="${EDITOR-}"
+            if [ -n "$editor_cmd" ]; then
+                "$editor_cmd" "$path" || true
+            else
+                echo -e "${RED}No EDITOR set. Set EDITOR environment variable.${NC}"
+            fi
+            ;;
+        s|S)
+            local review_file="${path%.md}_review.md"
+            {
+                echo "# DevPlan Review"
+                echo ""
+                echo "**Reviewed by:** $review_model"
+                echo "**Date:** $(date)"
+                echo ""
+                echo "$review_output"
+            } > "$review_file"
+            echo -e "${GREEN}Review saved to: $review_file${NC}"
+            ;;
+        i|I|*)
+            echo -e "${YELLOW}Review ignored, continuing...${NC}"
+            ;;
+    esac
+
+    return 0
+}
+
 project_start_swarm_devplan() {
     if [ -z "$CURRENT_PROJECT" ] || [ -z "$CURRENT_PROJECT_DEVPLAN" ]; then
         echo -e "${RED}No current project/devplan selected${NC}"
@@ -431,15 +709,24 @@ project_start_swarm_devplan() {
         return 1
     fi
 
+    local workers=2
+    echo ""
+    read -r -p "Number of workers [$workers]: " input_workers || true
+    if [ -n "$input_workers" ]; then
+        workers="$input_workers"
+    fi
+
     if [ -n "$CURRENT_PROJECT_WORKDIR" ] && [ -d "$CURRENT_PROJECT_WORKDIR" ]; then
         echo -e "${CYAN}Workdir:${NC} $CURRENT_PROJECT_WORKDIR"
         (cd "$CURRENT_PROJECT_WORKDIR" && "$SCRIPT_DIR/ralph-swarm" --devplan "$CURRENT_PROJECT_DEVPLAN" \
+            --workers "$workers" \
             ${SWARM_PROVIDER:+--provider "$SWARM_PROVIDER"} \
             ${SWARM_MODEL:+--model "$SWARM_MODEL"} \
             ${MODEL:+--model "$MODEL"} \
             ${PROVIDER:+--provider "$PROVIDER"})
     else
         "$SCRIPT_DIR/ralph-swarm" --devplan "$CURRENT_PROJECT_DEVPLAN" \
+            --workers "$workers" \
             ${SWARM_PROVIDER:+--provider "$SWARM_PROVIDER"} \
             ${SWARM_MODEL:+--model "$SWARM_MODEL"} \
             ${MODEL:+--model "$MODEL"} \
@@ -523,13 +810,14 @@ EOF
         echo ""
 
         echo -e "${CYAN}Options:${NC}"
-        echo -e "  ${GREEN}e${NC}  Edit devplan"
-        echo -e "  ${GREEN}r${NC}  Reiterate devplan"
+        echo -e "  ${GREEN}e${NC}  Edit devplan manually"
+        echo -e "  ${GREEN}r${NC}  Reiterate devplan (with feedback)"
+        echo -e "  ${GREEN}a${NC}  Analyze with another model (review for issues/gaps)"
         echo -e "  ${GREEN}c${NC}  Continue to swarm"
         echo -e "  ${GREEN}q${NC}  Cancel"
 
         echo ""
-        echo -n -e "${YELLOW}Choose option (e/r/c/q): ${NC}"
+        echo -n -e "${YELLOW}Choose option (e/r/a/c/q): ${NC}"
         local choice
         read_user_input choice
 
@@ -550,6 +838,9 @@ EOF
                 if [ -n "$user_feedback" ]; then
                     project_reiterate_devplan_with_opencode "$devplan_path" "$name" "$user_feedback" || true
                 fi
+                ;;
+            a|A)
+                project_review_devplan_with_model "$devplan_path" "$name" || true
                 ;;
             c|C)
                 echo ""
@@ -874,17 +1165,24 @@ project_swarm_select_resume() {
     echo ""
 
     local workers
-    workers="2"
+    workers=$(sqlite3 "$RALPH_DIR/swarm.db" "SELECT worker_count FROM swarm_runs WHERE run_id = '$run_id';" 2>/dev/null || echo "2")
+    echo ""
+    read -r -p "Number of workers [$workers]: " input_workers || true
+    if [ -n "$input_workers" ]; then
+        workers="$input_workers"
+    fi
 
     if [ -n "$CURRENT_PROJECT_WORKDIR" ] && [ -d "$CURRENT_PROJECT_WORKDIR" ]; then
         echo -e "${CYAN}Workdir:${NC} $CURRENT_PROJECT_WORKDIR"
         (cd "$CURRENT_PROJECT_WORKDIR" && "$SCRIPT_DIR/ralph-swarm" --resume "$run_id" \
+            --workers "$workers" \
             ${SWARM_PROVIDER:+--provider "$SWARM_PROVIDER"} \
             ${SWARM_MODEL:+--model "$SWARM_MODEL"} \
             ${MODEL:+--model "$MODEL"} \
             ${PROVIDER:+--provider "$PROVIDER"})
     else
         "$SCRIPT_DIR/ralph-swarm" --resume "$run_id" \
+            --workers "$workers" \
             ${SWARM_PROVIDER:+--provider "$SWARM_PROVIDER"} \
             ${SWARM_MODEL:+--model "$SWARM_MODEL"} \
             ${MODEL:+--model "$MODEL"} \
@@ -2035,7 +2333,7 @@ move_artifacts_for_run() {
     local run_id="$1"
 
     echo ""
-    echo -e "${BLUE}[RALPH-LIVE]${NC} Moving artifacts for swarm: $run_id"
+    echo -e "${BLUE}[RALPH-LIVE]${NC} Moving and merging artifacts for swarm: $run_id"
 
     local run_dir="$RALPH_DIR/swarm/runs/$run_id"
     if [ ! -d "$run_dir" ]; then
@@ -2043,120 +2341,14 @@ move_artifacts_for_run() {
         return 1
     fi
 
-    local project_base="${PROJECTS_DIR:-$HOME/projects}"
-    local dest_dir="$project_base/swarm-$run_id"
-
-    if [ -d "$dest_dir" ]; then
-        echo ""
-        echo -e "${YELLOW}Destination already exists: $dest_dir${NC}"
-        echo -e "  ${CYAN}[o]${NC}  Overwrite"
-        echo -e "  ${CYAN}[c]${NC}  Cancel"
-        echo ""
-        echo -n -e "  ${YELLOW}Choose option (o/c): ${NC}"
-        local choice
-        read_user_input choice
-        case "$choice" in
-            o|O) ;;
-            *) return 1 ;;
-        esac
-    fi
-
-    mkdir -p "$dest_dir"
+    source "$SCRIPT_DIR/lib/swarm_artifacts.sh"
+    echo -e "${YELLOW}[RALPH-LIVE]${NC} Merging worker branches into project repository..."
+    swarm_merge_to_project "$run_id"
 
     echo ""
-    echo "Copying artifacts from $run_dir to $dest_dir"
-    echo ""
-
-    for worker_dir in "$run_dir"/worker-*; do
-        [ -d "$worker_dir" ] || continue
-        local worker_name
-        worker_name=$(basename "$worker_dir")
-        echo -e "  ${CYAN}Copying${NC} $worker_name..."
-
-        local dest_worker="$dest_dir/$worker_name"
-        mkdir -p "$dest_worker"
-
-        if [ -d "$worker_dir/repo" ]; then
-            local repo_dir="$worker_dir/repo"
-            
-            local branch_name
-            branch_name=$(git -C "$repo_dir" rev-parse --abbrev-ref HEAD 2>/dev/null)
-            
-            local target_branch="$branch_name"
-            if [ "$branch_name" = "HEAD" ]; then
-                local expected_branch="swarm/${run_id}/${worker_name}"
-                if git -C "$repo_dir" show-ref --verify --quiet "refs/heads/$expected_branch" 2>/dev/null; then
-                    target_branch="$expected_branch"
-                else
-                    target_branch=$(git -C "$repo_dir" rev-parse HEAD 2>/dev/null)
-                fi
-            fi
-            
-            if [ -n "$target_branch" ]; then
-                local base_commit
-                base_commit=$(git -C "$repo_dir" merge-base main "$target_branch" 2>/dev/null)
-                
-                if [ -n "$base_commit" ]; then
-                    local changed_files
-                    changed_files=$(git -C "$repo_dir" diff --name-only "${base_commit}..${target_branch}" 2>/dev/null)
-                    
-                    if [ -n "$changed_files" ]; then
-                        while IFS= read -r file; do
-                            if [ -n "$file" ]; then
-                                local src_file="${repo_dir}/${file}"
-                                local dst_file="${dest_worker}/${file}"
-                                mkdir -p "$(dirname "$dst_file")" 2>/dev/null || true
-                                if [ -f "$src_file" ]; then
-                                    cp "$src_file" "$dst_file" 2>/dev/null || true
-                                fi
-                            fi
-                        done <<< "$changed_files"
-                        
-                        echo "$changed_files" > "$dest_worker/files.txt" 2>/dev/null || true
-                    fi
-                    
-                    git -C "$repo_dir" log --name-status --oneline "${base_commit}..${target_branch}" > "$dest_worker/commits.txt" 2>/dev/null || true
-                fi
-            fi
-        fi
-
-        if [ -d "$worker_dir/logs" ]; then
-            mkdir -p "$dest_worker/logs"
-            cp -a "$worker_dir"/logs/* "$dest_worker/logs/" 2>/dev/null || true
-        fi
-    done
-
-    local summary_file="$dest_dir/SWARM_SUMMARY.md"
-    {
-        echo "# Swarm Run Summary: $run_id"
-        echo
-        echo "## Run Status"
-
-        local db_path="$RALPH_DIR/swarm.db"
-        local run_status total_tasks completed_tasks failed_tasks started_at completed_at
-        run_status=$(sqlite3 "$db_path" "SELECT status FROM swarm_runs WHERE run_id = '$run_id';" 2>/dev/null || echo "unknown")
-        total_tasks=$(sqlite3 "$db_path" "SELECT total_tasks FROM swarm_runs WHERE run_id = '$run_id';" 2>/dev/null || echo "0")
-        completed_tasks=$(sqlite3 "$db_path" "SELECT completed_tasks FROM swarm_runs WHERE run_id = '$run_id';" 2>/dev/null || echo "0")
-        failed_tasks=$(sqlite3 "$db_path" "SELECT failed_tasks FROM swarm_runs WHERE run_id = '$run_id';" 2>/dev/null || echo "0")
-        started_at=$(sqlite3 "$db_path" "SELECT datetime(started_at) FROM swarm_runs WHERE run_id = '$run_id';" 2>/dev/null || echo "N/A")
-        completed_at=$(sqlite3 "$db_path" "SELECT datetime(completed_at) FROM swarm_runs WHERE run_id = '$run_id';" 2>/dev/null || echo "N/A")
-
-        echo "- **Status**: $run_status"
-        echo "- **Total Tasks**: $total_tasks"
-        echo "- **Completed**: $completed_tasks"
-        echo "- **Failed**: $failed_tasks"
-        echo "- **Started**: $started_at"
-        echo "- **Completed**: $completed_at"
-    } > "$summary_file"
-
-    echo ""
-    echo -e "${GREEN}[RALPH-LIVE]${NC} Artifacts moved successfully!"
-    echo "  Destination: $dest_dir"
-    echo "  Summary: $summary_file"
-    echo ""
-
-    echo -e "${CYAN}To explore artifacts:${NC}"
-    echo "  cd $dest_dir"
+    echo -e "${GREEN}[RALPH-LIVE]${NC} Artifacts merged successfully!"
+    echo "  Changes have been merged into the project repository"
+    echo "  Worker branches have been cleaned up"
     echo ""
 }
 

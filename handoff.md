@@ -5,11 +5,14 @@
 
 ## Current Status
  
- The ralph-live system has been extensively debugged and improved. The swarm functionality is now operational with proper:
- 
- - **Project Isolation:** Swarms create independent repos in `~/projects/PROJECT_NAME/` (not ralphussy worktrees)
- - **Artifact Extraction:** `swarm_extract_merged_artifacts()` extracts only changed files from completed runs
- - **Model Configuration:** Default is `zai-coding-plan/glm-4.7` (fixed from broken `glm-4.7-free`)
+  The ralph-live system has been extensively debugged and improved. The swarm functionality is now operational with proper:
+  
+  - **Worker Prompts:** All swarm start operations now prompt for worker count before starting
+  - **Project Isolation:** Swarms create independent repos in `$RALPH_DIR/projects/PROJECT_NAME/` (not ralphussy worktrees)
+  - **Git Repository Initialization:** Auto-initializes git repos in projects created by `ralph-live`
+  - **Direct Merge:** Changes merge directly into project's `main` branch (no separate worker folders)
+  - **Branch Cleanup:** Merged worker branches are automatically deleted after merging
+  - **Model Configuration:** Default is `zai-coding-plan/glm-4.7` (fixed from broken `glm-4.7-free`)
  - **Token Counting:** Correctly aggregates all API events (was showing 0→0)
  - **JSON Text Extraction:** Fixed critical bug - now extracts LAST text message containing completion marker
  - **Task Timeout:** Increased to 600s (10 minutes) - was killing tasks at 180s
@@ -17,31 +20,83 @@
  - **Model Validation:** Validates models against `~/.opencode/enabled-models.json`
  - **Orphaned Process Cleanup:** Automatically kills orphaned opencode processes before new runs
  - **Worker Count:** Reduced to 2 (from 4) to reduce contention
- - **Real-Time Verbosity:** Shows task assignments, executions, API calls, and completions as they happen
+   - **Real-Time Verbosity:** Shows task assignments, executions, API calls, and completions as they happen
+   - **Worker Count Prompts:** All swarm starts prompt for worker count (default 2)
+   
+  ## Recent Critical Fixes
+   
+   ###1. Project Repository Isolation (2026-01-23)
+   - **Problem:** Swarm runs with `--project NAME` were creating worktrees from ralphussy instead of project's own repo
+   - **Root Cause:** Path mismatch - `swarm_worker.sh` used `$HOME/projects` while `ralph-live` created projects in `$RALPH_DIR/projects`
+   - **Root Cause:** Projects created by `ralph-live` weren't git repos (no `.git` folder)
+   - **Root Cause:** Workers used fallback repo (ralphussy) when project directory existed but wasn't a git repo
+   - **Solution:** Align project paths to use `$RALPH_DIR/projects` consistently
+   - **Solution:** Auto-initialize git repo in existing projects if not already initialized
+   - **Solution:** Ensure `main` branch is created (rename from default `master`)
+   - **Solution:** `move_artifacts_for_run()` now merges directly into project repository (no separate `worker-1`, `worker-2` folders)
+   - **Solution:** `swarm_merge_to_project()` detects project from source_path and merges into correct location
+   - **Files Changed:**
+     - `ralph-refactor/lib/swarm_worker.sh:105` - Changed `SWARM_PROJECTS_BASE` default to `$RALPH_DIR/projects`
+     - `ralph-refactor/lib/swarm_worker.sh:121-132` - Auto-init git in existing projects
+     - `ralph-refactor/lib/swarm_artifacts.sh:50-72` - Detect project from source_path in database
+     - `ralph-refactor/lib/swarm_artifacts.sh:75-83` - Auto-init git with `main` branch in merge
+     - `ralph-refactor/ralph-live:2086-2186` - Simplified to direct merge (no separate artifacts folders)
+   - **Result:** Each project has its own independent git repository
+   - **Result:** Changes merge directly into project's `main` branch
+   - **Result:** No cross-stream between different projects or with ralphussy
+   - **Result:** Artifacts merged, not copied to separate folders
 
- ## Recent Critical Fixes
- 
-  ###1. Project Isolation & Artifact Extraction (2026-01-23)
-  - **Problem:** Workers were creating git worktrees of ralphussy, mixing swarm commits with ralphussy history
-  - **Solution:** Workers now create independent repos in `~/projects/PROJECT_NAME/`
-  - **New Feature:** `--project NAME` flag for swarming on specific projects
-  - **New Feature:** `swarm_extract_merged_artifacts()` extracts only changed files (not full project)
-  - **Fixed:** Detached HEAD worktrees now use expected swarm branch instead of HEAD for diff calculation
-  - **Fixed:** `move_artifacts_for_run()` removed old artifacts folder copy that overwrote correct extraction
-  - **Files Changed:** 
-    - `ralph-refactor/lib/swarm_worker.sh:82-150` - Project repo initialization logic
-    - `ralph-refactor/ralph-swarm:943-949` - `--project` parameter
-    - `ralph-refactor/lib/swarm_artifacts.sh:161-171,301-315` - Detached HEAD handling for extraction
-    - `ralph-refactor/ralph-live:2079-2131` - `move_artifacts_for_run()` extracts only changed files
-  - **Usage:**
-    ```bash
-    ./ralph-refactor/ralph-swarm --devplan devplan.md --project my-app
-    source ralph-refactor/lib/swarm_artifacts.sh
-    swarm_extract_merged_artifacts "RUN_ID" "/home/mojo/projects"
-    ./ralph-live  # Select 'm' to move artifacts to projects
-    ```
-  - **Result:** Worker artifacts now ~200KB instead of 1.5MB (only swarm commits, not full ralphussy)
- 
+   ###2. Worker Count Prompts (2026-01-23)
+   - **Problem:** Swarms were starting with default 2 workers without prompting user
+   - **Solution:** All swarm start operations now prompt for worker count before starting
+   - **New Feature:** `ralph-swarm --devplan PATH` prompts for workers if not specified
+   - **New Feature:** `ralph-live project_start_swarm_devplan()` prompts for workers
+   - **New Feature:** `ralph-live project_resume_swarm()` prompts for workers (allows changing from saved value)
+   - **New Feature:** `ralph-swarm --resume` accepts `--workers N` to override saved count
+   - **Files Changed:**
+     - `ralph-refactor/ralph-swarm:1308-1328` - Prompt for workers in non-interactive start
+     - `ralph-refactor/ralph-swarm:1300-1309` - Resume accepts --workers override
+     - `ralph-refactor/ralph-live:433-449` - Prompt for workers in project start
+     - `ralph-refactor/ralph-live:883-905` - Prompt for workers in project resume
+   - **Result:** User always sees "Number of workers [2]:" prompt before swarm starts
+   - **Result:** Resume operations can change worker count from previous run
+
+   ###3. Project Isolation & Artifact Extraction (2026-01-23)
+   - **Problem:** Workers were creating git worktrees of ralphussy, mixing swarm commits with ralphussy history
+   - **Solution:** Workers now create independent repos in `~/projects/PROJECT_NAME/`
+   - **New Feature:** `--project NAME` flag for swarming on specific projects
+   - **New Feature:** `swarm_extract_merged_artifacts()` extracts only changed files (not full project)
+   - **New Feature:** `swarm_merge_to_project()` merges worker branches into project's main branch
+   - **New Feature:** `ralph-live` option 'm' now prompts to merge changes into project repo
+   - **Fixed:** Detached HEAD worktrees now use expected swarm branch instead of HEAD for diff calculation
+   - **Fixed:** `move_artifacts_for_run()` removed old artifacts folder copy that overwrote correct extraction
+  - **Fixed:** Base branch detection - now uses `swarm_git_default_base_branch()` instead of hardcoded 'main'
+   - **Fixed:** Automatic branch cleanup - merged worker branches are deleted after merging
+   - **Files Changed:**
+     - `ralph-refactor/lib/swarm_worker.sh:82-150` - Project repo initialization logic
+     - `ralph-refactor/ralph-swarm:943-949` - `--project` parameter
+     - `ralph-refactor/lib/swarm_artifacts.sh:4-8,159-172,307-317` - Source swarm_git.sh, base branch detection
+     - `ralph-refactor/lib/swarm_artifacts.sh:10-110` - `swarm_merge_to_project()` function
+     - `ralph-refactor/lib/swarm_artifacts.sh:113-155` - `swarm_cleanup_branches()` function
+     - `ralph-refactor/ralph-live:2086-2185` - Automatic merge in `move_artifacts_for_run()`
+   - **Usage:**
+     ```bash
+     # Run swarm on isolated project
+     ./ralph-refactor/ralph-swarm --devplan devplan.md --project my-app --workers 2
+     
+     # Move artifacts (merges automatically into main)
+     ./ralph-live  # Select 'm' to move and merge
+     
+     # Clean up old swarm branches
+     source ralph-refactor/lib/swarm_artifacts.sh
+     cd ~/projects/ralphussy
+     swarm_cleanup_branches
+     ```
+   - **Result:** Worker artifacts now ~200KB instead of 1.5MB (only swarm commits, not full ralphussy)
+   - **Result:** Changes are AUTOMATICALLY merged into project's main branch when moving artifacts
+   - **Result:** Merged worker branches are automatically deleted to keep project clean
+   - **Result:** Changes are pushed to origin if remote is configured
+   
  ###2. JSON Text Extraction (ralph-refactor/lib/json.sh:14)
 - Fixed critical jq syntax error causing all tasks to fail
 - Now correctly extracts LAST text message containing `<promise>COMPLETE</promise>` marker
@@ -113,47 +168,70 @@
 | `ralph-refactor/lib/swarm_worker.sh:21-60` | Commit Checking | Enabled for resume |
 | `ralph-refactor/ralph-swarm:467-507` | Status Display | Formatted output |
 
-## Test Commands
- 
- ```bash
- # Run swarm on isolated project (NEW workflow)
- cd ralph-refactor
- ./ralph-swarm --devplan ../devplan.md --project warp-clone --workers 2
- 
- # Interactive mode (prompts for project name, workers, etc.)
- ./ralph-swarm --interactive
- 
- # Run with live verbosity
- SWARM_OUTPUT_MODE=live ./ralph-swarm --devplan ../devplan.md --project warp-clone --workers 2
- 
- # Resume previous run (now checks for existing commits)
- SWARM_OUTPUT_MODE=live ./ralph-swarm --resume 20260122_230145
- 
- # Extract artifacts from completed run (NEW feature)
- source lib/swarm_artifacts.sh
- export RALPH_DIR="$HOME/.ralph"
- swarm_list_runs
- swarm_extract_merged_artifacts "RUN_ID" "/home/mojo/projects"
- 
- # Run JSON extraction tests
- ./tests/test_json.sh
- ```
+ ## Test Commands
+  
+   ```bash
+  # Run swarm on isolated project (NEW workflow)
+  # Note: Will prompt "Number of workers [2]:" before starting
+  cd ralph-refactor
+  ./ralph-swarm --devplan ../devplan.md --project warp-clone
+  
+  # Run with specific worker count (no prompt)
+  ./ralph-swarm --devplan ../devplan.md --project warp-clone --workers 4
+  
+  # Interactive mode (prompts for project name, workers, etc.)
+  ./ralph-swarm --interactive
+  
+  # Run with live verbosity
+  SWARM_OUTPUT_MODE=live ./ralph-swarm --devplan ../devplan.md --project warp-clone
+  
+  # Resume previous run (now prompts for workers to allow changing)
+  SWARM_OUTPUT_MODE=live ./ralph-swarm --resume 20260122_230145
+  
+  # Move artifacts (automatically merges and cleans up)
+  ./ralph-live  # Select 'm'
+  
+  # Clean up old swarm branches (manual cleanup)
+  source ralph-refactor/lib/swarm_artifacts.sh
+  cd ~/projects/ralphussy
+  swarm_cleanup_branches
+  
+  # Run JSON extraction tests
+  ./tests/test_json.sh
+  ```
 
-## Next Steps
- 
- 1. Try alternative models for better instruction following:
-    - `opencode/gemini-3-flash`
-    - `opencode/claude-sonnet-4-5` (requires payment method)
- 
- 2. Consider dynamic timeout based on task complexity
- 
- 3. Monitor database lock errors and consider reducing to 1 worker if persistent
- 
- 4. Test artifact extraction on completed runs:
-    - Run `swarm_extract_merged_artifacts()` on a completed run
-    - Verify only changed files are extracted (not entire project)
-    - Check SWARM_SUMMARY.md for task status
-
+   ## Next Steps
+   
+    1. Clean up existing swarm branches in ralphussy (34 branches remaining):
+       ```bash
+       source ralph-refactor/lib/swarm_artifacts.sh
+       cd ~/projects/ralphussy
+       swarm_cleanup_branches
+       ```
+    
+    2. Use `--project NAME` when running swarms to avoid cross-stream with ralphussy repo:
+       - Creates independent repo at `~/projects/NAME` (empty, just devplan.md)
+       - Workers create branches like `swarm/RUN_ID/worker-N` in that project
+       - `move artifacts` (option 'm' in ralph-live) automatically merges all worker branches
+    
+    3. Test new automatic merge functionality on a new project:
+       ```bash
+       ./ralph-refactor/ralph-swarm --devplan devplan.md --project my-new-app --workers 2
+       # Wait for completion, then:
+       ./ralph-live  # Select 'm' to move and merge automatically
+       cd ~/projects/my-new-app
+       git log --oneline  # Should show merged worker commits
+       git branch -a  # Should have NO swarm branches (they were deleted)
+       ```
+    
+    4. Try alternative models for better instruction following:
+       - `opencode/gemini-3-flash`
+       - `opencode/claude-sonnet-4-5` (requires payment method)
+    
+    5. Consider dynamic timeout based on task complexity
+    
+    6. Monitor database lock errors and consider reducing to 1 worker if persistent
+   
 ---
 
 ## Archive Index
