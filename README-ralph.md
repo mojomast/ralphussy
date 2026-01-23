@@ -293,7 +293,7 @@ Make the code better
 
 ## State Files
 
-Ralph maintains state in `~/.ralph/`:
+Ralph maintains state in `~/projects/.ralph/`:
 
 - `state.json` - Current loop state
 - `history.json` - Iteration history and metrics
@@ -326,7 +326,7 @@ ralph/
 ├── ralph.config       # Configuration file
 └── README.md          # This file
 
-~/.ralph/
+~/projects/.ralph/
 ├── state.json         # Current loop state
 ├── history.json       # Iteration history
 ├── progress.md        # Progress log
@@ -349,7 +349,7 @@ export MAX_ITERATIONS=50          # Maximum iterations
 export COMPLETION_PROMISE="DONE"  # Completion tag
 export VERBOSE=true               # Verbose output
 export MODEL="claude-sonnet-4"    # Default model
-export RALPH_DIR="$HOME/.ralph"   # State directory
+export RALPH_DIR="$HOME/projects/.ralph"   # State directory
 export HANDOFF_FILE="./handoff.md" # Handoff file path
 export SIMPLE_TASK_THRESHOLD=2    # Task batching threshold
 ```

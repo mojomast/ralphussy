@@ -4,11 +4,12 @@
 2026-01-23
 
 ## Current Status
- 
+
   The ralph-live system has been extensively debugged and improved. The swarm functionality is now operational with proper:
-  
-  - **Worker Prompts:** All swarm start operations now prompt for worker count before starting
-  - **Project Isolation:** Swarms create independent repos in `$RALPH_DIR/projects/PROJECT_NAME/` (not ralphussy worktrees)
+
+   - **RALPH_DIR Relocation:** Default state directory changed from `~/.ralph` to `~/projects/.ralph` to consolidate all Ralph-related state within the projects folder
+   - **Worker Prompts:** All swarm start operations now prompt for worker count before starting
+   - **Project Isolation:** Swarms create independent repos in `$RALPH_DIR/projects/PROJECT_NAME/` (not ralphussy worktrees)
   - **Git Repository Initialization:** Auto-initializes git repos in projects created by `ralph-live`
   - **Direct Merge:** Changes merge directly into project's `main` branch (no separate worker folders)
   - **Branch Cleanup:** Merged worker branches are automatically deleted after merging

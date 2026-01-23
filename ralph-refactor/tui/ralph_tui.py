@@ -62,7 +62,7 @@ except Exception:  # pragma: no cover
     awatch = None
 
 # Configuration
-RALPH_DIR = Path(os.environ.get("RALPH_DIR", Path.home() / ".ralph"))
+RALPH_DIR = Path(os.environ.get("RALPH_DIR", Path.home() / "projects" / ".ralph"))
 # Projects should be in ~/projects not ~/.ralph/projects
 PROJECTS_DIR = Path(os.environ.get("SWARM_PROJECTS_BASE", Path.home() / "projects"))
 SWARM_DB = RALPH_DIR / "swarm.db"

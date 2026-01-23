@@ -19,7 +19,7 @@ class RalphCLI {
   private historyFile: string;
 
   constructor() {
-    this.stateDir = '.ralph';
+    this.stateDir = 'projects/.ralph';
     this.progressFile = path.join(this.stateDir, 'progress.md');
     this.historyFile = path.join(this.stateDir, 'history.json');
   }

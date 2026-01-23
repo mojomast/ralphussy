@@ -177,7 +177,7 @@ export class SwarmDatabase {
   }
 
   getRecentLogs(runId: string, limit: number = 20): Array<{ worker_num: string; log_line: string; timestamp: number }> {
-    const ralphDir = process.env.RALPH_DIR || path.join(process.env.HOME || '', '.ralph');
+    const ralphDir = process.env.RALPH_DIR || path.join(process.env.HOME || '', 'projects', '.ralph');
     const runDir = path.join(ralphDir, 'swarm', 'runs', runId);
     const logs: Array<{ worker_num: string; log_line: string; timestamp: number }> = [];
 
@@ -228,7 +228,7 @@ export class SwarmDatabase {
 }
 
 export function getSwarmDatabasePath(): string {
-  const ralphDir = process.env.RALPH_DIR || path.join(process.env.HOME || '', '.ralph');
+  const ralphDir = process.env.RALPH_DIR || path.join(process.env.HOME || '', 'projects', '.ralph');
   return path.join(ralphDir, 'swarm.db');
 }
 

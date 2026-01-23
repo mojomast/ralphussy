@@ -189,7 +189,7 @@ export class SwarmDatabase {
 }
 
 export function getSwarmDatabasePath(): string {
-  const ralphDir = process.env.RALPH_DIR || path.join(process.env.HOME || '', '.ralph');
+  const ralphDir = process.env.RALPH_DIR || path.join(process.env.HOME || '', 'projects', '.ralph');
   return path.join(ralphDir, 'swarm.db');
 }
 

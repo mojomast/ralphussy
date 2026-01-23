@@ -88,7 +88,7 @@ SWARM_OUTPUT_MODE=live \
 ./ralph-refactor/ralph-swarm --devplan ralph-refactor/tests/devplan_complex.md --workers 2
 ```
 
-- `RALPH_DIR` points at state/log/run artifacts (default: `~/.ralph`).
+- `RALPH_DIR` points at state/log/run artifacts (default: `~/projects/.ralph`).
 - Default model is `zai-coding-plan/glm-4.7` (set in `lib/core.sh`).
 - Override provider/model via `RALPH_LLM_PROVIDER` and `RALPH_LLM_MODEL`.
 - Ensure `opencode` is installed and configured.

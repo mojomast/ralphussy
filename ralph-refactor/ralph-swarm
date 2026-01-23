@@ -5,7 +5,7 @@ set -euo pipefail
 __RALPH_SWARM_DIR__="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Ensure we have a sane default RALPH_DIR even if the caller didn't set it.
-RALPH_DIR="${RALPH_DIR:-$HOME/.ralph}"
+RALPH_DIR="${RALPH_DIR:-$HOME/projects/.ralph}"
 
 # Load the main ralph core helpers (logging, dependency checks, etc.) if present.
 # Note: in this repo, core.sh lives at ralph-refactor/lib/core.sh.

@@ -137,10 +137,10 @@ The TUI allows you to:
  After a swarm run completes, extract the merged results:
  
  ```bash
- # List all swarm runs
- source ralph-refactor/lib/swarm_artifacts.sh
- export RALPH_DIR="$HOME/.ralph"
- swarm_list_runs
+  # List all swarm runs
+  source ralph-refactor/lib/swarm_artifacts.sh
+  export RALPH_DIR="$HOME/projects/.ralph"
+  swarm_list_runs
  
  # Extract artifacts (only changes, not full project)
  swarm_extract_merged_artifacts "RUN_ID" "/home/mojo/projects"

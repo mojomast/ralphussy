@@ -11,7 +11,7 @@ RALPH_CORE_LOADED=1
 # ---------------------------------------------------------------------------
 # Configuration
 
-RALPH_DIR="${RALPH_DIR:-$HOME/.ralph}"
+RALPH_DIR="${RALPH_DIR:-$HOME/projects/.ralph}"
 STATE_FILE="$RALPH_DIR/state.json"
 HISTORY_FILE="$RALPH_DIR/history.json"
 LOG_DIR="$RALPH_DIR/logs"
