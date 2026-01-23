@@ -1,0 +1,26 @@
+{
+  "name": "swarm-dashboard",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Real-time OpenTUI dashboard for Ralph swarm monitoring",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/index.tsx",
+    "start": "bun run dist/index.js",
+    "start:simple": "bun run dist/simple.js"
+  },
+  "keywords": ["swarm", "dashboard", "opentui", "ralph", "monitoring"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@opentui/core": "^0.1.74",
+    "@opentui/react": "^0.1.74"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.10.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
