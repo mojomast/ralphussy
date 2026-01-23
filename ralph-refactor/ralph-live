@@ -2078,14 +2078,45 @@ move_artifacts_for_run() {
 
         if [ -d "$worker_dir/repo" ]; then
             local repo_dir="$worker_dir/repo"
-            if command -v rsync >/dev/null 2>&1; then
-                rsync -a --exclude='.git' --exclude='node_modules' "$repo_dir"/ "$dest_worker/" 2>/dev/null || true
-            else
-                cp -a "$repo_dir"/. "$dest_worker/" 2>/dev/null || true
+            
+            local branch_name
+            branch_name=$(git -C "$repo_dir" rev-parse --abbrev-ref HEAD 2>/dev/null)
+            
+            local target_branch="$branch_name"
+            if [ "$branch_name" = "HEAD" ]; then
+                local expected_branch="swarm/${run_id}/${worker_name}"
+                if git -C "$repo_dir" show-ref --verify --quiet "refs/heads/$expected_branch" 2>/dev/null; then
+                    target_branch="$expected_branch"
+                else
+                    target_branch=$(git -C "$repo_dir" rev-parse HEAD 2>/dev/null)
+                fi
             fi
-
-            if [ -d "$repo_dir/.git" ]; then
-                git -C "$repo_dir" log --oneline -n 100 > "$dest_worker/commits.txt" 2>/dev/null || true
+            
+            if [ -n "$target_branch" ]; then
+                local base_commit
+                base_commit=$(git -C "$repo_dir" merge-base main "$target_branch" 2>/dev/null)
+                
+                if [ -n "$base_commit" ]; then
+                    local changed_files
+                    changed_files=$(git -C "$repo_dir" diff --name-only "${base_commit}..${target_branch}" 2>/dev/null)
+                    
+                    if [ -n "$changed_files" ]; then
+                        while IFS= read -r file; do
+                            if [ -n "$file" ]; then
+                                local src_file="${repo_dir}/${file}"
+                                local dst_file="${dest_worker}/${file}"
+                                mkdir -p "$(dirname "$dst_file")" 2>/dev/null || true
+                                if [ -f "$src_file" ]; then
+                                    cp "$src_file" "$dst_file" 2>/dev/null || true
+                                fi
+                            fi
+                        done <<< "$changed_files"
+                        
+                        echo "$changed_files" > "$dest_worker/files.txt" 2>/dev/null || true
+                    fi
+                    
+                    git -C "$repo_dir" log --name-status --oneline "${base_commit}..${target_branch}" > "$dest_worker/commits.txt" 2>/dev/null || true
+                fi
             fi
         fi
 
@@ -2094,11 +2125,6 @@ move_artifacts_for_run() {
             cp -a "$worker_dir"/logs/* "$dest_worker/logs/" 2>/dev/null || true
         fi
     done
-
-    if [ -d "$run_dir/artifacts" ]; then
-        echo -e "  ${CYAN}Copying${NC} artifacts folder..."
-        cp -a "$run_dir/artifacts"/. "$dest_dir/" 2>/dev/null || true
-    fi
 
     local summary_file="$dest_dir/SWARM_SUMMARY.md"
     {

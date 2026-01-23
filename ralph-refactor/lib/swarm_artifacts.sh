@@ -159,10 +159,17 @@ swarm_extract_merged_artifacts() {
             swarm_commit_count=$(git -C "$repo_dir" log --oneline "${base_commit}..${branch_name}" 2>/dev/null | wc -l)
             head_ref="$branch_name"
         else
-            head_ref=$(git -C "$repo_dir" rev-parse HEAD 2>/dev/null)
-            if [ -n "$head_ref" ]; then
-                base_commit=$(git -C "$repo_dir" merge-base main HEAD 2>/dev/null)
-                swarm_commit_count=$(git -C "$repo_dir" log --oneline "${base_commit}..HEAD" 2>/dev/null | wc -l)
+            local expected_branch="swarm/${run_id}/${worker_name}"
+            if git -C "$repo_dir" show-ref --verify --quiet "refs/heads/$expected_branch" 2>/dev/null; then
+                head_ref="$expected_branch"
+                base_commit=$(git -C "$repo_dir" merge-base main "$head_ref" 2>/dev/null)
+                swarm_commit_count=$(git -C "$repo_dir" log --oneline "${base_commit}..${head_ref}" 2>/dev/null | wc -l)
+            else
+                head_ref=$(git -C "$repo_dir" rev-parse HEAD 2>/dev/null)
+                if [ -n "$head_ref" ]; then
+                    base_commit=$(git -C "$repo_dir" merge-base main HEAD 2>/dev/null)
+                    swarm_commit_count=$(git -C "$repo_dir" log --oneline "${base_commit}..HEAD" 2>/dev/null | wc -l)
+                fi
             fi
         fi
         
@@ -294,14 +301,22 @@ EOF
             if [ -d "$repo_dir" ] && git -C "$repo_dir" rev-parse --git-dir >/dev/null 2>&1; then
                 branch_name=$(git -C "$repo_dir" rev-parse --abbrev-ref HEAD 2>/dev/null)
                 
-                if git -C "$repo_dir" show-ref --verify --quiet "refs/heads/$branch_name" 2>/dev/null; then
-                    base_commit=$(git -C "$repo_dir" merge-base main "$branch_name" 2>/dev/null)
-                    swarm_commit_count=$(git -C "$repo_dir" log --oneline "${base_commit}..${branch_name}" 2>/dev/null | wc -l)
+                local target_branch="$branch_name"
+                if [ "$branch_name" = "HEAD" ]; then
+                    local expected_branch="swarm/${run_id}/${worker_name}"
+                    if git -C "$repo_dir" show-ref --verify --quiet "refs/heads/$expected_branch" 2>/dev/null; then
+                        target_branch="$expected_branch"
+                    fi
+                fi
+                
+                if [ "$target_branch" != "HEAD" ] && git -C "$repo_dir" show-ref --verify --quiet "refs/heads/$target_branch" 2>/dev/null; then
+                    base_commit=$(git -C "$repo_dir" merge-base main "$target_branch" 2>/dev/null)
+                    swarm_commit_count=$(git -C "$repo_dir" log --oneline "${base_commit}..${target_branch}" 2>/dev/null | wc -l)
                     
                     if [ "$swarm_commit_count" -gt 0 ]; then
                         echo "### $worker_name ($swarm_commit_count commits)"
                         echo
-                        git -C "$repo_dir" log --name-status --oneline "${base_commit}..${branch_name}" 2>/dev/null || true
+                        git -C "$repo_dir" log --name-status --oneline "${base_commit}..${target_branch}" 2>/dev/null || true
                         echo
                     fi
                 fi

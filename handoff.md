@@ -21,21 +21,26 @@
 
  ## Recent Critical Fixes
  
- ###1. Project Isolation & Artifact Extraction (2026-01-23)
- - **Problem:** Workers were creating git worktrees of ralphussy, mixing swarm commits with ralphussy history
- - **Solution:** Workers now create independent repos in `~/projects/PROJECT_NAME/`
- - **New Feature:** `--project NAME` flag for swarming on specific projects
- - **New Feature:** `swarm_extract_merged_artifacts()` extracts only changed files (not full project)
- - **Files Changed:** 
-   - `ralph-refactor/lib/swarm_worker.sh:82-150` - Project repo initialization logic
-   - `ralph-refactor/ralph-swarm:943-949` - `--project` parameter
-   - `ralph-refactor/lib/swarm_artifacts.sh:76-320` - Artifact extraction function
- - **Usage:**
-   ```bash
-   ./ralph-refactor/ralph-swarm --devplan devplan.md --project my-app
-   source ralph-refactor/lib/swarm_artifacts.sh
-   swarm_extract_merged_artifacts "RUN_ID" "/home/mojo/projects"
-   ```
+  ###1. Project Isolation & Artifact Extraction (2026-01-23)
+  - **Problem:** Workers were creating git worktrees of ralphussy, mixing swarm commits with ralphussy history
+  - **Solution:** Workers now create independent repos in `~/projects/PROJECT_NAME/`
+  - **New Feature:** `--project NAME` flag for swarming on specific projects
+  - **New Feature:** `swarm_extract_merged_artifacts()` extracts only changed files (not full project)
+  - **Fixed:** Detached HEAD worktrees now use expected swarm branch instead of HEAD for diff calculation
+  - **Fixed:** `move_artifacts_for_run()` removed old artifacts folder copy that overwrote correct extraction
+  - **Files Changed:** 
+    - `ralph-refactor/lib/swarm_worker.sh:82-150` - Project repo initialization logic
+    - `ralph-refactor/ralph-swarm:943-949` - `--project` parameter
+    - `ralph-refactor/lib/swarm_artifacts.sh:161-171,301-315` - Detached HEAD handling for extraction
+    - `ralph-refactor/ralph-live:2079-2131` - `move_artifacts_for_run()` extracts only changed files
+  - **Usage:**
+    ```bash
+    ./ralph-refactor/ralph-swarm --devplan devplan.md --project my-app
+    source ralph-refactor/lib/swarm_artifacts.sh
+    swarm_extract_merged_artifacts "RUN_ID" "/home/mojo/projects"
+    ./ralph-live  # Select 'm' to move artifacts to projects
+    ```
+  - **Result:** Worker artifacts now ~200KB instead of 1.5MB (only swarm commits, not full ralphussy)
  
  ###2. JSON Text Extraction (ralph-refactor/lib/json.sh:14)
 - Fixed critical jq syntax error causing all tasks to fail
