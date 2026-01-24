@@ -594,13 +594,70 @@ swarm_extract_merged_artifacts() {
                     if [ -f "$src_file" ]; then
                         # Check for conflicts: if file exists and differs, warn
                         if [ -f "$dst_file" ]; then
-                            if ! cmp -s "$src_file" "$dst_file"; then
-                                echo "  ⚠️  CONFLICT: $file modified by multiple workers, using latest version"
-                                # TODO: Implement 3-way merge here
+                            if cmp -s "$src_file" "$dst_file"; then
+                                # identical, nothing to do
+                                :
+                            else
+                                echo "  ⚠️  CONFLICT: $file modified by multiple workers, attempting 3-way merge"
+
+                                # Prepare temp files
+                                base_tmp=""
+                                merged_tmp="$(mktemp)"
+
+                                # Try to obtain base version from worker repo if available
+                                if [ -n "${base_commit:-}" ]; then
+                                    base_tmp="$(mktemp)"
+                                    # If base commit has the file, write it; otherwise remove base_tmp
+                                    if git -C "$repo_dir" show "${base_commit}:$file" > "$base_tmp" 2>/dev/null; then
+                                        :
+                                    else
+                                        rm -f "$base_tmp" || true
+                                        base_tmp=""
+                                    fi
+                                fi
+
+                                # Attempt git merge-file (produces conflict markers on conflict)
+                                if [ -n "$base_tmp" ] && command -v git >/dev/null 2>&1; then
+                                    if git merge-file -p --marker-size=7 "$dst_file" "$base_tmp" "$src_file" > "$merged_tmp" 2>/dev/null; then
+                                        mv "$merged_tmp" "$dst_file" || true
+                                        echo "  ✓ 3-way merge applied: $file"
+                                    else
+                                        # git merge-file exits non-zero on conflicts but still writes merged output
+                                        mv "$merged_tmp" "$dst_file" || true
+                                        echo "  ⚠️  Merge produced conflicts (markers added) for: $file"
+                                    fi
+                                else
+                                    # No base available or git missing: fallback to diff3 if present
+                                    if command -v diff3 >/dev/null 2>&1 && [ -n "$base_tmp" ]; then
+                                        if diff3 -m "$dst_file" "$base_tmp" "$src_file" > "$merged_tmp" 2>/dev/null; then
+                                            mv "$merged_tmp" "$dst_file" || true
+                                            echo "  ✓ 3-way merge (diff3) applied: $file"
+                                        else
+                                            mv "$merged_tmp" "$dst_file" || true
+                                            echo "  ⚠️  diff3 produced conflicts (markers added) for: $file"
+                                        fi
+                                    else
+                                        # Worst-case: insert conflict markers with both versions preserved
+                                        {
+                                            echo "<<<<<<< WORKER_VERSION"
+                                            cat "$src_file"
+                                            echo "======="
+                                            cat "$dst_file"
+                                            echo ">>>>>>> PROJECT_VERSION"
+                                        } > "$merged_tmp" || true
+                                        mv "$merged_tmp" "$dst_file" || true
+                                        echo "  ⚠️  No base available; conflict markers inserted for: $file"
+                                    fi
+                                fi
+
+                                # Cleanup
+                                [ -n "$base_tmp" ] && rm -f "$base_tmp" || true
+                                [ -f "$merged_tmp" ] && rm -f "$merged_tmp" >/dev/null 2>&1 || true
                             fi
+                        else
+                            # Destination does not exist - straightforward copy
+                            cp "$src_file" "$dst_file" 2>/dev/null || true
                         fi
-                        
-                        cp "$src_file" "$dst_file" 2>/dev/null || true
                     fi
                 fi
             done <<< "$changed_files"
@@ -845,4 +902,3 @@ EOF
 }
 
 export -f swarm_list_runs 2>/dev/null || true
-

@@ -26,6 +26,42 @@ swarm_git_default_base_branch() {
     printf '%s' "master"
 }
 
+
+# Ensure local default branch exists and normalize master -> main when safe.
+# This performs a local rename only; it will not push or change remotes.
+# If SWARM_BASE_BRANCH is set, that value takes precedence.
+swarm_git_normalize_default_branch() {
+    local desired
+    desired=$(swarm_git_default_base_branch)
+
+    # If env override present, honor it
+    if [ -n "${SWARM_BASE_BRANCH:-}" ]; then
+        desired="$SWARM_BASE_BRANCH"
+    fi
+
+    # If desired branch exists locally, prefer it.
+    if git show-ref --verify --quiet "refs/heads/$desired"; then
+        echo "Using existing base branch: $desired"
+        return 0
+    fi
+
+    # If desired doesn't exist but master exists and desired is 'main', rename master -> main locally.
+    if [ "$desired" = "main" ] && git show-ref --verify --quiet "refs/heads/master"; then
+        echo "Normalizing default branch: renaming local 'master' -> 'main'"
+        git branch -m master main || {
+            echo "Warning: failed to rename master -> main"
+            return 1
+        }
+        return 0
+    fi
+
+    # If desired missing and master missing, fall back to current branch
+    local current
+    current=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+    echo "Falling back to current branch: ${current:-master}"
+    return 0
+}
+
 swarm_git_create_worker_branch() {
     local run_id="$1"
     local worker_num="$2"

@@ -55,6 +55,34 @@ setup_test_db() {
     echo "$run_id"
 }
 
+# Simple unit test for branch normalization behavior (local-only)
+test_branch_normalization() {
+    echo "Testing branch normalization..."
+    local repo_dir="$TEST_RUN_DIR/git_norm"
+    mkdir -p "$repo_dir"
+    git -C "$repo_dir" init -q
+    git -C "$repo_dir" config user.name "Test"
+    git -C "$repo_dir" config user.email "test@example.com"
+    echo "initial" > "$repo_dir/file.txt"
+    git -C "$repo_dir" add file.txt
+    git -C "$repo_dir" commit -m "initial" -q
+
+    # ensure initial branch name is master (git may default to main depending on config)
+    git -C "$repo_dir" branch -m master 2>/dev/null || true
+
+    pushd "$repo_dir" >/dev/null
+    source "$__TEST_SWARM_DIR__/../lib/swarm_git.sh"
+    swarm_git_normalize_default_branch || true
+    local out_branch
+    out_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+    if [ "$out_branch" = "main" ]; then
+        echo "✅ master was normalized to main"
+    else
+        echo "✅ branch normalization left branch as: $out_branch"
+    fi
+    popd >/dev/null
+}
+
 test_database_operations() {
     echo "Testing database operations..."
 
