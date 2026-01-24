@@ -350,54 +350,42 @@ export class SwarmDashboard {
   private updateWorkers(runId: string) {
     const workers = this.db.getWorkersByRun(runId);
     const workersList = this.renderer.root.findDescendantById('workers-list');
-    if (!workersList)
-      return;
+    if (!workersList) return;
 
+    // Build mapping of tasks by id for quick lookup
+    const allTasks = this.db.getTasksByRun(runId);
+    const taskById = new Map<number, any>();
+    for (const t of allTasks) taskById.set(t.id, t);
+
+    // Build stable worker lines (include branch and task first line). We'll
+    // render a window slice to avoid modifying nodes while scrolling.
+    const workerLines: Array<{ content: string; fg: string }> = [];
+    workers.forEach((worker, index) => {
+      const statusColor = this.getStatusColor(worker.status);
+      const statusIcon = this.getStatusIcon(worker.status);
+      const assignedTaskId = worker.current_task_id ?? (allTasks.find(t => t.worker_id === worker.id)?.id ?? null);
+      const taskName = assignedTaskId ? (String(taskById.get(assignedTaskId)?.task_text || '').split('\n')[0] || '') : '';
+      const branch = worker.branch_name ? ` ${worker.branch_name}` : '';
+      const parts = [`${index + 1}. W${worker.worker_num.toString().padStart(2)}`, statusIcon, worker.status];
+      if (assignedTaskId) parts.push(`[T#${assignedTaskId}]`);
+      if (branch) parts.push(branch);
+      if (taskName) parts.push('-', taskName);
+      workerLines.push({ content: parts.join(' '), fg: statusColor });
+    });
+
+    // Clear and render visible window
     while (workersList.getChildrenCount() > 0) {
       const child = workersList.getChildren()[0];
       workersList.remove(child.id);
     }
-
-    // Resiliency: some DB updates set task.worker_id but may not update
-    // workers.current_task_id immediately. Build a mapping from tasks so
-    // we can display accurate live activity.
-    const allTasks = this.db.getTasksByRun(runId);
-    const inProgressByWorker = new Map<number, any>();
-    for (const t of allTasks) {
-      if (t.status === 'in_progress' && t.worker_id) {
-        inProgressByWorker.set(t.worker_id, t);
-      }
-    }
-
-    workers.forEach((worker, index) => {
-      const statusColor = this.getStatusColor(worker.status);
-      const statusIcon = this.getStatusIcon(worker.status);
-
-      // Prefer the worker.current_task_id, but fall back to tasks table mapping
-      const assignedTaskId = worker.current_task_id || (inProgressByWorker.get(worker.id)?.id ?? null);
-
-      const workerText = Text({
-        id: `worker-${worker.id}`,
-        // Compact single-line worker display; full activity is shown in Actions panel
-        content: `${index + 1}. W${worker.worker_num.toString().padStart(2)} ${statusIcon} ${worker.status}${assignedTaskId ? ' [' + 'T#' + assignedTaskId + ']' : ''}`,
-        fg: statusColor,
-        position: 'relative',
-      });
-
-      workersList.add(workerText);
+    const wOff = this.paneOffsets.workers || 0;
+    const wWindow = workerLines.slice(wOff, wOff + this.pageSize);
+    wWindow.forEach((l, idx) => {
+      workersList.add(Text({ id: `worker-line-${idx}-${wOff}`, content: l.content, fg: l.fg, position: 'relative' }));
     });
 
-    // Apply simple scrolling: hide top N entries based on paneOffsets.workers
-    const offset = this.paneOffsets.workers || 0;
-    // If offset > 0, remove first `offset` children so the pane appears scrolled
-    for (let i = 0; i < offset; i++) {
-      if (workersList.getChildrenCount() > 0) {
-        const child = workersList.getChildren()[0];
-        workersList.remove(child.id);
-      }
-    }
-
-    // Populate the actions panel with any worker current task info
+    // Actions pane: show recent log lines (activity stream). Do not include
+    // branch/path here — leave that for the workers pane.
     const actionsList = this.renderer.root.findDescendantById('actions-list');
     if (actionsList) {
       while (actionsList.getChildrenCount() > 0) {
@@ -405,29 +393,19 @@ export class SwarmDashboard {
         actionsList.remove(child.id);
       }
 
-      // Show live tasks / actions from workers (use assignedTaskId mapping)
-      workers.forEach((worker) => {
-        const assigned = worker.current_task_id || (inProgressByWorker.get(worker.id)?.id ?? null);
-        const taskDesc = assigned ? `Task:${assigned}` : 'Idle';
-        const branch = worker.branch_name ? ` ${worker.branch_name}` : '';
-        const actionContent = `W${worker.worker_num}  ${taskDesc}${branch}`;
-        const actionText = Text({
-          id: `action-${worker.id}`,
-          content: actionContent,
-          fg: '#c9d1d9',
-          position: 'relative',
-        });
-        actionsList.add(actionText);
-      });
-
-      // Simple scrolling for actions pane
-      const aOff = this.paneOffsets.actions || 0;
-      for (let i = 0; i < aOff; i++) {
-        if (actionsList.getChildrenCount() > 0) {
-          const child = actionsList.getChildren()[0];
-          actionsList.remove(child.id);
-        }
+      const logs = this.db.getRecentLogs(runId, 200);
+      const actionLines: Array<{ content: string; fg: string }> = [];
+      for (const log of logs) {
+        const clean = String(log.log_line).replace(/\x1b\[[0-9;]*m/g, '').trim();
+        if (!clean) continue;
+        actionLines.push({ content: `W${log.worker_num.padStart(2)}  ${clean}`, fg: this.getLogColor(clean) });
       }
+
+      const aOff = this.paneOffsets.actions || 0;
+      const aWindow = actionLines.slice(aOff, aOff + this.pageSize);
+      aWindow.forEach((l, idx) => {
+        actionsList.add(Text({ id: `action-line-${idx}-${aOff}`, content: l.content, fg: l.fg, position: 'relative' }));
+      });
     }
   }
 
