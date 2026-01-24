@@ -135,22 +135,39 @@ swarm_cleanup_orphaned_opencode() {
 swarm_emergency_stop() {
     echo "EMERGENCY STOP - Killing all swarm workers..."
 
-    # Kill all processes in the process group
-    local pgid=$$
+    # Send SIGTERM first for graceful shutdown
     if command -v pgrep >/dev/null 2>&1; then
-        # Find all swarm worker processes
         pgrep -f "swarm_worker" 2>/dev/null | while read -r pid; do
-            echo "Killing worker process: $pid"
-            kill "$pid" 2>/dev/null || true
+            echo "Stopping worker process: $pid (SIGTERM)"
+            kill -TERM "$pid" 2>/dev/null || true
         done
     fi
 
-    # Kill all workers in database
+    # Wait up to 10 seconds for graceful shutdown
+    echo "Waiting for workers to shut down gracefully..."
+    local wait_count=0
+    while [ $wait_count -lt 10 ]; do
+        local remaining
+        remaining=$(pgrep -f "swarm_worker" 2>/dev/null | wc -l)
+        if [ "$remaining" -eq 0 ]; then
+            echo "All workers shut down gracefully"
+            break
+        fi
+        sleep 1
+        wait_count=$((wait_count + 1))
+    done
+
+    # Force kill any remaining workers
+    pgrep -f "swarm_worker" 2>/dev/null | while read -r pid; do
+        echo "Force killing stubborn worker: $pid (SIGKILL)"
+        kill -KILL "$pid" 2>/dev/null || true
+    done
+
+    # Kill all workers in database as backup
     swarm_db_get_all_active_workers 2>/dev/null | while IFS='|' read -r id run_id worker_num pid branch_name status current_task_id started_at last_heartbeat worker_status; do
         [ -z "$pid" ] && continue
-        echo "Killing worker $worker_num (PID: $pid)..."
-        kill "$pid" 2>/dev/null || true
-        kill -9 "$pid" 2>/dev/null || true
+        # These should already be dead from above, but just in case
+        kill -KILL "$pid" 2>/dev/null || true
     done
 
     # Clean up registry
@@ -292,18 +309,21 @@ PY
         echo "Timeout: $timeout_seconds seconds"
         echo ""
 
-        # Resume the run
-        swarm_db_resume_run "$run_id_result" >/dev/null
+        # Resume the run using the FIXED swarm_db_resume_run function
+        if ! swarm_db_resume_run "$run_id_result"; then
+            echo "Failed to resume run: $run_id_result"
+            rm -f "$task_list_file"
+            return 1
+        fi
 
-        # Update the started_at timestamp for proper timeout calculation
-        # Use a transaction to avoid "database is locked" errors
-        sqlite3 "$RALPH_DIR/swarm.db" <<EOF
-BEGIN TRANSACTION;
- UPDATE swarm_runs SET status = 'running', started_at = datetime('now') WHERE run_id = '$run_id_result';
- UPDATE workers SET status = 'stopped', current_task_id = NULL WHERE run_id = '$run_id_result';
- UPDATE tasks SET status = 'pending', worker_id = NULL, started_at = NULL WHERE run_id = '$run_id_result' AND status = 'in_progress';
- COMMIT;
-EOF
+        # Update worker count if it changed
+        local old_worker_count
+        old_worker_count=$(sqlite3 "$RALPH_DIR/swarm.db" "SELECT worker_count FROM swarm_runs WHERE run_id = '$run_id_result';")
+
+        if [ "$worker_count" != "$old_worker_count" ]; then
+            echo "Updating worker count from $old_worker_count to $worker_count"
+            sqlite3 "$RALPH_DIR/swarm.db" "UPDATE swarm_runs SET worker_count = $worker_count WHERE run_id = '$run_id_result';"
+        fi
 
         echo "Run ID: $run_id_result"
         
@@ -375,7 +395,14 @@ PY
             fi
 
             task_id=$(swarm_db_add_task "$run_id_result" "$task_text" "[]" "$devplan_line" "$priority")
-            echo "Added task $task_id: $task_text"
+            
+            if [ "$task_id" = "SKIPPED" ]; then
+                echo "Skipped already-completed task: $task_text"
+                # Increment completed_tasks count instead
+                sqlite3 "$RALPH_DIR/swarm.db" "UPDATE swarm_runs SET completed_tasks = completed_tasks + 1 WHERE run_id = '$run_id_result';"
+            else
+                echo "Added task $task_id: $task_text"
+            fi
 
             current_priority=$((current_priority + 1))
         done

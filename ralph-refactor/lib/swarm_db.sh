@@ -36,12 +36,18 @@ swarm_db_init() {
 
     # sqlite3 prints the new journal mode for PRAGMA journal_mode=WAL on some
     # builds; silence init output to keep tests clean.
-    sqlite3 "$db_path" >/dev/null <<'EOF'
-  PRAGMA journal_mode=WAL;
-  PRAGMA synchronous=NORMAL;
-  PRAGMA foreign_keys=ON;
-  PRAGMA busy_timeout=30000;
-  PRAGMA wal_autocheckpoint=1000;
+     sqlite3 "$db_path" >/dev/null <<'EOF'
+   PRAGMA journal_mode=WAL;
+   PRAGMA synchronous=NORMAL;
+   PRAGMA foreign_keys=ON;
+   PRAGMA busy_timeout=120000;        # INCREASED: 120 seconds (was 30)
+   PRAGMA wal_autocheckpoint=1000;
+   
+   # Additional performance optimizations for high concurrency
+   PRAGMA cache_size=-64000;          # 64MB cache (negative = KB)
+   PRAGMA temp_store=MEMORY;          # Use RAM for temp tables
+   PRAGMA mmap_size=268435456;        # 256MB memory-mapped I/O
+   PRAGMA page_size=4096;             # Larger page size for better perf
 
 CREATE TABLE IF NOT EXISTS swarm_runs (
     id INTEGER PRIMARY KEY,
@@ -109,6 +115,17 @@ CREATE TABLE IF NOT EXISTS workers (
  CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(run_id, status);
  CREATE INDEX IF NOT EXISTS idx_workers_status ON workers(run_id, status);
  CREATE INDEX IF NOT EXISTS idx_file_locks_worker ON file_locks(worker_id);
+
+ -- Prevent multiple workers from claiming same task
+ CREATE UNIQUE INDEX IF NOT EXISTS idx_task_in_progress 
+   ON tasks(id) 
+   WHERE status = 'in_progress';
+
+ -- Performance indexes for faster queries
+ CREATE INDEX IF NOT EXISTS idx_tasks_hash ON tasks(task_hash);
+ CREATE INDEX IF NOT EXISTS idx_completed_tasks_source ON completed_tasks(source_hash, task_hash);
+ CREATE INDEX IF NOT EXISTS idx_workers_run_status ON workers(run_id, status);
+ CREATE INDEX IF NOT EXISTS idx_tasks_run_status_priority ON tasks(run_id, status, priority);
 
  -- Optional cost tracking for OpenCode runs (best-effort; some providers may not report cost).
  CREATE TABLE IF NOT EXISTS task_costs (
@@ -303,14 +320,29 @@ swarm_db_add_task() {
     local devplan_line="$4"
     local priority="${5:-0}"
 
-    # Insert task and update run atomically, returning the new task id
+    # Calculate task hash for deduplication
+    local task_hash
+    task_hash=$(printf '%s' "$task_text" | sha256sum | cut -d' ' -f1)
+
+    # Check if this exact task already exists in completed_tasks
+    local already_completed
+    already_completed=$(swarm_db_is_task_completed "$task_hash")
+    
+    if [ "$already_completed" = "yes" ]; then
+        echo "Task already completed in previous run, skipping: $task_text" >&2
+        # Return a special marker instead of task_id
+        echo "SKIPPED"
+        return 0
+    fi
+
+    # Insert task with hash
     local task_id
     task_id=$(sqlite3 "$db_path" <<EOF
 BEGIN TRANSACTION;
 INSERT INTO tasks (
-    run_id, task_text, status, priority, estimated_files, devplan_line, created_at
+    run_id, task_text, task_hash, status, priority, estimated_files, devplan_line, created_at
 ) VALUES (
-    '$run_id', '$task_text', 'pending', $priority, '$estimated_files', $devplan_line, datetime('now')
+    '$run_id', '$task_text', '$task_hash', 'pending', $priority, '$estimated_files', $devplan_line, datetime('now')
 );
 -- Recalculate total_tasks to avoid relying on incremental updates
 UPDATE swarm_runs
@@ -324,7 +356,7 @@ EOF
     echo "$task_id"
 }
 
- swarm_db_claim_task() {
+swarm_db_claim_task() {
     local db_path="$RALPH_DIR/swarm.db"
     local worker_id="$1"
 
@@ -359,23 +391,37 @@ EOF
 )
 
         local exit_code=$?
+        
+        # If claim succeeded, verify we actually got the task
         if [ $exit_code -eq 0 ] && [ -n "$task_id" ]; then
-            break
+            # VERIFICATION: Check that WE are the worker assigned to this task
+            local assigned_worker
+            assigned_worker=$(sqlite3 "$db_path" "SELECT worker_id FROM tasks WHERE id = $task_id AND status = 'in_progress';")
+            
+            if [ "$assigned_worker" = "$worker_id" ]; then
+                # Success! We own this task
+                break
+            else
+                # Race condition: another worker grabbed it between our update and verify
+                echo "[RACE] Worker $worker_id lost race for task $task_id to worker $assigned_worker" >&2
+                task_id=""
+            fi
         fi
 
         retry_count=$((retry_count + 1))
         if [ $retry_count -lt $max_retries ]; then
             sleep $retry_delay
-            retry_delay=$(awk "BEGIN {print $retry_delay * 2}")
+            retry_delay=$(awk "BEGIN {print $retry_delay * 1.5}")  # Exponential backoff
         fi
     done
 
     if [ -z "$task_id" ]; then
-        # No pending tasks available.
+        # No pending tasks available after retries
         echo ""
         return 0
     fi
 
+    # Fetch task details
     task_text=$(sqlite3 "$db_path" "SELECT task_text FROM tasks WHERE id = $task_id")
     estimated_files=$(sqlite3 "$db_path" "SELECT estimated_files FROM tasks WHERE id = $task_id")
     devplan_line=$(sqlite3 "$db_path" "SELECT devplan_line FROM tasks WHERE id = $task_id")
@@ -992,7 +1038,7 @@ swarm_db_resume_run() {
     local db_path="$RALPH_DIR/swarm.db"
     local run_id="$1"
 
-    # Check if run exists and is running
+    # Check if run exists
     local status
     status=$(sqlite3 "$db_path" "SELECT status FROM swarm_runs WHERE run_id = '$run_id';")
 
@@ -1006,23 +1052,65 @@ swarm_db_resume_run() {
         return 1
     fi
 
-    # Check for pending tasks
-    local pending
-    pending=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM tasks WHERE run_id = '$run_id' AND status = 'pending';")
+    # Check for pending or in_progress tasks
+    local resumable_tasks
+    resumable_tasks=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM tasks WHERE run_id = '$run_id' AND status IN ('pending', 'in_progress');")
 
-    if [ "$pending" = "0" ]; then
-        local in_progress
-        in_progress=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM tasks WHERE run_id = '$run_id' AND status = 'in_progress';")
-        if [ "$in_progress" = "0" ]; then
-            echo "Run has no remaining tasks: $run_id"
-            return 1
-        fi
+    if [ "$resumable_tasks" -eq 0 ]; then
+        echo "Run has no remaining tasks: $run_id"
+        return 1
     fi
 
-    # Resume the run by marking it as running again if it was interrupted
-    if [ "$status" = "interrupted" ] || [ "$status" = "running" ]; then
-        sqlite3 "$db_path" "UPDATE swarm_runs SET status = 'running', completed_at = NULL WHERE run_id = '$run_id';"
-    fi
+    # Resume the run - CRITICAL: Don't reset started_at!
+    sqlite3 "$db_path" <<EOF
+BEGIN TRANSACTION;
+
+-- Reset workers (they're all dead after crash)
+UPDATE workers 
+SET status = 'stopped', 
+    current_task_id = NULL, 
+    last_heartbeat = NULL
+WHERE run_id = '$run_id';
+
+-- Release all locks from dead workers
+DELETE FROM file_locks WHERE run_id = '$run_id';
+
+-- Reset in_progress tasks ONLY if not already in completed_tasks
+-- Use task_hash to check if work is actually done
+UPDATE tasks 
+SET status = 'pending', 
+    worker_id = NULL, 
+    started_at = NULL,
+    stall_count = COALESCE(stall_count, 0) + 1
+WHERE run_id = '$run_id' 
+  AND status = 'in_progress'
+  AND task_hash NOT IN (
+    SELECT task_hash FROM completed_tasks WHERE task_hash IS NOT NULL
+  );
+
+-- Mark tasks as completed if they're in completed_tasks but status is wrong
+-- This handles the case where DB update failed but task was actually done
+UPDATE tasks t
+SET status = 'completed',
+    completed_at = (
+      SELECT completed_at FROM completed_tasks ct 
+      WHERE ct.task_hash = t.task_hash 
+      LIMIT 1
+    )
+WHERE run_id = '$run_id'
+  AND status = 'in_progress'
+  AND task_hash IN (
+    SELECT task_hash FROM completed_tasks WHERE task_hash IS NOT NULL
+  );
+
+-- Mark run as running again - KEEP ORIGINAL started_at for timeout calculations!
+UPDATE swarm_runs 
+SET status = 'running', 
+    completed_at = NULL 
+WHERE run_id = '$run_id';
+
+COMMIT;
+EOF
 
     echo "$run_id"
 }

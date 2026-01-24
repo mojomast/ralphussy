@@ -558,13 +558,33 @@ swarm_extract_merged_artifacts() {
         if [ -n "$changed_files" ]; then
             while IFS= read -r file; do
                 if [ -n "$file" ]; then
-                    # Skip ralphussy-specific files that should never be copied
+                    # Skip ONLY if file is in .gitignore or is clearly internal
+                    local should_skip=false
+                    
+                    # Check if file path starts with known internal directories AT ROOT LEVEL
                     case "$file" in
-                        ralph-refactor/*|ralph-tui/*|swarm-dashboard/*|opencode-ralph*/*|.git/*|*.db)
-                            echo "  Skipping ralphussy file: $file"
-                            continue
+                        ralph-refactor/*|ralph-tui/*|swarm-dashboard/*|.git/*|*.db)
+                            # Only skip if this is a ROOT-level internal directory
+                            if [ ! -f "$repo_dir/.ralph_project_marker" ]; then
+                                # This is ralphussy itself, skip these
+                                should_skip=true
+                            fi
+                            ;;
+                        opencode-ralph/*|opencode-ralph-slash/*)
+                            # Only skip opencode-ralph if it's the main repo's copy
+                            # Allow project-specific opencode plugins
+                            local file_path="$repo_dir/$file"
+                            if [ -L "$file_path" ] || grep -q "opencode-ralph" "$repo_dir/.gitmodules" 2>/dev/null; then
+                                # It's a symlink or submodule to internal tooling
+                                should_skip=true
+                            fi
                             ;;
                     esac
+                    
+                    if [ "$should_skip" = true ]; then
+                        echo "  Skipping internal file: $file"
+                        continue
+                    fi
                     
                     local src_file="${repo_dir}/${file}"
                     local dst_file="${project_dir}/${file}"
@@ -572,6 +592,14 @@ swarm_extract_merged_artifacts() {
                     mkdir -p "$(dirname "$dst_file")" 2>/dev/null || true
                     
                     if [ -f "$src_file" ]; then
+                        # Check for conflicts: if file exists and differs, warn
+                        if [ -f "$dst_file" ]; then
+                            if ! cmp -s "$src_file" "$dst_file"; then
+                                echo "  ⚠️  CONFLICT: $file modified by multiple workers, using latest version"
+                                # TODO: Implement 3-way merge here
+                            fi
+                        fi
+                        
                         cp "$src_file" "$dst_file" 2>/dev/null || true
                     fi
                 fi
@@ -739,12 +767,55 @@ EOF
         echo "Warning: No artifacts found - workers may not have made any commits"
     fi
 
+    # Verify all completed tasks have their changes in the merged project
+    swarm_verify_merge_completeness "$run_id" "$project_dir" || {
+        echo "⚠️  WARNING: Some completed task files are missing from merged project"
+        echo "This may indicate a merge issue or files were filtered incorrectly"
+    }
+
     echo
     echo "Artifacts extracted to: $project_dir"
     echo "Summary: $summary_file"
 }
 
+# Verify all completed tasks have their changes in the merged project
+swarm_verify_merge_completeness() {
+    local run_id="$1"
+    local project_dir="$2"
+    local db_path="$RALPH_DIR/swarm.db"
+    
+    echo "Verifying merge completeness..."
+    
+    local completed_tasks
+    completed_tasks=$(sqlite3 "$db_path" "SELECT id, task_text, actual_files FROM tasks WHERE run_id = '$run_id' AND status = 'completed';" 2>/dev/null || true)
+    
+    local missing_count=0
+    
+    while IFS='|' read -r task_id task_text actual_files; do
+        if [ -z "$actual_files" ] || [ "$actual_files" = "null" ] || [ "$actual_files" = "[]" ]; then
+            continue
+        fi
+        
+        # Check if files from this task exist in project
+        echo "$actual_files" | jq -r '.[]' 2>/dev/null | while read -r file; do
+            if [ -n "$file" ] && [ ! -f "$project_dir/$file" ]; then
+                echo "  ⚠️  Task $task_id file missing: $file"
+                missing_count=$((missing_count + 1))
+            fi
+        done
+    done <<< "$completed_tasks"
+    
+    if [ $missing_count -gt 0 ]; then
+        echo "  WARNING: $missing_count files from completed tasks are missing!"
+        return 1
+    else
+        echo "  ✓ All completed task files present in project"
+        return 0
+    fi
+}
+
 export -f swarm_extract_merged_artifacts 2>/dev/null || true
+export -f swarm_verify_merge_completeness 2>/dev/null || true
 
 swarm_list_runs() {
     local db_path="$RALPH_DIR/swarm.db"

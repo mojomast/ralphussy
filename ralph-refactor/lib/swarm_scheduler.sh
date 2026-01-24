@@ -154,8 +154,8 @@ swarm_scheduler_main_loop() {
             fi
         fi
 
-        # Periodic dead worker cleanup (every 15 seconds)
-        if [ $((current_time - last_cleanup_check)) -ge 15 ]; then
+        # Periodic dead worker cleanup (every 5 seconds instead of 15)
+        if [ $((current_time - last_cleanup_check)) -ge 5 ]; then
             local dead_workers
             dead_workers=$(swarm_scheduler_cleanup_dead_workers "$run_id")
             last_cleanup_check=$current_time
@@ -259,140 +259,6 @@ swarm_scheduler_get_next_task() {
     fi
 
     echo "$pending_tasks"
-}
-
-swarm_scheduler_check_file_conflicts() {
-    local run_id="$1"
-    local task_id="$2"
-    local estimated_files="$3"
-
-    echo "$estimated_files" | jq -r '.[]' 2>/dev/null | while read -r file_pattern; do
-        if [ -z "$file_pattern" ]; then
-            continue
-        fi
-
-        local conflicts
-        conflicts=$(swarm_db_check_conflicts "$run_id" "$file_pattern" 2>/dev/null)
-
-        if [ -n "$conflicts" ]; then
-            echo "File conflict for pattern: $file_pattern"
-            echo "$conflicts" | while read -r worker_id task_id pattern; do
-                echo "  - Worker $worker_id has locked $pattern"
-            done
-            return 1
-        fi
-    done
-
-    return 0
-}
-
-swarm_scheduler_assign_task() {
-    local run_id="$1"
-    local worker_id="$2"
-    local task_id="$3"
-
-    echo "Assigning task $task_id to worker $worker_id"
-
-    local task_info
-    task_info=$(swarm_db_claim_task "$worker_id" 2>/dev/null)
-    if [ -z "$task_info" ]; then
-        echo "Error: Could not claim task for worker $worker_id"
-        return 1
-    fi
-
-    local task_text estimated_files devplan_line
-    task_text=$(echo "$task_info" | awk -F'|' '{print $2}')
-    estimated_files=$(echo "$task_info" | awk -F'|' '{print $3}')
-    devplan_line=$(echo "$task_info" | awk -F'|' '{print $4}')
-
-    echo "Assigned: $task_text"
-    echo "Estimated files: $estimated_files"
-    echo "Devplan line: $devplan_line"
-
-    if [ "${SWARM_OUTPUT_MODE:-}" = "live" ]; then
-        echo -e "${CYAN}[SCHEDULER]${NC} Task $task_id assigned to worker (ID: $worker_id)"
-        echo -e "${CYAN}[SCHEDULER]${NC}   Task: ${task_text:0:80}..."
-    fi
-
-    local lock_success
-    lock_success=$(swarm_db_acquire_locks "$run_id" "$worker_id" "$task_id" $estimated_files 2>/dev/null)
-
-    if [ $? -ne 0 ]; then
-        echo "Error: Failed to acquire locks"
-        swarm_db_release_locks "$worker_id" 2>/dev/null
-        return 1
-    fi
-
-    echo "Locks acquired"
-
-    return 0
-}
-
-swarm_scheduler_handle_completion() {
-    local task_id="$1"
-    local worker_id="$2"
-
-    echo "Handling task completion: $task_id (worker $worker_id)"
-
-    if [ "${SWARM_OUTPUT_MODE:-}" = "live" ]; then
-        echo -e "${GREEN}[SCHEDULER]${NC} Task $task_id completed by worker $worker_id"
-    fi
-
-    local result_files
-    result_files=$(swarm_db_complete_task "$task_id" "$worker_id" 2>/dev/null)
-
-    echo "Task $task_id completed"
-}
-
-swarm_scheduler_handle_failure() {
-    local task_id="$1"
-    local worker_id="$2"
-    local error_message="$3"
-
-    echo "Handling task failure: $task_id (worker $worker_id): $error_message"
-
-    if [ "${SWARM_OUTPUT_MODE:-}" = "live" ]; then
-        echo -e "${RED}[SCHEDULER]${NC} Task $task_id failed on worker $worker_id: ${error_message:0:60}"
-    fi
-
-    swarm_db_fail_task "$task_id" "$worker_id" "$error_message" 2>/dev/null
-
-    echo "Task $task_id marked as failed"
-}
-
-swarm_scheduler_rebalance() {
-    local run_id="$1"
-
-    echo "Checking for rebalancing opportunities..."
-
-    local stale_workers
-    stale_workers=$(swarm_db_cleanup_stale_workers "$run_id" 2>/dev/null)
-
-    if [ -n "$stale_workers" ]; then
-        echo "Found stale workers, re-balancing tasks..."
-
-        local old_ifs="$IFS"
-        IFS='|'
-        read -ra worker_ids <<< "$stale_workers"
-        IFS="$old_ifs"
-
-        for worker_id in "${worker_ids[@]}"; do
-            local current_task
-            current_task=$(swarm_db_worker_status "$run_id" "$worker_id" 2>/dev/null | awk -F'|' '{print $6}')
-
-            if [ -n "$current_task" ]; then
-                local task_id
-                task_id=$(echo "$current_task" | awk '{print $1}')
-                echo "Rebalancing stale task $task_id from worker $worker_id"
-
-                swarm_db_release_locks "$worker_id" 2>/dev/null
-
-                swarm_db_complete_task "$task_id" "$worker_id" "Worker timeout" 2>/dev/null
-            fi
-        done
-    else
-        echo "No stale workers found"
-    fi
 }
 
 swarm_scheduler_all_complete() {

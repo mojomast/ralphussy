@@ -264,33 +264,33 @@ get_tasks_needing_review() {
     echo "$tasks"
 }
 
-is_task_stalled() {
-    local task="$1"
-    local max_attempts="${2:-3}"
-
-    # Check if this task has been attempted multiple times without completion
-    # This would be tracked in a separate stall counter file
-    local stall_file="$RALPH_DIR/task_stalls.txt"
-
-    if [ ! -f "$stall_file" ]; then
-        return 1
-    fi
-
-    local attempts
-    attempts=$(grep -c "^$task$" "$stall_file" 2>/dev/null || echo "0")
-
-    if [ "$attempts" -ge "$max_attempts" ]; then
-        return 0
-    fi
-
-    return 1
-}
-
 record_stall_attempt() {
     local task="$1"
     local stall_file="$RALPH_DIR/task_stalls.txt"
-
-    echo "$task" >> "$stall_file"
+    
+    # Add timestamp for cleanup (Unix timestamp for easy comparison)
+    echo "$(date +%s)|$task" >> "$stall_file"
+    
+    # Cleanup: Remove entries older than 7 days (604800 seconds)
+    if [ -f "$stall_file" ]; then
+        local cutoff=$(($(date +%s) - 604800))
+        local temp_file="${stall_file}.tmp"
+        
+        # Only keep recent entries
+        if [ -s "$stall_file" ]; then
+            while IFS='|' read -r timestamp task_text; do
+                # Keep entries newer than cutoff
+                if [ "$timestamp" -gt "$cutoff" ] 2>/dev/null; then
+                    echo "$timestamp|$task_text" >> "$temp_file"
+                fi
+            done < "$stall_file"
+            
+            # Replace old file with cleaned version
+            if [ -f "$temp_file" ]; then
+                mv "$temp_file" "$stall_file"
+            fi
+        fi
+    fi
 }
 
 clear_stall_record() {
@@ -299,15 +299,43 @@ clear_stall_record() {
     local temp_file="$RALPH_DIR/task_stalls_temp.txt"
 
     if [ -f "$stall_file" ]; then
-        grep -v "^$task$" "$stall_file" > "$temp_file" 2>/dev/null || true
-        mv "$temp_file" "$stall_file"
+        # Remove all entries for this task (any timestamp)
+        grep -v "|$task$" "$stall_file" > "$temp_file" 2>/dev/null || true
+        mv "$temp_file" "$stall_file" 2>/dev/null || true
     fi
+}
+
+is_task_stalled() {
+    local task="$1"
+    local max_attempts="${2:-3}"
+    local stall_file="$RALPH_DIR/task_stalls.txt"
+
+    if [ ! -f "$stall_file" ]; then
+        return 1
+    fi
+
+    # Count recent attempts (from last 7 days only)
+    local cutoff=$(($(date +%s) - 604800))
+    local attempts=0
+    
+    while IFS='|' read -r timestamp task_text; do
+        if [ "$task_text" = "$task" ] && [ "$timestamp" -gt "$cutoff" ] 2>/dev/null; then
+            attempts=$((attempts + 1))
+        fi
+    done < "$stall_file"
+
+    if [ "$attempts" -ge "$max_attempts" ]; then
+        return 0
+    fi
+
+    return 1
 }
 
 detect_stall() {
     local iteration="$1"
     local output="$2"
     local tools_used="$3"
+    local duration="${4:-0}"  # ADD: Capture duration parameter
 
     # Check for multiple failure indicators
     local stall_indicators=0
@@ -328,7 +356,13 @@ detect_stall() {
     fi
 
     # 4. No completion promise after multiple retries
-    if ! echo "$output" | grep -q "<promise>COMPLETE</promise>"; then
+    if ! echo "$output" | grep -qiE "<\s*promise\s*>COMPLETE<\s*/\s*promise\s*>"; then
+        stall_indicators=$((stall_indicators + 1))
+    fi
+
+    # NEW: 5. Duration-based stall detection
+    # If task took >300s (5 minutes) but no completion, likely stalled
+    if [ "$duration" -gt 300 ] && ! echo "$output" | grep -qiE "<\s*promise\s*>COMPLETE<\s*/\s*promise\s*>"; then
         stall_indicators=$((stall_indicators + 1))
     fi
 
@@ -573,8 +607,8 @@ run_devplan_iteration() {
     log_info "----------------------------------------"
     echo ""
 
-    # Check for completion
-    if echo "$text_output" | grep -q "<promise>$COMPLETION_PROMISE</promise>"; then
+    # Check for completion (case-insensitive, space-tolerant)
+    if echo "$text_output" | grep -qiE "<\s*promise\s*>${COMPLETION_PROMISE}<\s*/\s*promise\s*>"; then
         log_success "Task completed!"
         mark_task_complete "$devfile" "$task"
         clear_stall_record "$task"

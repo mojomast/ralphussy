@@ -262,8 +262,8 @@ $context"
     log_info "----------------------------------------"
     echo ""
     
-    # Check for completion promise
-    if echo "$text_output" | grep -q "<promise>$COMPLETION_PROMISE</promise>"; then
+    # Check for completion promise (case-insensitive, space-tolerant)
+    if echo "$text_output" | grep -qiE "<\s*promise\s*>${COMPLETION_PROMISE}<\s*/\s*promise\s*>"; then
         log_success "Completion promise detected!"
         return 0
     fi
@@ -748,6 +748,22 @@ EOF
             init_ralph
             check_opencode
             
+            # Validate model/provider combination early
+            if [ -n "$MODEL" ] || [ -n "$PROVIDER" ]; then
+                log_info "Validating model configuration..."
+                if ! validate_model "$PROVIDER" "$MODEL"; then
+                    log_error "Invalid model/provider combination"
+                    log_info "Provider: ${PROVIDER:-default}"
+                    log_info "Model: ${MODEL:-default}"
+                    echo ""
+                    log_info "To see available models, run:"
+                    log_info "  ralph --list-models"
+                    echo ""
+                    exit 1
+                fi
+                log_success "Model validation passed"
+            fi
+            
             cat << 'BANNER'
 ╔═══════════════════════════════════════════════════════════════════╗
 ║                                                                   ║
@@ -883,8 +899,22 @@ BANNER
                     handoff_context=$(read_handoff)
                 fi
                 
-                # CRITICAL: Sync devplan to disk before creating handoff to ensure next task is correct
-                sync
+                # CRITICAL: Ensure devplan is flushed to disk before creating handoff
+                # Use fsync if available (file-specific), fall back to sync (system-wide), 
+                # fall back to read-based flush (forces kernel to sync)
+                if command -v fsync >/dev/null 2>&1; then
+                    # Best option: fsync just this file (macOS/BSD)
+                    fsync "$devfile" 2>/dev/null || true
+                elif command -v sync >/dev/null 2>&1 && [ -w / ]; then
+                    # Second best: sync everything (requires write access)
+                    sync 2>/dev/null || true
+                else
+                    # Fallback: Force kernel buffer flush by reading file
+                    # This works even in containers without sync command
+                    cat "$devfile" > /dev/null 2>&1 || true
+                    # Sleep briefly to let filesystem catch up
+                    sleep 0.1
+                fi
                 
                 # Build comprehensive prompt with handoff context
                 local devplan_prompt="# Ralph Task Execution
@@ -921,13 +951,17 @@ Begin work now."
                 # Run the task with fresh context
                 local result=0
                 if run_devplan_iteration "$devplan_prompt" $iteration "$devfile" "$task"; then
-                    # Mark all batched tasks as complete
+                    # Mark all batched tasks as complete (includes main task)
                     echo "$batch_tasks" | while IFS= read -r btask; do
                         btask=$(echo "$btask" | sed 's/^- //')
                         [ -n "$btask" ] && mark_task_complete "$devfile" "$btask"
                     done
-                    mark_task_complete "$devfile" "$task"
+                    # REMOVED: Don't mark $task again - it's already in $batch_tasks
+                    
                     log_success "✅ Task completed: $task"
+                    if [ $batch_count -gt 1 ]; then
+                        log_info "   (+ $((batch_count - 1)) batched tasks)"
+                    fi
                     completed_count=$((completed_count + batch_count))
                     consecutive_failures=0
                     

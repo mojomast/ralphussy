@@ -8,6 +8,7 @@ MONITOR_LOG="${MONITOR_LOG-}"
 MONITOR_ENABLED="${MONITOR_ENABLED:-true}"
 MONITOR_ACTIVITY_IDLE_SECONDS="${MONITOR_ACTIVITY_IDLE_SECONDS:-8}"
 MONITOR_PROC_CHECK_EVERY_TICKS="${MONITOR_PROC_CHECK_EVERY_TICKS:-10}"
+MONITOR_CONTROL_FILE="${MONITOR_CONTROL_FILE-}"  # ADD: Control file for graceful shutdown
 
 monitor_is_opencode_running() {
     # Best-effort: check whether an opencode process exists in the current
@@ -73,10 +74,17 @@ start_monitor() {
         return 0
     fi
 
+    # Kill any existing monitor for this session first
+    stop_monitor
+
     local log_dir="$HOME/.local/share/opencode/log"
     if [ ! -d "$log_dir" ]; then
         return 1
     fi
+
+    # Create a monitor control file unique to this PID
+    local monitor_control="$RALPH_DIR/monitor_control_$$"
+    touch "$monitor_control"
 
     # Get initial newest log (before opencode starts)
     local initial_log
@@ -84,6 +92,9 @@ start_monitor() {
 
     # Start monitoring in background
     (
+        # Monitor will exit when control file is removed OR after timeout
+        local monitor_started=$(date +%s)
+        local max_runtime=7200  # 2 hours max
         local monitor_started
         monitor_started=$(date +%s)
         local found_new_log=false
@@ -94,7 +105,13 @@ start_monitor() {
         local spinner_chars=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
 
         # Watch for new log file
-        while [ "$found_new_log" = false ]; do
+         while [ "$found_new_log" = false ] && [ -f "$monitor_control" ]; do
+             # Safety: Exit if running too long (prevents infinite orphans)
+             local now=$(date +%s)
+             if [ $((now - monitor_started)) -gt $max_runtime ]; then
+                 rm -f "$monitor_control" 2>/dev/null || true
+                 exit 0
+             fi
             spinner_idx=$(( (spinner_idx + 1) % 10 ))
             sleep 0.1
 
@@ -138,9 +155,16 @@ start_monitor() {
             local tick=0
             local opencode_running=false
 
-            while [ -f "$MONITOR_LOG" ]; do
-                spinner_idx=$(( (spinner_idx + 1) % 10 ))
-                tick=$((tick + 1))
+             while [ -f "$MONITOR_LOG" ] && [ -f "$monitor_control" ]; do
+                 spinner_idx=$(( (spinner_idx + 1) % 10 ))
+                 tick=$((tick + 1))
+                 
+                 # Safety: Exit if running too long (prevents infinite orphans)
+                 local now=$(date +%s)
+                 if [ $((now - monitor_started)) -gt $max_runtime ]; then
+                     rm -f "$monitor_control" 2>/dev/null || true
+                     break
+                 fi
 
                 local current_size
                 current_size=$(stat -c %s "$MONITOR_LOG" 2>/dev/null || echo "0")
@@ -271,19 +295,45 @@ start_monitor() {
                 sleep 0.1
             done
             # Cleanup status line
-            echo -ne "\r\033[K" >&2
-        fi
-    ) &
-    MONITOR_PID=$!
+             echo -ne "\r\033[K" >&2
+         fi
+         
+         # Cleanup on exit
+         rm -f "$monitor_control" 2>/dev/null || true
+     ) &
 
-    sleep 0.3
-}
+     MONITOR_PID=$!
+     MONITOR_CONTROL_FILE="$monitor_control"
+     
+     # Register cleanup trap for this monitor
+     trap "stop_monitor" EXIT
+
+     sleep 0.3
+ }
 
 # Stop background monitor
 stop_monitor() {
+    # Remove control file first (signals monitor to exit gracefully)
+    if [ -n "$MONITOR_CONTROL_FILE" ]; then
+        rm -f "$MONITOR_CONTROL_FILE" 2>/dev/null || true
+        MONITOR_CONTROL_FILE=""
+    fi
+
+    # Then kill process as backup
     if [ -n "$MONITOR_PID" ]; then
-        kill $MONITOR_PID 2>/dev/null || true
-        wait $MONITOR_PID 2>/dev/null || true
+        kill "$MONITOR_PID" 2>/dev/null || true
+        # Wait briefly for graceful exit
+        local wait_count=0
+        while kill -0 "$MONITOR_PID" 2>/dev/null && [ $wait_count -lt 10 ]; do
+            sleep 0.1
+            wait_count=$((wait_count + 1))
+        done
+        # Force kill if still alive
+        kill -9 "$MONITOR_PID" 2>/dev/null || true
+        wait "$MONITOR_PID" 2>/dev/null || true
         MONITOR_PID=""
     fi
+
+    # Cleanup any orphaned monitor control files (>10 min old)
+    find "$RALPH_DIR" -name "monitor_control_*" -type f -mmin +10 -delete 2>/dev/null || true
 }

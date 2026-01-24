@@ -65,11 +65,110 @@ log_error() {
     echo -e "${RED}[RALPH]${NC} $1"
 }
 
+# Rotate history file if it grows too large
+rotate_history_if_needed() {
+    local history_file="$RALPH_DIR/history.json"
+    
+    if [ ! -f "$history_file" ]; then
+        return 0
+    fi
+    
+    # Check file size (rotate if >5MB = 5242880 bytes)
+    local file_size=0
+    if command -v stat >/dev/null 2>&1; then
+        # Try BSD stat format first (macOS)
+        file_size=$(stat -f%z "$history_file" 2>/dev/null || stat -c%s "$history_file" 2>/dev/null || echo "0")
+    fi
+    
+    if [ "$file_size" -gt 5242880 ]; then
+        # Archive old history
+        local timestamp
+        timestamp=$(date +"%Y%m%d_%H%M%S")
+        local archive_dir="$RALPH_DIR/history_archive"
+        mkdir -p "$archive_dir"
+        
+        log_info "History file is large ($(( file_size / 1048576 ))MB), rotating..."
+        mv "$history_file" "$archive_dir/history_${timestamp}.json"
+        
+        # Create fresh history file
+        cat > "$history_file" << EOF
+{
+  "iterations": [],
+  "total_time": 0,
+  "success": false,
+  "note": "Previous history archived",
+  "archived_from": "$archive_dir/history_${timestamp}.json",
+  "archived_at": "$(date -Iseconds)"
+}
+EOF
+        
+        log_success "History rotated to: $archive_dir/history_${timestamp}.json"
+        
+        # Cleanup: Keep only last 10 archived histories
+        local archive_count
+        archive_count=$(find "$archive_dir" -name "history_*.json" -type f 2>/dev/null | wc -l)
+        if [ "$archive_count" -gt 10 ]; then
+            find "$archive_dir" -name "history_*.json" -type f -printf '%T@ %p\n' 2>/dev/null | sort -n | head -n -10 | cut -d' ' -f2- | xargs rm -f 2>/dev/null || true
+        fi
+    fi
+}
+
+# Cleanup old background run logs
+cleanup_old_run_logs() {
+    local runs_dir="$RALPH_DIR/runs"
+    
+    if [ ! -d "$runs_dir" ]; then
+        return 0
+    fi
+    
+    # Count log files
+    local log_count
+    log_count=$(find "$runs_dir" -name "run_*.log" -type f 2>/dev/null | wc -l)
+    
+    if [ "$log_count" -gt 20 ]; then
+        log_info "Cleaning up old run logs (found $log_count, keeping 20 newest)..."
+        
+        # Delete logs older than 7 days
+        find "$runs_dir" -name "run_*.log" -type f -mtime +7 -delete 2>/dev/null || true
+        
+        # If still >20 logs, delete oldest
+        local remaining
+        remaining=$(find "$runs_dir" -name "run_*.log" -type f 2>/dev/null | wc -l)
+        
+        if [ "$remaining" -gt 20 ]; then
+            # Delete all but 20 newest (sorted by modification time)
+            find "$runs_dir" -name "run_*.log" -type f -printf '%T@ %p\n' 2>/dev/null | sort -n | head -n -20 | cut -d' ' -f2- | xargs rm -f 2>/dev/null || true
+        fi
+    fi
+    
+    # Cleanup orphaned PID files (PID no longer running)
+    find "$runs_dir" -name "run_*.pid" -type f 2>/dev/null | while read -r pid_file; do
+        local pid
+        pid=$(cat "$pid_file" 2>/dev/null || echo "")
+        if [ -n "$pid" ]; then
+            # Check if process is still running
+            if ! kill -0 "$pid" 2>/dev/null; then
+                # Process dead, remove PID file
+                rm -f "$pid_file" 2>/dev/null || true
+            fi
+        else
+            # Empty PID file, remove
+            rm -f "$pid_file" 2>/dev/null || true
+        fi
+    done
+}
+
 # ---------------------------------------------------------------------------
 # Init / shared helpers
 
 init_ralph() {
     mkdir -p "$RALPH_DIR" "$LOG_DIR" "$RUNS_DIR"
+
+    # Rotate history if needed
+    rotate_history_if_needed
+    
+    # Cleanup old run logs
+    cleanup_old_run_logs
 
     # Initialize state file
     if [ ! -f "$STATE_FILE" ]; then
@@ -415,6 +514,15 @@ archive_handoff() {
         local timestamp
         timestamp=$(date +"%Y%m%d_%H%M%S")
         cp "$HANDOFF_FILE" "$archive_dir/handoff_$timestamp.md"
+        
+        # Cleanup: Keep only last 50 handoffs
+        local handoff_count
+        handoff_count=$(find "$archive_dir" -name "handoff_*.md" -type f 2>/dev/null | wc -l)
+        
+        if [ "$handoff_count" -gt 50 ]; then
+            # Delete oldest handoffs, keeping 50 newest
+            find "$archive_dir" -name "handoff_*.md" -type f -printf '%T@ %p\n' 2>/dev/null | sort -n | head -n -50 | cut -d' ' -f2- | xargs rm -f 2>/dev/null || true
+        fi
     fi
 }
 

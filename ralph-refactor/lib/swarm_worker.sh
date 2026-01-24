@@ -25,32 +25,50 @@ swarm_worker_check_commit_for_task() {
     local task_text="$3"
     local worker_dir="$4"
 
+    # ALWAYS check completed_tasks table FIRST (source of truth)
+    local task_hash
+    task_hash=$(printf '%s' "$task_text" | sha256sum | cut -d' ' -f1)
+    
+    local is_completed
+    is_completed=$(swarm_db_is_task_completed "$task_hash")
+    
+    if [ "$is_completed" = "yes" ]; then
+        # Task is definitively completed according to database
+        echo "check:completed_in_db|$task_hash|Found in completed_tasks table"
+        return
+    fi
+    
+    # Secondary check: look for git commits (fallback for legacy runs)
     local repo_dir="$worker_dir/repo"
-
+    
     if [ ! -d "$repo_dir/.git" ]; then
-        echo "check:skip"
+        echo "check:no_git"
         return
     fi
 
     # Try to find commits that match the task text
-    # We search for commits whose message contains keywords from the task
+    # Use more sophisticated matching than just keywords
     local task_keywords
     task_keywords=$(echo "$task_text" | grep -oE '\b[a-zA-Z]{4,}\b' | head -n 5 | tr '\n' '|' | sed 's/|$//')
 
     if [ -z "$task_keywords" ]; then
-        echo "check:skip"
+        echo "check:no_keywords"
         return
     fi
 
+    # Search in commits from the current run's branches
     local matching_commit
-    matching_commit=$(cd "$repo_dir" && git log --all --grep="$task_keywords" --oneline 2>/dev/null | head -n 1 || true)
+    matching_commit=$(cd "$repo_dir" && git log --all --grep="$task_keywords" --oneline --since="7 days ago" 2>/dev/null | head -n 1 || true)
 
     if [ -n "$matching_commit" ]; then
         local commit_hash
         commit_hash=$(echo "$matching_commit" | cut -d' ' -f1)
         local commit_msg
         commit_msg=$(echo "$matching_commit" | cut -d' ' -f2-)
-        echo "check:found|$commit_hash|$commit_msg"
+        
+        # IMPORTANT: This is just a hint, not definitive
+        # Don't auto-complete based on git alone, just log it
+        echo "check:git_hint|$commit_hash|$commit_msg"
         return
     fi
 
@@ -310,25 +328,40 @@ swarm_worker_main_loop() {
         local check_status
         check_status=$(echo "$commit_check_result" | cut -d'|' -f1)
 
-        if [ "$check_status" = "check:found" ]; then
-            local commit_hash
-            commit_hash=$(echo "$commit_check_result" | cut -d'|' -f2)
-            local commit_msg
-            commit_msg=$(echo "$commit_check_result" | cut -d'|' -f3-)
-
-            echo "[$(date)] Task $task_id already completed (found commit: $commit_hash)"
-            echo "[$(date)] Commit message: $commit_msg"
-
-            if [ "${SWARM_OUTPUT_MODE:-}" = "live" ]; then
-                echo -e "${GREEN}✓${NC} Worker $worker_num skipping task $task_id (already done)"
-                echo -e "${GREEN}✓${NC}   Found commit: $commit_hash - ${commit_msg:0:60}..."
-                echo ""
-            fi
-
-            # Mark task as completed
-            swarm_db_complete_task "$task_id" "$estimated_files" "$worker_id"
-            continue
-        fi
+        case "$check_status" in
+            check:completed_in_db)
+                # Definitive: task is done according to database
+                local task_hash
+                task_hash=$(echo "$commit_check_result" | cut -d'|' -f2)
+                echo "[$(date)] Task $task_id already completed (DB hash: $task_hash)"
+                
+                if [ "${SWARM_OUTPUT_MODE:-}" = "live" ]; then
+                    echo -e "${GREEN}✓${NC} Worker $worker_num skipping task $task_id (completed in DB)"
+                fi
+                
+                # Mark as completed in this run's tasks table
+                swarm_db_complete_task "$task_id" "$estimated_files" "$worker_id"
+                continue
+                ;;
+                
+            check:git_hint)
+                # Found matching commit but NOT in completed_tasks
+                # This is suspicious - task may have been completed but not recorded
+                # Log it but DON'T skip - let it run to be safe
+                local commit_hash
+                commit_hash=$(echo "$commit_check_result" | cut -d'|' -f2)
+                local commit_msg
+                commit_msg=$(echo "$commit_check_result" | cut -d'|' -f3-)
+                
+                echo "[$(date)] WARNING: Found matching commit $commit_hash but task not in completed_tasks"
+                echo "[$(date)] Commit: $commit_msg"
+                echo "[$(date)] Running task $task_id to be safe..."
+                ;;
+                
+            check:not_found|check:no_git|check:no_keywords|check:skip)
+                # No evidence of completion, proceed with task
+                ;;
+        esac
 
         # Update global heartbeat before task execution
         if command -v swarm_db_heartbeat_worker_global >/dev/null 2>&1; then
@@ -380,7 +413,59 @@ swarm_worker_execute_task() {
         return 1
     fi
 
-    # Ensure json_extract_text is available for completion detection.
+    # Get worker_id for locking
+    local worker_id
+    worker_id=$(sqlite3 "$RALPH_DIR/swarm.db" "SELECT id FROM workers WHERE run_id = '$run_id' AND worker_num = $worker_num ORDER BY id DESC LIMIT 1;")
+
+    # Check if we already created a commit for this task (idempotency check)
+    local existing_commit
+    existing_commit=$(cd "$repo_dir" && git log --all --oneline --grep="Task $task_id:" 2>/dev/null | head -n 1)
+
+    if [ -n "$existing_commit" ]; then
+        echo "[$(date)] Task $task_id already has commit: $existing_commit"
+        echo "[$(date)] Treating as completed (idempotency check)"
+        
+        if [ "${SWARM_OUTPUT_MODE:-}" = "live" ]; then
+            echo -e "${GREEN}✓${NC} Worker $worker_num found existing commit for task $task_id"
+        fi
+        
+        # Release locks and return success
+        swarm_db_release_locks "$worker_id" 2>/dev/null || true
+        return 0
+    fi
+
+    # ACQUIRE FILE LOCKS BEFORE EXECUTION
+    if [ -n "$estimated_files" ] && [ "$estimated_files" != "[]" ] && [ "$estimated_files" != "null" ]; then
+        echo "[$(date)] Acquiring locks for estimated files: $estimated_files"
+        
+        if ! swarm_db_acquire_locks "$run_id" "$worker_id" "$task_id" "$estimated_files" 2>/dev/null; then
+            echo "[$(date)] Failed to acquire file locks for task $task_id" 1>&2
+            
+            # Check if locks are held by another worker
+            local locked_by
+            locked_by=$(swarm_db_check_conflicts "$run_id" "$estimated_files" 2>/dev/null)
+            
+            if [ -n "$locked_by" ]; then
+                echo "[$(date)] Files locked by: $locked_by" 1>&2
+                echo "[$(date)] Re-queuing task $task_id for later attempt" 1>&2
+                
+                # Re-queue task (don't fail it, just defer)
+                sqlite3 "$RALPH_DIR/swarm.db" <<EOF
+UPDATE tasks 
+SET status = 'pending', 
+    worker_id = NULL, 
+    started_at = NULL,
+    stall_count = COALESCE(stall_count, 0) + 1
+WHERE id = $task_id;
+EOF
+                return 1
+            fi
+        fi
+        
+        echo "[$(date)] Locks acquired for task $task_id"
+    fi
+
+    # Ensure json_extract_text is available for completion detection
     if ! command -v json_extract_text >/dev/null 2>&1; then
         # shellcheck source=ralph-refactor/lib/json.sh
         source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/json.sh"
@@ -399,7 +484,9 @@ Constraints:
 - This is a fresh project - create the necessary files and structure for the task.
 - DO NOT reference, copy, or include any files from ralph-refactor/, ralph-tui/, swarm-dashboard/, or opencode-ralph* directories - these are internal tooling files and must NOT be included in the project.
 - Run relevant tests/linters if they exist.
-- Create a git commit for your changes with a clear message.
+- Create a git commit for your changes with a clear message in this format:
+  "Task $task_id: <brief description of what you did>"
+  This allows the swarm to detect if this task was already completed.
 - When finished, you MUST output exactly: <promise>COMPLETE</promise>
 
 Remember: End your response with "<promise>COMPLETE</promise>" to signal task completion. This is required for the swarm system to recognize your work as done.
@@ -434,14 +521,17 @@ EOF
         opencode_cmd="$opencode_cmd --model $full_model"
     fi
 
-    echo "[$(date)] DEBUG: RALPH_LLM_PROVIDER=${RALPH_LLM_PROVIDER:-}, RALPH_LLM_MODEL=${RALPH_LLM_MODEL:-}"
-    echo "[$(date)] DEBUG: Command: $opencode_cmd"
-
     local timeout_seconds="${SWARM_TASK_TIMEOUT:-600}"
     local json_output
+    local execution_failed=false
 
     if ! json_output=$(cd "$repo_dir" && timeout "$timeout_seconds" $opencode_cmd --format json "$prompt" 2>&1); then
+        execution_failed=true
         local exit_code=$?
+        
+        # ALWAYS release locks on failure
+        swarm_db_release_locks "$worker_id" 2>/dev/null || true
+        
         if [ $exit_code -eq 124 ]; then
             echo "[$(date)] Task execution failed (timeout after ${timeout_seconds}s)" 1>&2
             if [ "${SWARM_OUTPUT_MODE:-}" = "live" ]; then
@@ -458,18 +548,24 @@ EOF
         return 1
     fi
 
-    # Best-effort: record token/cost stats if possible.
-    # Aggregate tokens from all step_finish events
+    # Best-effort: record token/cost stats if possible
     local prompt_tokens=0
     local completion_tokens=0
     local cost=0
     if command -v jq >/dev/null 2>&1; then
-        # Sum tokens from all events that have them
-        prompt_tokens=$(echo "$json_output" | jq -s 'map(select(.part.tokens.input)) | map(.part.tokens.input) | add // 0' 2>/dev/null) || prompt_tokens=0
-        completion_tokens=$(echo "$json_output" | jq -s 'map(select(.part.tokens.output)) | map(.part.tokens.output) | add // 0' 2>/dev/null) || completion_tokens=0
-        # Get cost from first step_finish event or sum all
-        cost=$(echo "$json_output" | jq -s 'map(select(.part.cost)) | map(.part.cost) | add // 0' 2>/dev/null) || cost=0
+        # Single jq call for efficiency
+        local stats
+        stats=$(echo "$json_output" | jq -s '{
+            prompt: (map(select(.part.tokens.input)) | map(.part.tokens.input) | add // 0),
+            completion: (map(select(.part.tokens.output)) | map(.part.tokens.output) | add // 0),
+            cost: (map(select(.part.cost)) | map(.part.cost) | add // 0)
+        }' 2>/dev/null) || stats='{"prompt":0,"completion":0,"cost":0}'
+        
+        prompt_tokens=$(echo "$stats" | jq -r '.prompt')
+        completion_tokens=$(echo "$stats" | jq -r '.completion')
+        cost=$(echo "$stats" | jq -r '.cost')
     fi
+    
     if command -v swarm_db_record_task_cost >/dev/null 2>&1; then
         swarm_db_record_task_cost "$run_id" "$task_id" "$prompt_tokens" "$completion_tokens" "$cost" >/dev/null 2>&1 || true
     fi
@@ -488,13 +584,14 @@ EOF
 
     # Debug: Warn if text extraction failed but tokens were generated
     if [ -z "$text_output" ] && [ "$completion_tokens" -gt 0 ]; then
-        echo "[$(date)] DEBUG: Text extraction failed despite $completion_tokens completion tokens" 1>&2
-        echo "[$(date)] DEBUG: Full JSON saved to: ${repo_dir}/.swarm_text_debug_${task_id}.json" 1>&2
-        echo "$json_output" > "${repo_dir}/.swarm_text_debug_${task_id}.json"
+        if [ "${SWARM_DEBUG:-false}" = "true" ]; then
+            echo "[$(date)] DEBUG: Text extraction failed despite $completion_tokens completion tokens" 1>&2
+            echo "[$(date)] DEBUG: Full JSON saved to: ${repo_dir}/.swarm_text_debug_${task_id}.json" 1>&2
+            echo "$json_output" > "${repo_dir}/.swarm_text_debug_${task_id}.json"
+        fi
     fi
 
-    # Check for completion using multiple patterns to handle model non-compliance
-    # Some models may not output exact marker but use completion language
+    # Check for completion using multiple patterns
     local completed=false
     if echo "$text_output" | grep -qiE "<promise>COMPLETE</promise>|Task completed|task completed|completed successfully|All done|Task finished|Done|done"; then
         completed=true
@@ -502,6 +599,11 @@ EOF
     
     if $completed; then
         echo "[$(date)] Task execution successful"
+        
+        # RELEASE LOCKS AFTER SUCCESSFUL COMPLETION
+        swarm_db_release_locks "$worker_id" 2>/dev/null || true
+        echo "[$(date)] Locks released for task $task_id"
+        
         if [ "${SWARM_OUTPUT_MODE:-}" = "live" ]; then
             echo -e "${GREEN}✓${NC} Worker $worker_num completed task $task_id"
             echo ""
@@ -522,37 +624,13 @@ EOF
         return 0
     fi
 
+    # RELEASE LOCKS ON INCOMPLETE/FAILED TASK
+    swarm_db_release_locks "$worker_id" 2>/dev/null || true
+    
     echo "[$(date)] Task execution did not return completion promise" 1>&2
     if [ "${SWARM_OUTPUT_MODE:-}" = "live" ]; then
         echo -e "${YELLOW}⚠${NC} Worker $worker_num task $task_id did not complete (no promise)"
     fi
-    return 1
-}
-
-swarm_worker_poll_for_task() {
-    local worker_id="$1"
-    local timeout_seconds="${2:-300}"
-
-    local start_time=$(date +%s)
-    local elapsed=0
-
-    while [ $elapsed -lt $timeout_seconds ]; do
-        local current_task
-        current_task=$(swarm_db_claim_task "$worker_id")
-
-        if [ -n "$current_task" ]; then
-            local task_id
-            task_id=$(echo "$current_task" | cut -d'|' -f1)
-
-            echo "[$(date)] Polling found task $task_id"
-            return 0
-        fi
-
-        sleep 2
-        elapsed=$((elapsed + 2))
-    done
-
-    echo "[$(date)] Polling timeout after $timeout_seconds seconds"
     return 1
 }
 
