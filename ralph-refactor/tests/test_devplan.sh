@@ -9,11 +9,11 @@ mkdir -p "$TEST_TMP_DIR"
 
 test_plain_list_items() {
     echo "Testing plain '- task' list items..."
-    printf '%s
-'- task A
-'- task B
-'- task C
-'" > "$TEST_TMP_DIR/plain.md"
+    cat > "$TEST_TMP_DIR/plain.md" <<'EOF'
+- task A
+- task B
+- task C
+EOF
 
     if has_pending_tasks "$TEST_TMP_DIR/plain.md"; then
         echo "✅ plain list detected as pending"
@@ -26,10 +26,10 @@ test_plain_list_items() {
 
 test_checklist_items() {
     echo "Testing checklist '- [ ] task' items..."
-    printf '%s
-'- [ ] check A
-'- [ ] check B
-'" > "$TEST_TMP_DIR/checklist.md"
+    cat > "$TEST_TMP_DIR/checklist.md" <<'EOF'
+- [ ] check A
+- [ ] check B
+EOF
 
     if has_pending_tasks "$TEST_TMP_DIR/checklist.md"; then
         echo "✅ checklist detected as pending"

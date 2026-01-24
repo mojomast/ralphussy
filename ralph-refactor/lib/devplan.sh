@@ -39,29 +39,16 @@ preprocess_devplan() {
     # Strip YAML frontmatter (--- ... ---) if present at the top
     if head -n1 "$out" | grep -qE '^---\s*$'; then
         # remove from first --- through the next --- (inclusive)
-        awk 'BEGIN{del=0} /^---\s*$/ { if (del==0) {del=1; next} else {del=0; next}} !del {print}' "$out" > "${out}.tmp" || true
+        awk 'BEGIN{del=0} /^---[[:space:]]*$/ { if (del==0) {del=1; next} else {del=0; next}} !del {print}' "$out" > "${out}.tmp" || true
         mv "${out}.tmp" "$out" 2>/dev/null || true
     fi
 
-    # Remove HTML comments and trim trailing/leading spaces on lines
-    # Normalize lines that begin with '- ' (plain list) to '- [ ] '
-    awk '
-    { line=$0
-      # remove HTML comments
-      gsub(/<!--.*-->/, "", line)
-      # trim leading/trailing
-      sub(/^[ \t]+/, "", line)
-      sub(/[ \t]+$/, "", line)
-      # normalize unicode checkbox markers to bracket form
-      gsub(/⏳/, "[⏳]", line)
-      gsub(/✅/, "[✅]", line)
-      gsub(/🔄/, "[🔄]", line)
-      # convert plain '- task' to '- [ ] task' but avoid double-wrapping
-      if (line ~ /^- [^-\[]/) {
-        sub(/^- /, "- [ ] ", line)
-      }
-      print line
-    }' "$out" > "${out}.norm" || true
+    # Strip HTML comments, trim whitespace and normalize checkboxes.
+    sed -E 's/<!--.*-->//' "$out" \
+        | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' \
+        | sed -E 's/⏳/[⏳]/g; s/✅/[✅]/g; s/🔄/[🔄]/g' \
+        | sed -E 's/^- ([^[])/- [ ] \1/' \
+        > "${out}.norm" || true
 
     mv "${out}.norm" "$out" 2>/dev/null || true
 
@@ -121,13 +108,13 @@ get_next_pending_task() {
     /^[[:space:]]*- \[✅\]/ { next }
     /^[[:space:]]*- \[⏳\]/ {
         sub(/^[[:space:]]*- \[⏳\] /, "")
-        gsub(/^\s+|\s+$/, "")
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "")
         print
         exit
     }
     /^[[:space:]]*- \[ \]/ {
         sub(/^[[:space:]]*- \[ \] /, "")
-        gsub(/^\s+|\s+$/, "")
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "")
         print
         exit
     }
@@ -149,23 +136,23 @@ get_all_tasks_with_states() {
     awk '
     /^[[:space:]]*- \[✅\]/ {
         sub(/^[[:space:]]*- \[✅\] /, "")
-        gsub(/^\s+|\s+$/, "")
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "")
         print "complete: " $0
     }
     /^[[:space:]]*- \[⏳\]/ {
         sub(/^[[:space:]]*- \[⏳\] /, "")
-        gsub(/^\s+|\s+$/, "")
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "")
         print "in_progress: " $0
     }
     /^[[:space:]]*- \[🔄\]/ {
         sub(/^[[:space:]]*- \[🔄\] /, "")
         gsub(/<!--.*-->/, "")
-        gsub(/^\s+|\s+$/, "")
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "")
         print "needs_review: " $0
     }
     /^[[:space:]]*- \[ \]/ {
         sub(/^[[:space:]]*- \[ \] /, "")
-        gsub(/^\s+|\s+$/, "")
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "")
         print "pending: " $0
     }
     ' "$pdev"
@@ -289,13 +276,13 @@ get_tasks_needing_review() {
     /^[ ]*- \[🔄\]/ {
         sub(/^[ ]*- \[🔄\] /, "")
         gsub(/<!--.*-->/, "")  # Remove comments
-        gsub(/^\s+|\s+$/, "")
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "")
         print
     }
     /^[ ]*- 🔄/ {
         sub(/^[ ]*- 🔄 /, "")
         gsub(/<!--.*-->/, "")  # Remove comments
-        gsub(/^\s+|\s+$/, "")
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "")
         print
     }
     ' "$devpath")
