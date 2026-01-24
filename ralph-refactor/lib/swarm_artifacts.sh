@@ -839,12 +839,10 @@ SELECT
     datetime(started_at) as started,
     datetime(completed_at) as completed
 FROM swarm_runs
-ORDER BY id DESC
-LIMIT 20;
+ORDER BY id DESC;
 EOF
     echo
 }
 
 export -f swarm_list_runs 2>/dev/null || true
-
 

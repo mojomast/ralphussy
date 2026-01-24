@@ -97,6 +97,7 @@ export class SwarmDashboard {
       left: 0,
     });
 
+    // Layout: left = actions stream, middle = tasks, right = vertical column (resources over workers)
     const middleContainer = Box({
       id: 'middle',
       flexDirection: 'row',
@@ -105,43 +106,32 @@ export class SwarmDashboard {
       position: 'relative',
     });
 
-    const workersPanel = Box({
-      id: 'workers-panel',
-      width: '40%',
+    const actionsPanel = Box({
+      id: 'actions-panel',
+      width: '30%',
       height: '100%',
-      backgroundColor: '#0d1117',
+      backgroundColor: '#071129',
       borderStyle: 'double',
-      borderColor: '#58a6ff',
-      title: ' Workers ',
+      borderColor: '#39a0ed',
+      title: ' Live Actions ',
       position: 'relative',
     });
 
-    const workersHeader = Text({
-      id: 'workers-header',
-      content: '#  Worker    Status       Task',
-      fg: '#8b949e',
-      position: 'absolute',
-      left: 1,
-      top: 1,
-    });
-
-    workersPanel.add(workersHeader);
-
-    const workersList = Box({
-      id: 'workers-list',
+    const actionsList = Box({
+      id: 'actions-list',
       flexDirection: 'column',
       width: '100%',
       height: '100%',
       position: 'absolute',
-      top: 3,
+      top: 1,
       left: 0,
     });
 
-    workersPanel.add(workersList);
+    actionsPanel.add(actionsList);
 
     const tasksPanel = Box({
       id: 'tasks-panel',
-      width: '35%',
+      width: '45%',
       height: '100%',
       backgroundColor: '#0d1117',
       borderStyle: 'double',
@@ -173,10 +163,18 @@ export class SwarmDashboard {
 
     tasksPanel.add(tasksList);
 
-    const resourcesPanel = Box({
-      id: 'resources-panel',
+    const rightColumn = Box({
+      id: 'right-column',
+      flexDirection: 'column',
       width: '25%',
       height: '100%',
+      position: 'relative',
+    });
+
+    const resourcesPanel = Box({
+      id: 'resources-panel',
+      width: '100%',
+      height: '60%',
       backgroundColor: '#0d1117',
       borderStyle: 'double',
       borderColor: '#d29922',
@@ -195,9 +193,46 @@ export class SwarmDashboard {
 
     resourcesPanel.add(resourcesText);
 
-    middleContainer.add(workersPanel);
+    const workersPanel = Box({
+      id: 'workers-panel',
+      width: '100%',
+      height: '40%',
+      backgroundColor: '#0d1117',
+      borderStyle: 'double',
+      borderColor: '#58a6ff',
+      title: ' Workers ',
+      position: 'relative',
+    });
+
+    const workersHeader = Text({
+      id: 'workers-header',
+      content: '#  Worker    Status       Task',
+      fg: '#8b949e',
+      position: 'absolute',
+      left: 1,
+      top: 1,
+    });
+
+    workersPanel.add(workersHeader);
+
+    const workersList = Box({
+      id: 'workers-list',
+      flexDirection: 'column',
+      width: '100%',
+      height: '100%',
+      position: 'absolute',
+      top: 3,
+      left: 0,
+    });
+
+    workersPanel.add(workersList);
+
+    rightColumn.add(resourcesPanel);
+    rightColumn.add(workersPanel);
+
+    middleContainer.add(actionsPanel);
     middleContainer.add(tasksPanel);
-    middleContainer.add(resourcesPanel);
+    middleContainer.add(rightColumn);
 
     const consolePanel = Box({
       id: 'console-panel',
@@ -307,17 +342,42 @@ export class SwarmDashboard {
       
       const workerText = Text({
         id: `worker-${worker.id}`,
-        content: `${index + 1}.  Worker-${worker.worker_num.toString().padStart(2)}  ${statusIcon}${worker.status.padEnd(10)}  ${taskInfo}`,
+        // Compact single-line worker display; full activity is shown in Actions panel
+        content: `${index + 1}. W${worker.worker_num.toString().padStart(2)} ${statusIcon} ${worker.status}`,
         fg: statusColor,
         position: 'relative',
       });
 
       workersList.add(workerText);
     });
+
+    // Populate the actions panel with any worker current task info
+    const actionsList = this.renderer.root.findDescendantById('actions-list');
+    if (actionsList) {
+      while (actionsList.getChildrenCount() > 0) {
+        const child = actionsList.getChildren()[0];
+        actionsList.remove(child.id);
+      }
+
+      // Show live tasks / actions from workers (current_task_id presence)
+      workers.forEach((worker) => {
+        const actionContent = worker.current_task_id ? `W${worker.worker_num}  Task:${worker.current_task_id}  ${worker.branch_name || ''}` : `W${worker.worker_num}  Idle`;
+        const actionText = Text({
+          id: `action-${worker.id}`,
+          content: actionContent,
+          fg: '#c9d1d9',
+          position: 'relative',
+        });
+        actionsList.add(actionText);
+      });
+    }
   }
 
   private updateTasks(runId: string) {
-    const tasks = this.db.getTasksByRun(runId).slice(0, 20);
+    // Show all tasks (pending/in_progress first) and allow scrolling in the
+    // TUI by not truncating here. We'll fetch and order tasks so the pane can
+    // render many entries.
+    const tasks = this.db.getTasksByRun(runId);
     const tasksList = this.renderer.root.findDescendantById('tasks-list');
     
     if (!tasksList) return;
@@ -329,18 +389,32 @@ export class SwarmDashboard {
 
     tasks.forEach((task) => {
       const statusColor = this.getStatusColor(task.status);
-      const truncatedText = task.task_text.length > 40 
-        ? task.task_text.substring(0, 37) + '...'
-        : task.task_text;
-      
+      // Word-wrap the task text to avoid overflowing the pane. Keep an
+      // abbreviated first line for quick scanning.
+      const firstLine = task.task_text.split('\n')[0].substring(0, 80);
       const taskText = Text({
         id: `task-${task.id}`,
-        content: `${task.id.toString().padStart(2)}.  ${task.status.padEnd(8)}  ${truncatedText}`,
+        content: `${task.id.toString().padStart(2)}. ${task.status.padEnd(12)} ${firstLine}`,
         fg: statusColor,
         position: 'relative',
       });
 
       tasksList.add(taskText);
+
+      // Add wrapped additional lines as separate Text nodes so panes can scroll
+      const remaining = task.task_text.length > 80 ? task.task_text.substring(80) : '';
+      if (remaining) {
+        const wrapped = remaining.match(/.{1,80}(?:\s|$)|\S+/g) || [];
+        wrapped.forEach((line, idx) => {
+          const extra = Text({
+            id: `task-${task.id}-extra-${idx}`,
+            content: `    ${line.trim()}`,
+            fg: '#8b949e',
+            position: 'relative',
+          });
+          tasksList.add(extra);
+        });
+      }
     });
   }
 

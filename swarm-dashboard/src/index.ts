@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 
+// Import the compiled JS entry so Bun/Node resolve modules normally.
+// Using a .js import here avoids TypeScript import-extension errors when
+// running the source with Bun in development.
 import { SwarmDashboard } from './dashboard.js';
 
 async function main() {

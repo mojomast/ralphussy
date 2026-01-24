@@ -14,10 +14,11 @@ export class SwarmDatabase {
         this.db.close();
     }
     getCurrentRun() {
+        // Prefer run that is currently running and has most recent heartbeat activity
         const run = this.db.query(`
-      SELECT * FROM swarm_runs 
-      WHERE status = 'running' 
-      ORDER BY started_at DESC 
+      SELECT * FROM swarm_runs
+      WHERE status = 'running'
+      ORDER BY started_at DESC
       LIMIT 1
     `).get();
         return run || null;

@@ -37,17 +37,17 @@ swarm_db_init() {
     # sqlite3 prints the new journal mode for PRAGMA journal_mode=WAL on some
     # builds; silence init output to keep tests clean.
      sqlite3 "$db_path" >/dev/null <<'EOF'
-   PRAGMA journal_mode=WAL;
-   PRAGMA synchronous=NORMAL;
-   PRAGMA foreign_keys=ON;
-   PRAGMA busy_timeout=120000;        # INCREASED: 120 seconds (was 30)
-   PRAGMA wal_autocheckpoint=1000;
-   
-   # Additional performance optimizations for high concurrency
-   PRAGMA cache_size=-64000;          # 64MB cache (negative = KB)
-   PRAGMA temp_store=MEMORY;          # Use RAM for temp tables
-   PRAGMA mmap_size=268435456;        # 256MB memory-mapped I/O
-   PRAGMA page_size=4096;             # Larger page size for better perf
+    PRAGMA journal_mode=WAL;
+    PRAGMA synchronous=NORMAL;
+    PRAGMA foreign_keys=ON;
+    PRAGMA busy_timeout=120000;        -- INCREASED: 120 seconds (was 30)
+    PRAGMA wal_autocheckpoint=1000;
+
+    -- Additional performance optimizations for high concurrency
+    PRAGMA cache_size=-64000;          -- 64MB cache (negative = KB)
+    PRAGMA temp_store=MEMORY;          -- Use RAM for temp tables
+    PRAGMA mmap_size=268435456;        -- 256MB memory-mapped I/O
+    PRAGMA page_size=4096;             -- Larger page size for better perf
 
 CREATE TABLE IF NOT EXISTS swarm_runs (
     id INTEGER PRIMARY KEY,
@@ -373,6 +373,7 @@ swarm_db_claim_task() {
         task_id=$(sqlite3 "$db_path" <<EOF 2>/dev/null
 BEGIN IMMEDIATE TRANSACTION;
 
+-- Claim a single pending task and record the worker as its owner
 UPDATE tasks
 SET status = 'in_progress',
     worker_id = $worker_id,
@@ -385,6 +386,13 @@ WHERE id IN (
     LIMIT 1
 )
 RETURNING id;
+
+-- Ensure the worker record reflects the task it's currently running
+UPDATE workers
+SET current_task_id = (SELECT id FROM tasks WHERE worker_id = $worker_id AND status = 'in_progress' ORDER BY id DESC LIMIT 1),
+    status = 'in_progress',
+    last_heartbeat = datetime('now')
+WHERE id = $worker_id;
 
 COMMIT;
 EOF

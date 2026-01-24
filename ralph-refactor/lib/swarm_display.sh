@@ -24,7 +24,7 @@ swarm_display_show_progress() {
         percentage=0
     fi
 
-    local bar_length=30
+    local bar_length=40
     local filled=$((percentage * bar_length / 100))
 
     local bar
@@ -35,32 +35,44 @@ swarm_display_show_progress() {
     echo "║  Progress: ${bar}  │  $completed_tasks/$total_tasks tasks ($percentage%)   ║"
     echo "╠══════════════════════════════════════════════════════════════════╣"
 
+    # Make these lines wrap more gracefully by printing minimal info and
+    # leaving detailed lists to the workers/tasks panes which are scrollable.
     if [ $in_progress_tasks -gt 0 ]; then
-        echo "║  In Progress: $in_progress_tasks                                              ║"
+        echo "║  In Progress: $in_progress_tasks" 
     fi
 
     if [ $failed_tasks -gt 0 ]; then
-        echo "║  Failed: $failed_tasks                                                 ║"
+        echo "║  Failed: $failed_tasks"
     fi
 }
 
 swarm_display_show_workers() {
     local workers_info="$1"
-
-    echo "║  Workers:" 
-    echo "$workers_info" | head -n 5 | while IFS='|' read -r id worker_num pid branch_name status current_task_id; do
-        if [ -n "$branch_name" ]; then
-            echo "║    $worker_num [${status^^}]  Branch: $branch_name"
-            if [ -n "$current_task_id" ]; then
-                echo "║           Task: $current_task_id"
+    # Compact worker listing; the detailed live actions will be shown in the
+    # left-hand realtime pane (stream). Show up to 10 workers but allow
+    # the caller to produce a scrollable pane of full output.
+    echo "║  Workers:"
+    local printed=0
+    echo "$workers_info" | while IFS='|' read -r id worker_num pid branch_name status current_task_id started_at last_heartbeat; do
+        if [ -z "$branch_name" ]; then
+            continue
+        fi
+        if [ $printed -lt 10 ]; then
+            local status_label="${status^^}"
+            # show basic one-line status; detailed action stream is separate
+            if [ -n "$current_task_id" ] && [ "$current_task_id" != "NULL" ]; then
+                echo "║    $worker_num [$status_label] Task:$current_task_id Branch:$branch_name"
+            else
+                echo "║    $worker_num [$status_label] Branch:$branch_name"
             fi
+            printed=$((printed + 1))
         fi
     done
 
     local total_workers
     total_workers=$(echo "$workers_info" | wc -l)
-    if [ "$total_workers" -gt 5 ]; then
-        echo "║    ... and $((total_workers - 5)) more workers"
+    if [ "$total_workers" -gt 10 ]; then
+        echo "║    ... and $((total_workers - 10)) more workers"
     fi
 }
 
@@ -116,8 +128,47 @@ swarm_display_update() {
     local worker_info
     worker_info=$(swarm_db_list_workers "$run_id" 2>/dev/null || echo "")
 
+    # Show compact progress and workers header
     swarm_display_show_progress "$completed_tasks" "$total_tasks" "$in_progress" "$failed_tasks"
     swarm_display_show_workers "$worker_info"
+
+    # Real-time stream of worker actions: read latest logs from per-worker
+    # directories and print the last few lines for each active worker. This
+    # gives a live-view to the left of the tasks pane in a TUI layout. Output
+    # is word-wrapped so panes can be scrollable and desktop TUIs can display
+    # the full text.
+    echo "╠══════════════════════════════════════════════════════════════════╣"
+    echo "║  Live Actions (most recent):"
+    if [ -n "$worker_info" ]; then
+        echo "$worker_info" | while IFS='|' read -r id worker_num pid branch_name status current_task_id started_at last_heartbeat; do
+            if [ -z "$branch_name" ]; then
+                continue
+            fi
+            # only show active workers (in_progress or recently heartbeated)
+            if [ "$status" = "in_progress" ] || [ -n "$current_task_id" ]; then
+                local log_dir="$RALPH_DIR/swarm/runs/$run_id/worker-$worker_num/logs"
+                if [ -d "$log_dir" ]; then
+                    local recent_log
+                    recent_log=$(ls -1t "$log_dir" 2>/dev/null | head -n1 || true)
+                    if [ -n "$recent_log" ]; then
+                        # Print last 5 lines wrapped at 100 chars, prefixing each line for box drawing
+                        tail -n 5 "$log_dir/$recent_log" 2>/dev/null | sed -e 's/\r$//' | fold -s -w 100 | while IFS= read -r line; do
+                            printf "║  W%02d: %s\n" "$worker_num" "$line"
+                        done
+                    else
+                        echo "║  W$worker_num: (no logs yet)"
+                    fi
+                else
+                    echo "║  W$worker_num: (no log dir)"
+                fi
+            fi
+        done
+    else
+        echo "║  (no workers registered)"
+    fi
+
+    # Tasks pane: list all pending and in-progress tasks (fully, wrapped)
+    swarm_display_show_tasks_pane "$run_id"
 
     local elapsed_time
     local remaining_time
@@ -275,6 +326,43 @@ EOF
 
     echo "=== Task $task_id ==="
     echo "$task_info"
+}
+
+
+swarm_display_show_tasks_pane() {
+    local run_id="$1"
+
+    echo "╠══════════════════════════════════════════════════════════════════╣"
+    echo "║  Tasks (pending / in_progress):"
+
+    local tasks
+    tasks=$(swarm_db_get_incomplete_tasks "$run_id" 2>/dev/null || echo "")
+
+    if [ -z "$tasks" ]; then
+        echo "║  (no pending or in-progress tasks)"
+        return 0
+    fi
+
+    # Each row from DB is: id|task_text|priority|estimated_files|devplan_line
+    echo "$tasks" | while IFS='|' read -r id task_text priority estimated_files devplan_line; do
+        # Normalize values
+        id=${id:-}
+        task_text=${task_text:-}
+        priority=${priority:-0}
+
+        # Print header line for task
+        printf "║  #%s [prio:%s]\n" "$id" "$priority"
+
+        # Wrap task text nicely to 100 chars and prefix
+        echo "$task_text" | sed -e 's/\r$//' | fold -s -w 100 | while IFS= read -r line; do
+            printf "║    %s\n" "$line"
+        done
+
+        # Show estimated files if present (wrap)
+        if [ -n "$estimated_files" ] && [ "$estimated_files" != "null" ]; then
+            echo "║    EstFiles: $estimated_files" | fold -s -w 100 | sed -e 's/^/║    /'
+        fi
+    done
 }
 
 swarm_display_show_waiting_workers() {

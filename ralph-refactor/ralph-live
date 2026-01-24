@@ -255,14 +255,44 @@ project_generate_devplan_with_opencode() {
         return 1
     fi
 
-    local opencode_cmd="opencode run"
-    local use_model="${MODEL:-glm-4.7}"
-    if [ -n "${PROVIDER:-}" ]; then
-        use_model="${PROVIDER}/${MODEL:-glm-4.7}"
-    else
-        use_model="zai-coding-plan/${MODEL:-glm-4.7}"
+    # Select model interactively
+    echo ""
+    echo -e "${CYAN}Select model for DevPlan generation:${NC}"
+    echo ""
+    
+    SELECTED_PROVIDER=""
+    if ! select_provider_interactive; then
+        echo -e "${YELLOW}DevPlan generation cancelled; writing template instead${NC}"
+        project_write_devplan_template "$path" "$title"
+        return 1
     fi
-    opencode_cmd="$opencode_cmd --model $use_model"
+    local gen_provider="$SELECTED_PROVIDER"
+
+    if [ -z "$gen_provider" ]; then
+        echo -e "${YELLOW}DevPlan generation cancelled; writing template instead${NC}"
+        project_write_devplan_template "$path" "$title"
+        return 1
+    fi
+
+    SELECTED_MODEL=""
+    if ! select_model_interactive "$gen_provider"; then
+        echo -e "${YELLOW}DevPlan generation cancelled; writing template instead${NC}"
+        project_write_devplan_template "$path" "$title"
+        return 1
+    fi
+    local gen_model="$SELECTED_MODEL"
+
+    if [ -z "$gen_model" ]; then
+        echo -e "${YELLOW}DevPlan generation cancelled; writing template instead${NC}"
+        project_write_devplan_template "$path" "$title"
+        return 1
+    fi
+
+    echo ""
+    echo -e "${CYAN}Generating DevPlan with: ${GREEN}$gen_model${NC}"
+    echo ""
+
+    local opencode_cmd="opencode run --model $gen_model"
 
     local prompt
     prompt=$(cat <<EOF
@@ -308,11 +338,15 @@ DO NOT use tools, code blocks, or markdown fences. Just plain markdown text.
 EOF
 )
 
-    echo -e "${CYAN}Generating DevPlan with opencode...${NC}"
-
     local json_output=""
-    if ! json_output=$($opencode_cmd --format json "$prompt" 2>&1); then
-        echo -e "${RED}DevPlan generation failed; writing template instead${NC}"
+    # Use timeout to prevent hanging (120 seconds max)
+    if ! json_output=$(timeout 120 $opencode_cmd --format json "$prompt" 2>&1); then
+        local exit_code=$?
+        if [ $exit_code -eq 124 ]; then
+            echo -e "${RED}DevPlan generation timed out; writing template instead${NC}"
+        else
+            echo -e "${RED}DevPlan generation failed; writing template instead${NC}"
+        fi
         project_write_devplan_template "$path" "$title"
         return 1
     fi
@@ -347,14 +381,40 @@ project_reiterate_devplan_with_opencode() {
     local existing_devplan
     existing_devplan=$(cat "$path")
 
-    local opencode_cmd="opencode run"
-    local use_model="${MODEL:-glm-4.7}"
-    if [ -n "${PROVIDER:-}" ]; then
-        use_model="${PROVIDER}/${MODEL:-glm-4.7}"
-    else
-        use_model="zai-coding-plan/${MODEL:-glm-4.7}"
+    # Select model interactively
+    echo ""
+    echo -e "${CYAN}Select model for DevPlan reiteration:${NC}"
+    echo ""
+    
+    SELECTED_PROVIDER=""
+    if ! select_provider_interactive; then
+        echo -e "${YELLOW}DevPlan reiteration cancelled${NC}"
+        return 1
     fi
-    opencode_cmd="$opencode_cmd --model $use_model"
+    local reit_provider="$SELECTED_PROVIDER"
+
+    if [ -z "$reit_provider" ]; then
+        echo -e "${YELLOW}DevPlan reiteration cancelled${NC}"
+        return 1
+    fi
+
+    SELECTED_MODEL=""
+    if ! select_model_interactive "$reit_provider"; then
+        echo -e "${YELLOW}DevPlan reiteration cancelled${NC}"
+        return 1
+    fi
+    local reit_model="$SELECTED_MODEL"
+
+    if [ -z "$reit_model" ]; then
+        echo -e "${YELLOW}DevPlan reiteration cancelled${NC}"
+        return 1
+    fi
+
+    echo ""
+    echo -e "${CYAN}Reiterating DevPlan with: ${GREEN}$reit_model${NC}"
+    echo ""
+
+    local opencode_cmd="opencode run --model $reit_model"
 
     local prompt
     prompt=$(cat <<EOF
@@ -403,11 +463,15 @@ DO NOT use tools, code blocks, or markdown fences. Just plain markdown text.
 EOF
 )
 
-    echo -e "${CYAN}Reiterating DevPlan with opencode...${NC}"
-
     local json_output=""
-    if ! json_output=$($opencode_cmd --format json "$prompt" 2>&1); then
-        echo -e "${RED}DevPlan reiteration failed${NC}"
+    # Use timeout to prevent hanging (120 seconds max)
+    if ! json_output=$(timeout 120 $opencode_cmd --format json "$prompt" 2>&1); then
+        local exit_code=$?
+        if [ $exit_code -eq 124 ]; then
+            echo -e "${RED}DevPlan reiteration timed out${NC}"
+        else
+            echo -e "${RED}DevPlan reiteration failed${NC}"
+        fi
         return 1
     fi
 
@@ -487,6 +551,20 @@ project_review_devplan_with_model() {
 
     local opencode_cmd="opencode run --model $review_model"
 
+    # Ask if the user wants to include extra instructions for the reviewer
+    local add_prompt_choice=""
+    local custom_prompt=""
+    echo ""
+    echo -n -e "${YELLOW}Add extra instructions for the reviewer? (y/N): ${NC}"
+    read_user_input add_prompt_choice
+    if [[ "${add_prompt_choice:-}" =~ ^[Yy]$ ]]; then
+        echo ""
+        echo -e "${CYAN}Describe additional instructions for the reviewer (Ctrl+D when done):${NC}"
+        custom_prompt=$(read_multiline_input)
+        # Ensure it's not empty
+        custom_prompt="${custom_prompt:-}"
+    fi
+
     local prompt
     prompt=$(cat <<'REVIEWPROMPT'
 You are an expert software architect and project planner reviewing a DevPlan. Your job is to analyze the plan and provide EITHER:
@@ -498,6 +576,9 @@ PROJECT NAME: TITLE_PLACEHOLDER
 
 CURRENT DEVPLAN:
 DEVPLAN_PLACEHOLDER
+
+ADDITIONAL INSTRUCTIONS:
+CUSTOM_PROMPT_PLACEHOLDER
 
 ANALYZE THE DEVPLAN FOR:
 
@@ -572,13 +653,21 @@ REVIEWPROMPT
     # Replace placeholders
     prompt="${prompt//TITLE_PLACEHOLDER/$title}"
     prompt="${prompt//DEVPLAN_PLACEHOLDER/$existing_devplan}"
+    # Insert custom prompt (may be empty)
+    prompt="${prompt//CUSTOM_PROMPT_PLACEHOLDER/$custom_prompt}"
 
     echo -e "${CYAN}Analyzing DevPlan...${NC}"
     echo ""
 
     local json_output=""
-    if ! json_output=$($opencode_cmd --format json "$prompt" 2>&1); then
-        echo -e "${RED}DevPlan review failed${NC}"
+    # Use timeout to avoid hanging (120s)
+    if ! json_output=$(timeout 120 $opencode_cmd --format json "$prompt" 2>&1); then
+        local exit_code=$?
+        if [ $exit_code -eq 124 ]; then
+            echo -e "${RED}DevPlan review timed out${NC}"
+        else
+            echo -e "${RED}DevPlan review failed${NC}"
+        fi
         return 1
     fi
 
@@ -718,14 +807,36 @@ project_start_swarm_devplan() {
 
     if [ -n "$CURRENT_PROJECT_WORKDIR" ] && [ -d "$CURRENT_PROJECT_WORKDIR" ]; then
         echo -e "${CYAN}Workdir:${NC} $CURRENT_PROJECT_WORKDIR"
-        (cd "$CURRENT_PROJECT_WORKDIR" && "$SCRIPT_DIR/ralph-swarm" --devplan "$CURRENT_PROJECT_DEVPLAN" \
+        # Ensure swarm provider/model set or prompt for selection
+        if [ -z "${SWARM_PROVIDER:-}" ] || [ -z "${SWARM_MODEL:-}" ]; then
+            echo -n -e "${YELLOW}No swarm provider/model set. Select now? (Y/n): ${NC}"
+            local _choose
+            read_user_input _choose
+            if [[ ! "${_choose:-}" =~ ^[Nn]$ ]]; then
+                select_swarm_model || true
+            fi
+        fi
+
+        echo "Using swarm provider/model: ${SWARM_PROVIDER:-(agent)}/${SWARM_MODEL:-(agent)}"
+        # Export env vars so ralph-swarm receives them consistently
+        (cd "$CURRENT_PROJECT_WORKDIR" && RALPH_LLM_PROVIDER="${SWARM_PROVIDER:-}" RALPH_LLM_MODEL="${SWARM_MODEL:-}" "$SCRIPT_DIR/ralph-swarm" --devplan "$CURRENT_PROJECT_DEVPLAN" \
             --workers "$workers" \
             ${SWARM_PROVIDER:+--provider "$SWARM_PROVIDER"} \
             ${SWARM_MODEL:+--model "$SWARM_MODEL"} \
             ${MODEL:+--model "$MODEL"} \
             ${PROVIDER:+--provider "$PROVIDER"})
     else
-        "$SCRIPT_DIR/ralph-swarm" --devplan "$CURRENT_PROJECT_DEVPLAN" \
+        if [ -z "${SWARM_PROVIDER:-}" ] || [ -z "${SWARM_MODEL:-}" ]; then
+            echo -n -e "${YELLOW}No swarm provider/model set. Select now? (Y/n): ${NC}"
+            local _choose2
+            read_user_input _choose2
+            if [[ ! "${_choose2:-}" =~ ^[Nn]$ ]]; then
+                select_swarm_model || true
+            fi
+        fi
+
+        echo "Using swarm provider/model: ${SWARM_PROVIDER:-(agent)}/${SWARM_MODEL:-(agent)}"
+        RALPH_LLM_PROVIDER="${SWARM_PROVIDER:-}" RALPH_LLM_MODEL="${SWARM_MODEL:-}" "$SCRIPT_DIR/ralph-swarm" --devplan "$CURRENT_PROJECT_DEVPLAN" \
             --workers "$workers" \
             ${SWARM_PROVIDER:+--provider "$SWARM_PROVIDER"} \
             ${SWARM_MODEL:+--model "$SWARM_MODEL"} \
@@ -810,6 +921,9 @@ EOF
         echo ""
 
         echo -e "${CYAN}Options:${NC}"
+        # show current swarm settings and offer a selector
+        show_swarm_model
+        echo -e "  ${GREEN}m${NC}  Select model/provider for swarm"
         echo -e "  ${GREEN}e${NC}  Edit devplan manually"
         echo -e "  ${GREEN}r${NC}  Reiterate devplan (with feedback)"
         echo -e "  ${GREEN}a${NC}  Analyze with another model (review for issues/gaps)"
@@ -841,6 +955,10 @@ EOF
                 ;;
             a|A)
                 project_review_devplan_with_model "$devplan_path" "$name" || true
+                ;;
+            m|M)
+                echo ""
+                select_swarm_model || true
                 ;;
             c|C)
                 echo ""
@@ -1231,6 +1349,15 @@ project_menu() {
                 read_user_input
                 ;;
             3)
+                # Offer model selection before starting swarm
+                echo ""
+                echo -n -e "  ${YELLOW}Select a swarm provider/model before starting? (Y/n): ${NC}"
+                local _selm
+                read_user_input _selm
+                if [[ ! "${_selm:-}" =~ ^[Nn]$ ]]; then
+                    select_swarm_model || true
+                fi
+
                 project_start_swarm_devplan || true
                 echo ""
                 echo -e "${CYAN}Press Enter to continue...${NC}"
@@ -1300,7 +1427,29 @@ EOF
 # ============================================================================
 
 get_all_providers() {
-    opencode models 2>/dev/null | cut -d'/' -f1 | sort -u | grep -v '^$' || echo "opencode"
+    # Prefer opencode debug config (gives authoritative provider list)
+    if command -v opencode >/dev/null 2>&1; then
+        # Try jq-based parse first
+        if command -v jq >/dev/null 2>&1; then
+            local providers
+            providers=$(opencode debug config 2>/dev/null | jq -r '.provider | keys[]' 2>/dev/null || true)
+            if [ -n "$providers" ]; then
+                printf '%s\n' "$providers" | sort -u
+                return 0
+            fi
+        fi
+
+        # Fallback: use opencode models output and extract provider prefix
+        local models_out
+        models_out=$(opencode models 2>/dev/null || true)
+        if [ -n "$models_out" ]; then
+            printf '%s\n' "$models_out" | cut -d'/' -f1 | sort -u | grep -v '^$' || true
+            return 0
+        fi
+    fi
+
+    # If opencode not present or no providers found, return empty
+    echo ""
 }
 
 get_models_for_provider() {
