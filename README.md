@@ -19,6 +19,10 @@ Ralphussy is a comprehensive distribution of the "Ralph" autonomous agent toolin
 
 See [IMPLEMENTATION_COMPLETED.md](IMPLEMENTATION_COMPLETED.md) for detailed documentation.
 
+**New (2026-01-24): Completed remaining optimizations**
+- ✅ Task batching look-ahead optimization (removes O(n^2) scans on large devplans)
+- ✅ Removed duplicated OpenCode execution logic (shared helper used by loop + devplan)
+
 ## 📦 What's Included
 
 This repository contains a self-contained distribution of the Ralph tooling:

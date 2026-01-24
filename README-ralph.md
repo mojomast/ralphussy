@@ -80,6 +80,9 @@ Simple tasks (renames, small fixes, etc.) are automatically batched together:
 - Reduces API calls for trivial changes
 - Tasks estimated as "simple" based on length and keywords
 
+Implementation note: devplan batching now pre-parses pending tasks once and uses
+array lookahead, avoiding repeated full-file scans on large devplans.
+
 ## Installation
 
 ### System-wide Install

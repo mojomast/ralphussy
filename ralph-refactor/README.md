@@ -7,6 +7,10 @@ Goals:
 - Isolate the Unicode-heavy / fast-changing sections (like the live monitor) into separate modules.
 - Reduce the chance that a partial edit or encoding hiccup corrupts the entire script.
 
+Recent refactor (2026-01-24): The duplicated "opencode run" plumbing used by loop
+mode and devplan mode is now shared via `_ralph_execute_opencode` in
+`ralph-refactor/lib/core.sh`.
+
 Files:
 - `ralph-refactor/ralph` - Refactor candidate entrypoint (sources modules from `ralph-refactor/lib/`).
 - `ralph-refactor/ralph.orig` - Snapshot of the copied script before refactoring.

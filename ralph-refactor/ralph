@@ -170,98 +170,14 @@ $context"
     log_info "=========================================="
     echo ""
     
-    # Build command for real-time output
-    local opencode_cmd="opencode run"
-    if [ -n "$PROVIDER" ]; then
-        opencode_cmd="$opencode_cmd --provider $PROVIDER"
-    fi
-    if [ -n "$MODEL" ]; then
-        opencode_cmd="$opencode_cmd --model $MODEL"
-    fi
-    
-    # Show API request info
-    echo -e "${BLUE}📤 API REQUEST${NC}"
-    echo -e "   ${YELLOW}Provider:${NC} ${PROVIDER:-default}"
-    echo -e "   ${YELLOW}Model:${NC} ${MODEL:-default}"
-    echo -e "   ${YELLOW}Prompt:${NC} $(echo "$full_prompt" | head -c 100 | tr '\n' ' ')..."
-    echo ""
-    
-    # Show waiting indicator
-    echo -e "${YELLOW}⏳ Waiting for API response...${NC}"
-    
-    # Start background monitor
-    start_monitor
-    
-    # Run with JSON format - single API call
-    local start_time=$(date +%s)
-    local json_output=$($opencode_cmd --format json "$full_prompt" 2>&1)
-    local exit_code=$?
-    local end_time=$(date +%s)
-    local duration=$((end_time - start_time))
-    
-    # Stop background monitor
-    stop_monitor
-    
-    # Clear waiting message and show response received
-    echo -e "${GREEN}📥 API RESPONSE received (${duration}s)${NC}"
-    echo ""
-    
-    # Check for API errors
-    if [ $exit_code -ne 0 ]; then
-        log_error "API call failed with exit code $exit_code"
-        echo -e "${RED}Error output: $(echo "$json_output" | head -c 200)${NC}"
+    local preview
+    preview=$(echo "$full_prompt" | head -c 100 | tr '\n' ' ')
+    if ! _ralph_execute_opencode "$full_prompt" "" "" "$preview..."; then
         return 1
     fi
-    
-    # Extract text content for display and completion check (robust helper)
-    local text_output=""
-    text_output=$(json_extract_text "$json_output") || text_output=""
-    
-    # Display tool calls and output (filter out Ralph's own headers)
-    echo "$text_output" | tr '|' '\n' | grep -vE '^\[RALPH\]|^=== Task|^=================================|^[0-9]\+' | while IFS= read -r line; do
-        line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-        if [ -z "$line" ]; then
-            continue
-        fi
-        if echo "$line" | grep -qE '^(Read|Write|Edit|Bash|grep|glob|task|webfetch|codesearch|websearch|todoread|todowrite)'; then
-            echo -e "\033[0;36m🔧 $line\033[0m"
-        elif echo "$line" | grep -qE '^Thinking|^Analyzing|^Searching|^Reading|^Writing|^Executing'; then
-            echo -e "\033[0;33m💭 $line\033[0m"
-        elif echo "$line" | grep -qE '^(✅|❌|⚠️|ℹ️|🔧)'; then
-            echo -e "\033[0;32m$line\033[0m"
-        elif echo "$line" | grep -qE '^\[.*\]'; then
-            echo "$line"
-        else
-            echo "$line"
-        fi
-    done
-    
-    echo ""
-    log_info "----------------------------------------"
-    
-    # Parse token stats from JSON
-    local prompt_tokens=0
-    local completion_tokens=0
-    local cost=0
-    if command -v jq &> /dev/null; then
-        prompt_tokens=$(echo "$json_output" | jq -r '.part.tokens.input // .tokens.input // 0' 2>/dev/null | head -1) || prompt_tokens=0
-        completion_tokens=$(echo "$json_output" | jq -r '.part.tokens.output // .tokens.output // 0' 2>/dev/null | head -1) || completion_tokens=0
-        cost=$(echo "$json_output" | jq -r '.part.cost // .cost // 0' 2>/dev/null | head -1) || cost=0
-    fi
-    local total_tokens=$((prompt_tokens + completion_tokens))
-    
-    log_info "Provider/Model: ${PROVIDER:-opencode}/${MODEL:-default} | Tokens: ${prompt_tokens:-0}→${completion_tokens:-0} (total: ${total_tokens:-0}) | Cost: \$${cost:-0} | Duration: ${duration}s"
-    
-    # Extract tool calls from JSON
-    local tools_used=""
-    tools_used=$(json_extract_tools "$json_output") || tools_used=""
-    if [ -n "$tools_used" ]; then
-        log_info "Tools used: $tools_used"
-    fi
-    
-    log_info "----------------------------------------"
-    echo ""
-    
+
+    local text_output="$RALPH_LAST_TEXT_OUTPUT"
+
     # Check for completion promise (case-insensitive, space-tolerant)
     if echo "$text_output" | grep -qiE "<\s*promise\s*>${COMPLETION_PROMISE}<\s*/\s*promise\s*>"; then
         log_success "Completion promise detected!"
@@ -817,10 +733,44 @@ BANNER
             local consecutive_failures=0
             local max_consecutive_failures=3
             
+            log_info "📋 Parsing devplan tasks..."
+            local -a all_pending_tasks
+            mapfile -t all_pending_tasks < <(awk '
+                # Skip completed / needs-review
+                /^[ ]*- \[✅\]/ { next }
+                /^[ ]*- ✅/ { next }
+                /^[ ]*- \[🔄\]/ { next }
+                /^[ ]*- 🔄/ { next }
+
+                # In-progress
+                /^[ ]*- \[⏳\]/ {
+                    sub(/^[ ]*- \[⏳\] /, "")
+                    gsub(/^\s+|\s+$/, "")
+                    print
+                    next
+                }
+                /^[ ]*- ⏳/ {
+                    sub(/^[ ]*- ⏳ /, "")
+                    gsub(/^\s+|\s+$/, "")
+                    print
+                    next
+                }
+
+                # Pending
+                /^[ ]*- \[ \]/ {
+                    sub(/^[ ]*- \[ \] /, "")
+                    gsub(/^\s+|\s+$/, "")
+                    print
+                    next
+                }
+            ' "$devfile")
+            local total_pending="${#all_pending_tasks[@]}"
+            log_info "   Found $total_pending pending tasks"
+
             # Main loop - continues until all tasks are complete or max iterations
-            while [ $task_count -lt $max_tasks ]; do
-                # Get next pending task
-                local task=$(get_next_pending_task "$devfile")
+            local current_task_index=0
+            while [ $current_task_index -lt ${#all_pending_tasks[@]} ] && [ $task_count -lt $max_tasks ]; do
+                local task="${all_pending_tasks[$current_task_index]}"
                 
                 if [ -z "$task" ]; then
                     # Double-check: are there really no pending tasks?
@@ -852,40 +802,27 @@ BANNER
                 log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
                 echo ""
                 
-                # Mark task as in progress
+                # Mark task as in progress (if it isn't already)
                 mark_task_in_progress "$devfile" "$task"
                 
                 # Check if we should batch this with additional simple tasks
                 local batch_tasks="$task"
                 local batch_count=1
-                local next_task_preview=$(get_next_pending_task "$devfile" | head -1)
+                local lookahead_index=$((current_task_index + 1))
                 
                 # Look ahead for simple tasks to batch (max 2 additional)
-                while [ $batch_count -lt 3 ] && should_batch_tasks "$task" "$next_task_preview"; do
-                    # Get the actual next pending task after current
-                    local temp_next=$(awk -v current="$task" '
-                        BEGIN { found_current=0 }
-                        /^[ ]*- \[ \]/ {
-                            if (found_current) {
-                                sub(/^[ ]*- \[ \] /, "")
-                                gsub(/^\s+|\s+$/, "")
-                                print
-                                exit
-                            }
-                        }
-                        $0 ~ current { found_current=1 }
-                    ' "$devfile")
-                    
-                    if [ -n "$temp_next" ] && should_batch_tasks "$task" "$temp_next"; then
+                while [ $batch_count -lt 3 ] && [ $lookahead_index -lt ${#all_pending_tasks[@]} ]; do
+                    local next_task="${all_pending_tasks[$lookahead_index]}"
+                    if [ -n "$next_task" ] && should_batch_tasks "$task" "$next_task"; then
                         batch_tasks="$batch_tasks
-- $temp_next"
+- $next_task"
                         batch_count=$((batch_count + 1))
-                        mark_task_in_progress "$devfile" "$temp_next"
-                        log_info "📦 Batching simple task: $temp_next"
+                        mark_task_in_progress "$devfile" "$next_task"
+                        log_info "📦 Batching simple task: $next_task"
+                        lookahead_index=$((lookahead_index + 1))
                     else
                         break
                     fi
-                    next_task_preview="$temp_next"
                 done
                 
                 if [ $batch_count -gt 1 ]; then
@@ -992,6 +929,9 @@ Begin work now."
                     fi
                 fi
                 
+                # Advance by the number of tasks processed (batched tasks)
+                current_task_index=$((current_task_index + batch_count))
+
                 # Check for too many consecutive failures
                 if [ "$consecutive_failures" -ge "$max_consecutive_failures" ]; then
                     log_warning "⚠️  $consecutive_failures consecutive failures. Consider reviewing the devplan or adding context."

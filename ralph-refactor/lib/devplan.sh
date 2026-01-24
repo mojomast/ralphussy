@@ -510,102 +510,15 @@ run_devplan_iteration() {
     log_info "=========================================="
     echo ""
 
-    # Build command for real-time output
-    local opencode_cmd="opencode run"
-    if [ -n "$PROVIDER" ]; then
-        opencode_cmd="$opencode_cmd --provider $PROVIDER"
-    fi
-    if [ -n "$MODEL" ]; then
-        opencode_cmd="$opencode_cmd --model $MODEL"
-    fi
-
-    # Show API request info
-    echo -e "${BLUE}📤 API REQUEST${NC}"
-    echo -e "   ${YELLOW}Provider:${NC} ${PROVIDER:-default}"
-    echo -e "   ${YELLOW}Model:${NC} ${MODEL:-default}"
-    echo -e "   ${YELLOW}Task:${NC} $task"
-    echo -e "   ${YELLOW}DevPlan:${NC} $devfile"
-    echo ""
-
-    # Show waiting indicator
-    echo -e "${YELLOW}⏳ Waiting for API response...${NC}"
-
-    # Start background monitor
-    start_monitor
-
-    # Run with JSON format - single API call
-    local start_time
-    start_time=$(date +%s)
-    local json_output
-    json_output=$($opencode_cmd --format json "$prompt" 2>&1)
-    local exit_code=$?
-    local end_time
-    end_time=$(date +%s)
-    local duration=$((end_time - start_time))
-
-    # Stop background monitor
-    stop_monitor
-
-    # Clear waiting message and show response received
-    echo -e "${GREEN}📥 API RESPONSE received (${duration}s)${NC}"
-    echo ""
-
-    # Check for API errors
-    if [ $exit_code -ne 0 ]; then
-        log_error "API call failed with exit code $exit_code"
-        echo -e "${RED}Error output: $(echo "$json_output" | head -c 500)${NC}"
+    if ! _ralph_execute_opencode "$prompt" "$task" "$devfile"; then
         record_stall_attempt "$task"
         return 1
     fi
 
-    # Extract text content for display (robust helper)
-    local text_output=""
-    text_output=$(json_extract_text "$json_output") || text_output=""
-
-    # Display tool calls and output (filter out Ralph's own headers)
-    echo "$text_output" | tr '|' '\n' | grep -vE '^\[RALPH\]|^=== Task|^=================================|^[0-9]\+' | while IFS= read -r line; do
-        line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-        if [ -z "$line" ]; then
-            continue
-        fi
-        if echo "$line" | grep -qE '^(Read|Write|Edit|Bash|grep|glob|task|webfetch|codesearch|websearch|todoread|todowrite)'; then
-            echo -e "\033[0;36m🔧 $line\033[0m"
-        elif echo "$line" | grep -qE '^Thinking|^Analyzing|^Searching|^Reading|^Writing|^Executing|^Running|^Created|^Modified|^Updated'; then
-            echo -e "\033[0;33m💭 $line\033[0m"
-        elif echo "$line" | grep -qE '^(✅|❌|⚠️|ℹ️|🔧|📁|📝)'; then
-            echo -e "\033[0;32m$line\033[0m"
-        elif echo "$line" | grep -qE '^\[.*\]'; then
-            echo "$line"
-        else
-            echo "$line"
-        fi
-    done
-
-    echo ""
-    log_info "----------------------------------------"
-
-    # Parse token stats from JSON
-    local prompt_tokens=0
-    local completion_tokens=0
-    local cost=0
-    if command -v jq &> /dev/null; then
-        prompt_tokens=$(echo "$json_output" | jq -r '.part.tokens.input // .tokens.input // 0' 2>/dev/null | head -1) || prompt_tokens=0
-        completion_tokens=$(echo "$json_output" | jq -r '.part.tokens.output // .tokens.output // 0' 2>/dev/null | head -1) || completion_tokens=0
-        cost=$(echo "$json_output" | jq -r '.part.cost // .cost // 0' 2>/dev/null | head -1) || cost=0
-    fi
-    local total_tokens=$((prompt_tokens + completion_tokens))
-
-    log_info "Provider/Model: ${PROVIDER:-opencode}/${MODEL:-default} | Tokens: ${prompt_tokens:-0}→${completion_tokens:-0} (total: ${total_tokens:-0}) | Cost: \$${cost:-0} | Duration: ${duration}s"
-
-    # Extract tool calls from JSON
-    local tools_used=""
-    tools_used=$(json_extract_tools "$json_output") || tools_used=""
-    if [ -n "$tools_used" ]; then
-        log_info "Tools used: $tools_used"
-    fi
-
-    log_info "----------------------------------------"
-    echo ""
+    local text_output="$RALPH_LAST_TEXT_OUTPUT"
+    local tools_used="$RALPH_LAST_TOOLS_USED"
+    local duration="$RALPH_LAST_DURATION"
+    local total_tokens="$RALPH_LAST_TOTAL_TOKENS"
 
     # Check for completion (case-insensitive, space-tolerant)
     if echo "$text_output" | grep -qiE "<\s*promise\s*>${COMPLETION_PROMISE}<\s*/\s*promise\s*>"; then

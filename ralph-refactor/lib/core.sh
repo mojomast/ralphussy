@@ -49,6 +49,129 @@ MAGENTA='\033[0;35m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
+# ---------------------------------------------------------------------------
+# Shared OpenCode execution (used by loop + devplan modes)
+
+RALPH_LAST_TEXT_OUTPUT=""
+RALPH_LAST_TOOLS_USED=""
+RALPH_LAST_DURATION=0
+RALPH_LAST_TOTAL_TOKENS=0
+RALPH_LAST_COST=0
+RALPH_LAST_EXIT_CODE=0
+
+_ralph_execute_opencode() {
+    local prompt="$1"
+    local task="${2:-}"
+    local devfile="${3:-}"
+    local prompt_preview="${4:-}"
+
+    RALPH_LAST_TEXT_OUTPUT=""
+    RALPH_LAST_TOOLS_USED=""
+    RALPH_LAST_DURATION=0
+    RALPH_LAST_TOTAL_TOKENS=0
+    RALPH_LAST_COST=0
+    RALPH_LAST_EXIT_CODE=0
+
+    # Build command
+    local opencode_cmd="opencode run"
+    if [ -n "${PROVIDER:-}" ]; then
+        opencode_cmd="$opencode_cmd --provider $PROVIDER"
+    fi
+    if [ -n "${MODEL:-}" ]; then
+        opencode_cmd="$opencode_cmd --model $MODEL"
+    fi
+
+    # Show API request info
+    echo -e "${BLUE}📤 API REQUEST${NC}"
+    echo -e "   ${YELLOW}Provider:${NC} ${PROVIDER:-default}"
+    echo -e "   ${YELLOW}Model:${NC} ${MODEL:-default}"
+    if [ -n "$task" ]; then
+        echo -e "   ${YELLOW}Task:${NC} $task"
+    fi
+    if [ -n "$devfile" ]; then
+        echo -e "   ${YELLOW}DevPlan:${NC} $devfile"
+    fi
+    if [ -z "$task" ] && [ -n "$prompt_preview" ]; then
+        echo -e "   ${YELLOW}Prompt:${NC} $prompt_preview"
+    fi
+    echo ""
+
+    echo -e "${YELLOW}⏳ Waiting for API response...${NC}"
+
+    start_monitor
+
+    local start_time
+    start_time=$(date +%s)
+    local json_output
+    json_output=$($opencode_cmd --format json "$prompt" 2>&1)
+    local exit_code=$?
+    local end_time
+    end_time=$(date +%s)
+    local duration=$((end_time - start_time))
+
+    stop_monitor
+
+    RALPH_LAST_EXIT_CODE=$exit_code
+    RALPH_LAST_DURATION=$duration
+
+    echo -e "${GREEN}📥 API RESPONSE received (${duration}s)${NC}"
+    echo ""
+
+    if [ $exit_code -ne 0 ]; then
+        log_error "API call failed with exit code $exit_code"
+        echo -e "${RED}Error output: $(echo "$json_output" | head -c 500)${NC}"
+        return 1
+    fi
+
+    local text_output=""
+    text_output=$(json_extract_text "$json_output") || text_output=""
+    RALPH_LAST_TEXT_OUTPUT="$text_output"
+
+    local tools_used=""
+    tools_used=$(json_extract_tools "$json_output") || tools_used=""
+    RALPH_LAST_TOOLS_USED="$tools_used"
+
+    # Display tool calls and output (filter out Ralph's own headers)
+    echo "$text_output" | tr '|' '\n' | grep -vE '^\[RALPH\]|^=== Task|^=================================|^[0-9]\+' | while IFS= read -r line; do
+        line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        [ -z "$line" ] && continue
+        if echo "$line" | grep -qE '^(Read|Write|Edit|Bash|grep|glob|task|webfetch|codesearch|websearch|todoread|todowrite)'; then
+            echo -e "\033[0;36m🔧 $line\033[0m"
+        elif echo "$line" | grep -qE '^(Thinking|Analyzing|Searching|Reading|Writing|Executing|Running|Created|Modified|Updated)'; then
+            echo -e "\033[0;33m💭 $line\033[0m"
+        elif echo "$line" | grep -qE '^(✅|❌|⚠️|ℹ️|🔧|📁|📝)'; then
+            echo -e "\033[0;32m$line\033[0m"
+        elif echo "$line" | grep -qE '^\[.*\]'; then
+            echo "$line"
+        else
+            echo "$line"
+        fi
+    done
+
+    echo ""
+    log_info "----------------------------------------"
+
+    local prompt_tokens=0
+    local completion_tokens=0
+    local cost=0
+    if command -v jq &> /dev/null; then
+        prompt_tokens=$(echo "$json_output" | jq -r '.part.tokens.input // .tokens.input // 0' 2>/dev/null | head -1) || prompt_tokens=0
+        completion_tokens=$(echo "$json_output" | jq -r '.part.tokens.output // .tokens.output // 0' 2>/dev/null | head -1) || completion_tokens=0
+        cost=$(echo "$json_output" | jq -r '.part.cost // .cost // 0' 2>/dev/null | head -1) || cost=0
+    fi
+    local total_tokens=$((prompt_tokens + completion_tokens))
+    RALPH_LAST_TOTAL_TOKENS=$total_tokens
+    RALPH_LAST_COST=$cost
+
+    log_info "Provider/Model: ${PROVIDER:-opencode}/${MODEL:-default} | Tokens: ${prompt_tokens:-0}→${completion_tokens:-0} (total: ${total_tokens:-0}) | Cost: \$${cost:-0} | Duration: ${duration}s"
+    if [ -n "$tools_used" ]; then
+        log_info "Tools used: $tools_used"
+    fi
+    log_info "----------------------------------------"
+    echo ""
+    return 0
+ }
+
 log_info() {
     echo -e "${BLUE}[RALPH]${NC} $1"
 }
