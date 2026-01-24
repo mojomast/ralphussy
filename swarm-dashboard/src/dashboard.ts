@@ -327,23 +327,36 @@ export class SwarmDashboard {
   private updateWorkers(runId: string) {
     const workers = this.db.getWorkersByRun(runId);
     const workersList = this.renderer.root.findDescendantById('workers-list');
-    
-    if (!workersList) return;
+    if (!workersList)
+      return;
 
     while (workersList.getChildrenCount() > 0) {
       const child = workersList.getChildren()[0];
       workersList.remove(child.id);
     }
 
+    // Resiliency: some DB updates set task.worker_id but may not update
+    // workers.current_task_id immediately. Build a mapping from tasks so
+    // we can display accurate live activity.
+    const allTasks = this.db.getTasksByRun(runId);
+    const inProgressByWorker = new Map<number, any>();
+    for (const t of allTasks) {
+      if (t.status === 'in_progress' && t.worker_id) {
+        inProgressByWorker.set(t.worker_id, t);
+      }
+    }
+
     workers.forEach((worker, index) => {
       const statusColor = this.getStatusColor(worker.status);
       const statusIcon = this.getStatusIcon(worker.status);
-      const taskInfo = worker.current_task_id ? `Task #${worker.current_task_id}` : 'Idle';
-      
+
+      // Prefer the worker.current_task_id, but fall back to tasks table mapping
+      const assignedTaskId = worker.current_task_id || (inProgressByWorker.get(worker.id)?.id ?? null);
+
       const workerText = Text({
         id: `worker-${worker.id}`,
         // Compact single-line worker display; full activity is shown in Actions panel
-        content: `${index + 1}. W${worker.worker_num.toString().padStart(2)} ${statusIcon} ${worker.status}`,
+        content: `${index + 1}. W${worker.worker_num.toString().padStart(2)} ${statusIcon} ${worker.status}${assignedTaskId ? ' [' + 'T#' + assignedTaskId + ']' : ''}`,
         fg: statusColor,
         position: 'relative',
       });
@@ -359,9 +372,12 @@ export class SwarmDashboard {
         actionsList.remove(child.id);
       }
 
-      // Show live tasks / actions from workers (current_task_id presence)
+      // Show live tasks / actions from workers (use assignedTaskId mapping)
       workers.forEach((worker) => {
-        const actionContent = worker.current_task_id ? `W${worker.worker_num}  Task:${worker.current_task_id}  ${worker.branch_name || ''}` : `W${worker.worker_num}  Idle`;
+        const assigned = worker.current_task_id || (inProgressByWorker.get(worker.id)?.id ?? null);
+        const taskDesc = assigned ? `Task:${assigned}` : 'Idle';
+        const branch = worker.branch_name ? ` ${worker.branch_name}` : '';
+        const actionContent = `W${worker.worker_num}  ${taskDesc}${branch}`;
         const actionText = Text({
           id: `action-${worker.id}`,
           content: actionContent,
