@@ -30,27 +30,68 @@ elif [ -f "dist/index.js" ]; then
     USE_SRC="true"
 fi
 
-# Locate swarm DB. Prefer explicit RALPH_DIR, then look upward from the dashboard directory,
-# then common locations ($HOME/projects/.ralph, $HOME/.ralph).
+# Locate swarm DB. Prefer explicit RALPH_DIR, then look upward from the dashboard
+# directory. If multiple candidate .ralph locations exist (common during dev),
+# pick the one with the most active work (in_progress tasks) or the most recent
+# running run. This helps the dashboard attach to the live swarm instead of a
+# stale local projects/.ralph when the real data is in ~/.ralph.
 RALPH_DIR_FOUND=""
 if [ -n "${RALPH_DIR:-}" ] && [ -f "${RALPH_DIR%/}/swarm.db" ]; then
     RALPH_DIR_FOUND="${RALPH_DIR%/}"
 else
+    # Gather candidate locations
+    candidates=()
+
     # Walk up from the script dir looking for a .ralph directory
     SEARCH_DIR="$SCRIPT_DIR"
     while [ "$SEARCH_DIR" != "/" ] && [ -n "$SEARCH_DIR" ]; do
         if [ -f "$SEARCH_DIR/.ralph/swarm.db" ]; then
-            RALPH_DIR_FOUND="$SEARCH_DIR/.ralph"
+            candidates+=("$SEARCH_DIR/.ralph")
             break
         fi
         SEARCH_DIR=$(dirname "$SEARCH_DIR")
     done
-    # Common fallbacks
-    if [ -z "$RALPH_DIR_FOUND" ] && [ -f "$HOME/projects/.ralph/swarm.db" ]; then
-        RALPH_DIR_FOUND="$HOME/projects/.ralph"
+
+    # Add common fallbacks if present
+    if [ -f "$HOME/projects/.ralph/swarm.db" ]; then
+        candidates+=("$HOME/projects/.ralph")
     fi
-    if [ -z "$RALPH_DIR_FOUND" ] && [ -f "$HOME/.ralph/swarm.db" ]; then
-        RALPH_DIR_FOUND="$HOME/.ralph"
+    if [ -f "$HOME/.ralph/swarm.db" ]; then
+        candidates+=("$HOME/.ralph")
+    fi
+
+    # If we found multiple candidates, choose the one with active in_progress tasks
+    if [ ${#candidates[@]} -eq 0 ]; then
+        RALPH_DIR_FOUND=""
+    elif [ ${#candidates[@]} -eq 1 ]; then
+        RALPH_DIR_FOUND="${candidates[0]}"
+    else
+        best=""
+        best_score=-1
+        for cand in "${candidates[@]}"; do
+            dbfile="$cand/swarm.db"
+            if [ ! -f "$dbfile" ]; then
+                continue
+            fi
+            # Count in_progress tasks (higher preferred)
+            inprog=0
+            inprog=$(sqlite3 "$dbfile" "SELECT COUNT(*) FROM tasks WHERE status = 'in_progress';" 2>/dev/null || echo 0)
+            inprog=${inprog%%\n}
+            # If tie, use most recent running run started_at timestamp (epoch seconds)
+            started_epoch=0
+            started_epoch=$(sqlite3 "$dbfile" "SELECT strftime('%s', started_at) FROM swarm_runs WHERE status = 'running' ORDER BY started_at DESC LIMIT 1;" 2>/dev/null || echo 0)
+            started_epoch=${started_epoch%%\n}
+            score=$((inprog * 1000000000 + started_epoch))
+            if [ "$score" -gt "$best_score" ]; then
+                best_score=$score
+                best="$cand"
+            fi
+        done
+        if [ -n "$best" ]; then
+            RALPH_DIR_FOUND="$best"
+        else
+            RALPH_DIR_FOUND="${candidates[0]}"
+        fi
     fi
 fi
 
