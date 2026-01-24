@@ -4,6 +4,21 @@
 
 Ralphussy is a comprehensive distribution of the "Ralph" autonomous agent tooling, evolved into a powerful suite for AI-assisted software engineering. It includes a robust CLI loop agent, a terminal user interface (TUI), and a swarm runner for parallel task execution.
 
+## ✨ Recent Improvements (2026-01-24)
+
+**15 Critical and Performance Fixes Implemented:**
+- ✅ Fixed stall detection with duration-based accuracy
+- ✅ Improved completion promise detection (case-insensitive, space-tolerant)
+- ✅ Fixed JSON extraction to get latest messages reliably
+- ✅ Prevented monitor process leaks with control files
+- ✅ Added cross-platform devplan sync (fsync fallback)
+- ✅ Automatic file rotation for history, logs, and handoffs
+- ✅ Early model validation to prevent wasted execution
+- ✅ SQLite performance optimizations for high concurrency
+- ✅ Improved tool detection across all provider formats
+
+See [IMPLEMENTATION_COMPLETED.md](IMPLEMENTATION_COMPLETED.md) for detailed documentation.
+
 ## 📦 What's Included
 
 This repository contains a self-contained distribution of the Ralph tooling:
