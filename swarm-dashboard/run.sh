@@ -73,19 +73,32 @@ else
             if [ ! -f "$dbfile" ]; then
                 continue
             fi
-            # Count in_progress tasks (higher preferred)
+            # Prefer DB with the most recent worker heartbeat (indicates active swarm)
+            hb_epoch=0
+            hb_epoch=$(sqlite3 "$dbfile" "SELECT MAX(strftime('%s', last_heartbeat)) FROM workers;" 2>/dev/null || echo 0)
+            hb_epoch=${hb_epoch%%\n}
+            hb_epoch=${hb_epoch:-0}
+
+            # Secondary metric: number of in_progress tasks
             inprog=0
             inprog=$(sqlite3 "$dbfile" "SELECT COUNT(*) FROM tasks WHERE status = 'in_progress';" 2>/dev/null || echo 0)
             inprog=${inprog%%\n}
-            # If tie, use most recent running run started_at timestamp (epoch seconds)
+            inprog=${inprog:-0}
+
+            # Tertiary: most recent running run started_at
             started_epoch=0
-            started_epoch=$(sqlite3 "$dbfile" "SELECT strftime('%s', started_at) FROM swarm_runs WHERE status = 'running' ORDER BY started_at DESC LIMIT 1;" 2>/dev/null || echo 0)
+            started_epoch=$(sqlite3 "$dbfile" "SELECT COALESCE(MAX(strftime('%s', started_at)), 0) FROM swarm_runs WHERE status = 'running';" 2>/dev/null || echo 0)
             started_epoch=${started_epoch%%\n}
-            score=$((inprog * 1000000000 + started_epoch))
+            started_epoch=${started_epoch:-0}
+
+            # Combine into a score prioritizing recent heartbeat, then in_progress, then started_at
+            # Multiply hb_epoch by a large factor so it's the dominant metric when present
+            score=$((hb_epoch * 1000000000 + inprog * 1000000 + started_epoch))
             if [ "$score" -gt "$best_score" ]; then
                 best_score=$score
                 best="$cand"
             fi
+            echo "Candidate DB: $dbfile (hb: $hb_epoch, inprog: $inprog, started: $started_epoch)" >&2
         done
         if [ -n "$best" ]; then
             RALPH_DIR_FOUND="$best"
