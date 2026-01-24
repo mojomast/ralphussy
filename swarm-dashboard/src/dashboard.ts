@@ -9,6 +9,10 @@ export class SwarmDashboard {
   private currentRunId: string | null = null;
   private lastLogTimestamp: number = 0;
   private logLines: Array<{ worker_num: string; log_line: string }> = [];
+  // Scrolling / focus state for panes
+  private paneOffsets: Record<string, number> = { actions: 0, tasks: 0, workers: 0, console: 0 };
+  private focusedPane: 'actions' | 'tasks' | 'workers' | 'console' = 'tasks';
+  private pageSize: number = 20;
 
   async init() {
     try {
@@ -55,6 +59,25 @@ export class SwarmDashboard {
         this.cleanup();
         process.exit(0);
       } else if (key.name === 'r') {
+        this.refreshData();
+      } else if (key.name === 'tab') {
+        // Cycle focus: tasks -> actions -> workers -> console
+        const order: Array<typeof this.focusedPane> = ['tasks', 'actions', 'workers', 'console'];
+        const idx = order.indexOf(this.focusedPane);
+        this.focusedPane = order[(idx + 1) % order.length];
+        this.refreshData();
+      } else if (key.name === 'up' || key.name === 'down' || key.name === 'pageup' || key.name === 'pagedown') {
+        // Scroll the focused pane
+        let delta = 0;
+        if (key.name === 'up') delta = -1;
+        else if (key.name === 'down') delta = 1;
+        else if (key.name === 'pageup') delta = -Math.max(1, Math.floor(this.pageSize * 0.8));
+        else if (key.name === 'pagedown') delta = Math.max(1, Math.floor(this.pageSize * 0.8));
+
+        const cur = this.paneOffsets[this.focusedPane] || 0;
+        let next = cur + delta;
+        if (next < 0) next = 0;
+        this.paneOffsets[this.focusedPane] = next;
         this.refreshData();
       }
     });
@@ -364,6 +387,16 @@ export class SwarmDashboard {
       workersList.add(workerText);
     });
 
+    // Apply simple scrolling: hide top N entries based on paneOffsets.workers
+    const offset = this.paneOffsets.workers || 0;
+    // If offset > 0, remove first `offset` children so the pane appears scrolled
+    for (let i = 0; i < offset; i++) {
+      if (workersList.getChildrenCount() > 0) {
+        const child = workersList.getChildren()[0];
+        workersList.remove(child.id);
+      }
+    }
+
     // Populate the actions panel with any worker current task info
     const actionsList = this.renderer.root.findDescendantById('actions-list');
     if (actionsList) {
@@ -386,6 +419,15 @@ export class SwarmDashboard {
         });
         actionsList.add(actionText);
       });
+
+      // Simple scrolling for actions pane
+      const aOff = this.paneOffsets.actions || 0;
+      for (let i = 0; i < aOff; i++) {
+        if (actionsList.getChildrenCount() > 0) {
+          const child = actionsList.getChildren()[0];
+          actionsList.remove(child.id);
+        }
+      }
     }
   }
 
@@ -432,6 +474,15 @@ export class SwarmDashboard {
         });
       }
     });
+
+    // Apply scrolling for tasks pane
+    const tOff = this.paneOffsets.tasks || 0;
+    for (let i = 0; i < tOff; i++) {
+      if (tasksList.getChildrenCount() > 0) {
+        const child = tasksList.getChildren()[0];
+        tasksList.remove(child.id);
+      }
+    }
   }
 
   private updateResources(runId: string) {
@@ -535,6 +586,15 @@ export class SwarmDashboard {
       });
 
       consoleList.add(logText);
+    }
+
+    // Apply scrolling for console pane
+    const cOff = this.paneOffsets.console || 0;
+    for (let i = 0; i < cOff; i++) {
+      if (consoleList.getChildrenCount() > 0) {
+        const child = consoleList.getChildren()[0];
+        consoleList.remove(child.id);
+      }
     }
   }
 
