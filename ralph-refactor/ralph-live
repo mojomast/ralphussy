@@ -799,6 +799,7 @@ project_start_swarm_devplan() {
         return 1
     fi
 
+    # Default to 2 workers for Devussy-generated grouped devplans
     local workers=2
     echo ""
     read -r -p "Number of workers [$workers]: " input_workers || true
