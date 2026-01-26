@@ -1,0 +1,12 @@
+{
+  "phase_number": 1,
+  "phase_title": "Implementation",
+  "phase_description": "",
+  "project_name": "hello-world-python",
+  "tech_stack": [
+    "No tech stack parsed"
+  ],
+  "task_group_size": 5,
+  "task_grouping": "grouped",
+  "detail_level": "normal"
+}

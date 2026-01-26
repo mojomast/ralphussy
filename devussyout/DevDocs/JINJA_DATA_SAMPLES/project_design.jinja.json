@@ -1,0 +1,7 @@
+{
+  "project_name": "hello-world-python",
+  "languages": [],
+  "frameworks": [],
+  "apis": [],
+  "requirements": "Create a simple Python hello world application with:\n- A main.py that prints \"Hello, World!\"\n- A greeter module with a Greeter class that has a greet(name) method\n- Unit tests for the Greeter class using pytest\n- A requirements.txt with pytest\n- A README.md explaining how to run the app"
+}

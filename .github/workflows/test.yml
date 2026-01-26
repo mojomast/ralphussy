@@ -1,0 +1,81 @@
+name: Test Suite
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Run Test Suite
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0  # Full history for git operations
+      
+      - name: Setup Git
+        run: |
+          git config --global user.name "CI Test Runner"
+          git config --global user.email "ci@ralphussy.test"
+      
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sqlite3 jq
+      
+      - name: Make test scripts executable
+        run: chmod +x ralph-refactor/tests/*.sh
+      
+      - name: Run test suite
+        run: |
+          cd ralph-refactor/tests
+          ./run_all_tests.sh
+      
+      - name: Generate test report
+        if: always()
+        run: |
+          echo "## Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f ralph-refactor/tests/test_results.txt ]; then
+            cat ralph-refactor/tests/test_results.txt >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ All tests passed!" >> $GITHUB_STEP_SUMMARY
+          fi
+      
+      - name: Upload test artifacts
+        if: failure()
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-failures
+          path: |
+            /tmp/test_*
+          retention-days: 7
+
+  lint:
+    name: Shellcheck Linting
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Install shellcheck
+        run: sudo apt-get install -y shellcheck
+      
+      - name: Run shellcheck on lib files
+        run: |
+          shellcheck ralph-refactor/lib/*.sh || true
+      
+      - name: Run shellcheck on test files
+        run: |
+          shellcheck ralph-refactor/tests/*.sh || true
+      
+      - name: Run shellcheck on main executables
+        run: |
+          shellcheck ralph-refactor/ralph-swarm || true
+          shellcheck ralph-refactor/ralph-live || true

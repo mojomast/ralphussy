@@ -8,7 +8,7 @@ import os from 'os';
 
 // Type definitions for detail view
 type DetailViewType = { type: 'task'; data: any } | { type: 'worker'; data: any } | null;
-type PaneType = 'actions' | 'tasks' | 'workers' | 'console';
+type PaneType = 'actions' | 'tasks' | 'workers' | 'console' | 'ralph';
 
 // Focus colors for visual indicator
 const FOCUS_COLORS = {
@@ -46,11 +46,12 @@ async function main() {
       const [costs, setCosts] = React.useState<any>({ total_cost: 0, total_prompt_tokens: 0, total_completion_tokens: 0 });
       const [stats, setStats] = React.useState<any>({ pending: 0, in_progress: 0, completed: 0, failed: 0 });
       const [recentCosts, setRecentCosts] = React.useState<any[]>([]);
+      const [ralphLines, setRalphLines] = React.useState<string[]>([]);
       const [focusedPane, setFocusedPane] = React.useState<PaneType>('tasks');
       
       // Selected item index per pane for detail view navigation
       const [selectedIndex, setSelectedIndex] = React.useState<Record<PaneType, number>>({
-        actions: 0, tasks: 0, workers: 0, console: 0
+        actions: 0, tasks: 0, workers: 0, console: 0, ralph: 0
       });
       
       // Detail view overlay state
@@ -58,7 +59,7 @@ async function main() {
       
       // Persistent scroll offsets per pane
       const scrollOffsetsRef = React.useRef<Record<PaneType, number>>({
-        actions: 0, tasks: 0, workers: 0, console: 0
+        actions: 0, tasks: 0, workers: 0, console: 0, ralph: 0
       });
 
       // Page size used for visible window when computing auto-scroll behavior
@@ -76,6 +77,7 @@ async function main() {
           case 'workers': return workers;
           case 'actions': return logs;
           case 'console': return logs;
+          case 'ralph': return ralphLines;
           default: return [];
         }
       };
@@ -84,27 +86,177 @@ async function main() {
       // Throttle repeated key events to avoid frequent rerenders
       let lastKeyAt = 0;
       const KEY_THROTTLE_MS = 80;
+      // Command modal state for confirmations/inputs/output streaming
+      const [commandModal, setCommandModal] = React.useState<any>(null);
+      // Selected task filter for Ralph Live (null => show all)
+      const [selectedTaskId, setSelectedTaskId] = React.useState<number | null>(null);
+      const selectedTaskIdRef = React.useRef<number | null>(null);
+      const applySelectedTaskId = (id: number | null) => { selectedTaskIdRef.current = id; setSelectedTaskId(id); };
+      // Selected run filter (null => show current run)
+      const [selectedRunId, setSelectedRunId] = React.useState<string | null>(null);
+      const selectedRunIdRef = React.useRef<string | null>(null);
+      const applySelectedRunId = (id: string | null) => { selectedRunIdRef.current = id; setSelectedRunId(id); };
+
+      // Refs used by DB polling so other helpers can trigger a load
+      const snapshotRef = React.useRef<any>(null);
+      const lastDbMtimeRef = React.useRef<number>(0);
+      const pollCounterRef = React.useRef<number>(0);
+      const mountedRef = React.useRef<boolean>(true);
+
+      // Helper to append to Ralph Live lines and keep a bounded history
+      const appendRalphLines = (lines: string[] | string) => {
+        setRalphLines(prev => {
+          const add = Array.isArray(lines) ? lines : [lines];
+          const merged = [...prev, ...add];
+          // keep last 200 lines
+          return merged.slice(-200);
+        });
+      };
+
+      // Command rate-limiting (ms)
+      const CMD_RATE_MS = 5000;
+      const lastCommandTimeRef = React.useRef<Record<string, number>>({});
+
+      // Helper to spawn commands and stream stdout/stderr into Ralph Live
+      // options: { showOutput:boolean, title?:string, key?:string }
+      const runCommandStream = (cmd: string, args: string[] = [], opts: any = {}) => {
+        const key = opts.key || `${cmd} ${args.join(' ')}`;
+        const now = Date.now();
+        const last = lastCommandTimeRef.current[key] || 0;
+        if (now - last < CMD_RATE_MS) {
+          appendRalphLines(`[UI] Command blocked: please wait ${Math.ceil((CMD_RATE_MS - (now - last))/1000)}s`);
+          return null;
+        }
+        lastCommandTimeRef.current[key] = now;
+
+        try {
+          const { spawn } = require('child_process');
+          const child = spawn(cmd, args, { env: process.env });
+          appendRalphLines([`--- Running: ${cmd} ${args.join(' ')} ---`]);
+          // Optionally show an output overlay while the command runs
+          if (opts.showOutput) {
+            setCommandModal({ type: 'output', title: opts.title || `Running: ${args.join(' ')}`, startAt: (ralphLines || []).length });
+          }
+          child.stdout.on('data', (chunk: Buffer) => {
+            const text = chunk.toString();
+            text.split(/\r?\n/).forEach((ln: string) => { if (ln.trim().length) appendRalphLines(ln); });
+          });
+          child.stderr.on('data', (chunk: Buffer) => {
+            const text = chunk.toString();
+            text.split(/\r?\n/).forEach((ln: string) => { if (ln.trim().length) appendRalphLines(`[ERR] ${ln}`); });
+          });
+          child.on('close', (code: number) => {
+            appendRalphLines(`--- Exit code: ${code} ---`);
+            // trigger immediate DB reload after command finishes
+            lastDbMtimeRef.current = 0;
+            // hide output overlay shortly after completion
+            setTimeout(() => {
+              try { if (commandModal && commandModal.type === 'output') setCommandModal(null); } catch (e) {}
+            }, 800);
+            // schedule an immediate reload
+            setTimeout(() => {
+              try { load(); } catch (e) { /* load is hoisted */ }
+            }, 300);
+          });
+          return child;
+        } catch (err) {
+          appendRalphLines(`[ERR] Failed to spawn ${cmd}: ${String(err)}`);
+          return null;
+        }
+      };
+      const ralphCli = `${process.cwd()}/ralph-refactor/ralph-swarm`;
       useKeyboard((key) => {
         try {
           const now = Date.now();
           if (now - lastKeyAt < KEY_THROTTLE_MS) return;
           lastKeyAt = now;
-          // Close detail view on Escape or q (if detail view is open)
-          if (detailView && (key.name === 'escape' || key.name === 'q')) {
-            setDetailView(null);
-            return;
+          // If a command modal is active, handle only modal keys
+          if (commandModal) {
+            const k = key.name || '';
+            if (commandModal.type === 'confirm') {
+              if (k === 'y' || k === 'return') {
+                try { commandModal.onConfirm && commandModal.onConfirm(); } catch (e) {}
+                setCommandModal(null);
+              } else if (k === 'n' || k === 'escape') {
+                try { commandModal.onCancel && commandModal.onCancel(); } catch (e) {}
+                setCommandModal(null);
+              }
+              return;
+            } else if (commandModal.type === 'output') {
+              // allow closing output overlay with ESC or q
+              if ((key.name === 'escape') || (key.name === 'q')) {
+                setCommandModal(null);
+              }
+              return;
+            } else if (commandModal.type === 'select-task') {
+              // navigate selection with up/down, confirm with return, cancel with escape
+              if (k === 'up') {
+                setCommandModal((cm: any) => ({ ...cm, sel: Math.max(0, (cm.sel || 0) - 1) }));
+                return;
+              } else if (k === 'down') {
+                setCommandModal((cm: any) => ({ ...cm, sel: Math.min(((cm.options || []).length - 1) || 0, (cm.sel || 0) + 1) }));
+                return;
+              } else if (k === 'return') {
+                try {
+                  const idx = commandModal.sel || 0;
+                  const task = (commandModal.options || [])[idx];
+                  if (task) {
+                    setSelectedTaskId(task.id || null);
+                    selectedTaskIdRef.current = task.id || null;
+                    appendRalphLines(`[UI] Ralph Live filtered to task ${task.id}`);
+                  }
+                } catch (e) {}
+                setCommandModal(null);
+                return;
+              } else if (k === 'escape' || k === 'q') {
+                setCommandModal(null);
+                return;
+              }
+            } else if (commandModal.type === 'select-run') {
+              // navigate selection with up/down, confirm with return, cancel with escape
+              if (k === 'up') {
+                setCommandModal((cm: any) => ({ ...cm, sel: Math.max(0, (cm.sel || 0) - 1) }));
+                return;
+              } else if (k === 'down') {
+                setCommandModal((cm: any) => ({ ...cm, sel: Math.min(((cm.options || []).length - 1) || 0, (cm.sel || 0) + 1) }));
+                return;
+              } else if (k === 'return') {
+                try {
+                  const idx = commandModal.sel || 0;
+                  const item = (commandModal.options || [])[idx];
+                  if (item) {
+                    // item.run_id === null means show current (all) runs
+                    applySelectedRunId(item.run_id || null);
+                    selectedRunIdRef.current = item.run_id || null;
+                    appendRalphLines(`[UI] Showing run: ${item.run_id || '(current)'} `);
+                    // force immediate reload
+                    lastDbMtimeRef.current = 0;
+                  }
+                } catch (e) {}
+                setCommandModal(null);
+                return;
+              } else if (k === 'escape' || k === 'q') {
+                setCommandModal(null);
+                return;
+              }
+            }
           }
+          // Close detail view on Escape or q (if detail view is open)
+            if (detailView && (key.name === 'escape' || key.name === 'q')) {
+              setDetailView(null);
+              return;
+            }
           
           if ((key.ctrl && key.name === 'c') || key.name === 'q') {
             // clean shutdown
             try { renderer.stop(); } catch (e) {}
             process.exit(0);
-          } else if (key.name === 'tab') {
-            if (detailView) return; // Don't switch panes in detail view
-            const order: PaneType[] = ['tasks','actions','workers','console'];
-            const idx = order.indexOf(focusedPane);
-            setFocusedPane(order[(idx + 1) % order.length]);
-          } else if (key.name === 'escape') {
+            } else if (key.name === 'tab') {
+              if (detailView) return; // Don't switch panes in detail view
+              const order: PaneType[] = ['tasks','actions','workers','ralph','console'];
+              const idx = order.indexOf(focusedPane);
+              setFocusedPane(order[(idx + 1) % order.length]);
+            } else if (key.name === 'escape') {
             setDetailView(null);
           } else if (['up','down','pageup','pagedown'].includes(key.name)) {
             if (detailView) return; // Scroll detail view differently if needed
@@ -116,34 +268,34 @@ async function main() {
             if (key.name === 'pagedown') delta = 10;
             
             // Check if shift is held for global scroll, otherwise scroll focused pane
-            if (key.shift) {
-              // Global scroll - scroll the main scrollbox
-              const mainScroll = renderer.root.findDescendantById('main-scroll');
-              if (mainScroll && typeof mainScroll.scrollBy === 'function') {
-                try { mainScroll.scrollBy(delta, 'content'); } catch (e) { mainScroll.scrollBy(delta); }
-              }
-              setGlobalScrollOffset(prev => Math.max(0, prev + delta));
-            } else {
-              // Pane scroll
-              const paneId = focusedPane;
-              const items = getItemsForPane(paneId);
-              const currentIdx = selectedIndex[paneId] || 0;
+                if (key.shift) {
+                  // Global scroll - scroll the main scrollbox
+                  const mainScroll = renderer.root.findDescendantById('main-scroll');
+                  if (mainScroll && typeof mainScroll.scrollBy === 'function') {
+                    try { mainScroll.scrollBy(delta, 'content'); } catch (e) { mainScroll.scrollBy(delta); }
+                  }
+                  setGlobalScrollOffset(prev => Math.max(0, prev + delta));
+                } else {
+                  // Pane scroll
+                  const paneId = focusedPane;
+                  const items = getItemsForPane(paneId);
+                  const currentIdx = selectedIndex[paneId] || 0;
 
               // Update selected index with bounds checking
               const newIdx = Math.max(0, Math.min(Math.max(0, items.length - 1), currentIdx + delta));
               setSelectedIndex(prev => ({ ...prev, [paneId]: newIdx }));
 
-              // Ensure new selection is visible: compute desired scroll offset
-              const node = renderer.root.findDescendantById(paneId);
-              try {
-                const savedOffset = scrollOffsetsRef.current[paneId] || 0;
-                const visibleSize = PAGE_SIZE;
-                let desiredOffset = savedOffset;
-                if (newIdx < savedOffset) {
-                  desiredOffset = newIdx;
-                } else if (newIdx >= savedOffset + visibleSize) {
-                  desiredOffset = newIdx - visibleSize + 1;
-                }
+                // Ensure new selection is visible: compute desired scroll offset
+                const node = renderer.root.findDescendantById(paneId);
+                try {
+                  const savedOffset = scrollOffsetsRef.current[paneId] || 0;
+                  const visibleSize = PAGE_SIZE;
+                  let desiredOffset = savedOffset;
+                  if (newIdx < savedOffset) {
+                    desiredOffset = newIdx;
+                  } else if (newIdx >= savedOffset + visibleSize) {
+                    desiredOffset = newIdx - visibleSize + 1;
+                  }
 
                 // Clamp desired offset
                 const maxOffset = Math.max(0, (items.length || 0) - visibleSize);
@@ -175,58 +327,159 @@ async function main() {
                 setDetailView({ type: 'worker', data: items[idx] });
               }
             }
-          } else if (key.name === 'r') {
-            // manual refresh - no-op here, effect polls
-          }
+            } else if (key.name === 'r') {
+             // manual refresh - force DB reload
+             lastDbMtimeRef.current = 0;
+            } else if (key.name === 'e') {
+              // Emergency stop - confirmation required
+              setCommandModal({
+                type: 'confirm',
+                title: 'Emergency STOP',
+                message: 'Emergency stop will attempt to kill all running workers. Confirm?',
+                onConfirm: () => {
+                  appendRalphLines('[UI] Emergency stop confirmed');
+                  runCommandStream(ralphCli, ['--emergency-stop'], { showOutput: true, title: 'Emergency Stop', key: 'emergency-stop' });
+                },
+                onCancel: () => {
+                  appendRalphLines('[UI] Emergency stop cancelled');
+                }
+              });
+            } else if (key.name === 'a') {
+              // Attach / inspect - spawn inspect command and stream output
+              appendRalphLines('[UI] Attaching to swarm (inspect)...');
+              runCommandStream(ralphCli, ['--inspect'], { showOutput: true, title: 'Inspect', key: 'inspect' });
+            } else if (key.name === 't') {
+              // Open task selector modal: let user pick from tasks[]
+              const opts = (tasks || []).map((t: any) => ({ id: t.id, text: String(t.task_text || '').split('\n')[0].substring(0,80) }));
+              if (opts.length === 0) {
+                appendRalphLines('[UI] No tasks available to select');
+              } else {
+                setCommandModal({ type: 'select-task', title: 'Select Task', options: opts, sel: 0 });
+              }
+            } else if ((key.name || '').toLowerCase() === 'v') {
+              // Open run selector modal: pick from recent runs
+              try {
+                appendRalphLines('[UI] Run selector requested');
+                const recent = db.getRecentRuns(20) || [];
+                appendRalphLines(`[UI] recent runs found: ${recent.length}`);
+                if (recent && recent.length > 0) {
+                  appendRalphLines(`[UI] sample runs: ${recent.slice(0,3).map((r:any)=>r.run_id).join(', ')}`);
+                }
+                if ((recent || []).length === 0) {
+                  appendRalphLines('[UI] No recent runs available');
+                } else {
+                  const opts = recent.map((r: any) => ({ run_id: r.run_id, text: `${r.run_id} ${String(r.status||'').toUpperCase()} ${r.started_at || ''}` }));
+                  // offer an option to switch back to live/current run
+                  opts.unshift({ run_id: null, text: '(current) Show current run' });
+                  setCommandModal({ type: 'select-run', title: 'Select Run', options: opts, sel: 0 });
+                }
+              } catch (e) { appendRalphLines('[ERR] Failed to fetch recent runs'); }
+            } else if (key.name === 's') {
+              // Start a run: read project and devplan, then ask for confirmation
+              let pname = '';
+              let devplan = '';
+              try {
+                const projFile = `${process.env.HOME}/projects/current`;
+                const fsLocal = require('fs');
+                if (fsLocal.existsSync(projFile)) {
+                  pname = fsLocal.readFileSync(projFile, 'utf8').trim();
+                  const envf = `${process.env.HOME}/projects/${pname}/project.env`;
+                  if (fsLocal.existsSync(envf)) {
+                    const envC = fsLocal.readFileSync(envf, 'utf8');
+                    const m = envC.match(/DEVPLAN_PATH=?(?:\"|\')?([^\"\']+)(?:\"|\')?/);
+                    if (m) devplan = m[1];
+                  }
+                }
+              } catch (e) { /* ignore */ }
+
+              const defaultWorkers = 4;
+              // Build confirmation message using the values we just resolved
+              const msg = `Start swarm with DevPlan: ${devplan || '(none)'}  Project: ${pname || '(unknown)'}  Workers: ${defaultWorkers}?`;
+              setCommandModal({
+                type: 'confirm',
+                title: 'Start Run',
+                message: msg,
+                onConfirm: () => {
+                  appendRalphLines('[UI] Starting run');
+                  // Ensure we have a project name before starting
+                  if (!pname) {
+                    appendRalphLines('[ERR] Could not determine project name; aborting start');
+                    return;
+                  }
+                  // Build args according to ralph-swarm usage: --devplan PATH --project NAME [--workers N]
+                  const args: string[] = [];
+                  if (devplan) { args.push('--devplan', devplan); }
+                  args.push('--project', pname);
+                  args.push('--workers', String(defaultWorkers));
+                  appendRalphLines(`[UI] Invoking: ${ralphCli} ${args.join(' ')}`);
+                  runCommandStream(ralphCli, args, { showOutput: true, title: 'Start Run', key: 'start' });
+                },
+                onCancel: () => { appendRalphLines('[UI] Start run cancelled'); }
+              });
+            } else if (key.name === 'V') {
+              // Clear selected run and show current run
+              applySelectedRunId(null);
+              appendRalphLines('[UI] Cleared run selection — showing current run');
+              lastDbMtimeRef.current = 0;
+            }
         } catch (err) {
           console.error('keyboard handler error', err);
         }
       });
 
-        React.useEffect(() => {
-          let mounted = true;
-        const snapshotRef = { current: null } as { current: any };
-        let lastDbMtime = 0;
-        let pollCounter = 0;
+        // DB polling/load function exposed so other actions can trigger it.
         const dbPath = (process.env.RALPH_DIR ? `${process.env.RALPH_DIR.replace(/\/+$/,'')}/swarm.db` : `${os.homedir()}/.ralph/swarm.db`);
 
         async function load() {
           try {
-            const r = db.getCurrentRun();
-            if (!mounted) return;
+            // Determine which run to load: either the selected run (historical) or the current run
+            let r: any = null;
+            try {
+                if (selectedRunIdRef.current) {
+                  try {
+                    // Prefer direct lookup if DB helper provides it
+                    if (typeof db.getRunById === 'function') {
+                      r = db.getRunById(selectedRunIdRef.current);
+                    } else {
+                      const recent = db.getRecentRuns(200) || [];
+                      r = (recent || []).find((rr: any) => rr.run_id === selectedRunIdRef.current) || null;
+                    }
+                  } catch (e) {
+                    r = null;
+                  }
+                }
+            } catch (e) {
+              r = null;
+            }
+            if (!r) {
+              r = db.getCurrentRun();
+            }
+            if (!mountedRef.current) return;
 
-            // Check DB mtime to avoid heavy work when DB hasn't changed. This
-            // reduces wakeups and work if the DB is idle.
+            // Check DB mtime to avoid heavy work when DB hasn't changed.
             let dbChanged = true;
             try {
               const st = fs.statSync(dbPath);
               const m = st.mtimeMs || st.mtime.getTime();
-              if (m === lastDbMtime && snapshotRef.current !== null) {
+              if (m === lastDbMtimeRef.current && snapshotRef.current !== null) {
                 dbChanged = false;
               } else {
-                lastDbMtime = m;
+                lastDbMtimeRef.current = m;
                 dbChanged = true;
               }
             } catch (e) {
-              // If DB stat fails, fall back to always treating as changed
               dbChanged = true;
             }
-            pollCounter++;
-            // Force a periodic refresh at least once every ~12 polls
-            if (pollCounter % 12 === 0) dbChanged = true;
+            pollCounterRef.current++;
+            if (pollCounterRef.current % 12 === 0) dbChanged = true;
 
-            if (!dbChanged) {
-              // Nothing to do this poll
-              return;
-            }
+            if (!dbChanged) return;
 
             if (r) {
-              // Fetch bounded datasets to reduce work
               const workers_ = db.getWorkersByRun(r.run_id) || [];
               const tasks_ = db.getTasksByRun(r.run_id) || [];
               const logs_ = db.getRecentLogs(r.run_id, 100) || [];
 
-              // costs/stats
               let c: any = null;
               let s: any = null;
               let rc: any[] = [];
@@ -234,7 +487,6 @@ async function main() {
               try { s = db.getTaskStats(r.run_id) || null; } catch (e) { s = null; }
               try { rc = db.getRecentTaskCosts(r.run_id, 5) || []; } catch (e) { rc = []; }
 
-              // Build snapshot summary to detect meaningful changes
               const snap = {
                 run_id: r.run_id,
                 total_tasks: r.total_tasks,
@@ -255,21 +507,48 @@ async function main() {
                 setCosts(c || { total_cost: 0, total_prompt_tokens: 0, total_completion_tokens: 0 });
                 setStats(s || { pending: 0, in_progress: 0, completed: 0, failed: 0 });
                 setRecentCosts(rc || []);
-                snapshotRef.current = snap;
-
-                // Restore scroll positions after meaningful data refresh
-                setTimeout(() => {
-                  for (const paneId of ['actions', 'tasks', 'workers', 'console'] as PaneType[]) {
-                    const savedOffset = scrollOffsetsRef.current[paneId];
-                    if (savedOffset > 0) {
-                      const node = renderer.root.findDescendantById(paneId);
-                      if (node && typeof node.scrollTo === 'function') {
-                        try { node.scrollTo(savedOffset); } catch (e) {}
-                      }
+                // Build Ralph Live lines: header + short activity
+                const rl: string[] = [];
+                rl.push(r ? `Run: ${r.run_id}  Status: ${r.status.toUpperCase()}  Progress: ${r.completed_tasks}/${r.total_tasks}` : 'No active run');
+                try {
+                  const projFile = `${process.env.HOME}/projects/current`;
+                  const fsLocal = require('fs');
+                  if (fsLocal.existsSync(projFile)) {
+                    const pname = fsLocal.readFileSync(projFile, 'utf8').trim();
+                    rl.push(`Project: ${pname}`);
+                    const envf = `${process.env.HOME}/projects/${pname}/project.env`;
+                    if (fsLocal.existsSync(envf)) {
+                      const envC = fsLocal.readFileSync(envf, 'utf8');
+                      const m = envC.match(/DEVPLAN_PATH=?"?([^\"]+)"?/);
+                      if (m) rl.push(`DevPlan: ${m[1].split('/').pop()}`);
                     }
                   }
-                }, 50);
-              }
+                } catch (e) { /* ignore */ }
+
+                  // If a task filter is active, show only logs for that task
+                  let snippetSrc = (logs_ || []).slice(-200);
+                  if (selectedTaskIdRef.current !== null) {
+                    snippetSrc = snippetSrc.filter((l: any) => l.task_id === selectedTaskIdRef.current);
+                  }
+                  const snippet = snippetSrc.slice(-8).map((l: any) => `W${String(l.worker_num).padStart(2)} T${String(l.task_id).padStart(4)} ${String(l.log_line || '').split('\n')[0].substring(0,80)}`);
+                  if (snippet.length) rl.push('');
+                  rl.push(...snippet);
+                  setRalphLines(rl);
+                }
+              snapshotRef.current = snap;
+
+              // Restore scroll positions after meaningful data refresh
+              setTimeout(() => {
+                for (const paneId of ['actions', 'tasks', 'workers', 'console'] as PaneType[]) {
+                  const savedOffset = scrollOffsetsRef.current[paneId];
+                  if (savedOffset > 0) {
+                    const node = renderer.root.findDescendantById(paneId);
+                    if (node && typeof node.scrollTo === 'function') {
+                      try { node.scrollTo(savedOffset); } catch (e) {}
+                    }
+                  }
+                }
+              }, 50);
             } else {
               if (snapshotRef.current !== null) {
                 setRun(null);
@@ -284,13 +563,16 @@ async function main() {
           }
         }
 
-        load();
-        const id = setInterval(load, 5000);
-        return () => {
-          mounted = false;
-          clearInterval(id);
-        };
-      }, []);
+        // Start polling
+        React.useEffect(() => {
+          mountedRef.current = true;
+          load();
+          const id = setInterval(load, 5000);
+          return () => {
+            mountedRef.current = false;
+            clearInterval(id);
+          };
+        }, []);
       
       // Helper to get pane style based on focus state
       const getPaneStyle = (paneId: PaneType) => {
@@ -450,12 +732,105 @@ async function main() {
         );
       };
 
+      // Command modal overlay (confirm prompt or live output)
+      const renderCommandModal = () => {
+        if (!commandModal) return null;
+        if (commandModal.type === 'confirm') {
+          const lines: string[] = [];
+          lines.push('═══════════════════════════════════════════════════════════');
+          lines.push(`                    ${String(commandModal.title || 'CONFIRM')}`);
+          lines.push('═══════════════════════════════════════════════════════════');
+          lines.push('');
+          const msg = String(commandModal.message || 'Are you sure?');
+          const msgLines = msg.split('\n');
+          for (const ml of msgLines) lines.push(`  ${ml}`);
+          lines.push('');
+          lines.push('  Press Y or Enter to confirm, N or Esc to cancel');
+          lines.push('');
+          return React.createElement(
+            'box',
+            {
+              position: 'absolute',
+              top: 4,
+              left: 8,
+              right: 8,
+              bottom: 6,
+              backgroundColor: '#0b1220',
+              borderStyle: 'single',
+              borderColor: '#f97316',
+              zIndex: 120,
+            },
+            React.createElement('scrollbox', { height: '100%', width: '100%' }, ...lines.map((ln: string, i: number) => React.createElement('text', { key: `cm-${i}`, content: ln, fg: '#ffd8a8' })))
+          );
+        } else if (commandModal.type === 'output') {
+          const start = typeof commandModal.startAt === 'number' ? commandModal.startAt : 0;
+          const out = (ralphLines || []).slice(start);
+          return React.createElement(
+            'box',
+            {
+              position: 'absolute',
+              top: 3,
+              left: 4,
+              right: 4,
+              bottom: 3,
+              backgroundColor: '#071029',
+              borderStyle: 'double',
+              borderColor: '#60a5fa',
+              zIndex: 150,
+            },
+            React.createElement('text', { content: ` ${commandModal.title || 'Command Output'} `, fg: '#ffffff' }),
+            React.createElement('scrollbox', { height: '90%', width: '100%' }, ...out.map((ln: string, i: number) => React.createElement('text', { key: `out-${i}`, content: ln, fg: i === 0 ? '#ffffff' : '#c7d2fe' }))),
+            React.createElement('text', { content: ' Press ESC or q to close ', fg: '#9ca3af' })
+          );
+        } else if (commandModal.type === 'select-task' || commandModal.type === 'select-run') {
+          const opts = commandModal.options || [];
+          const sel = typeof commandModal.sel === 'number' ? commandModal.sel : 0;
+          const title = commandModal.title || (commandModal.type === 'select-task' ? 'Select Task' : 'Select Run');
+          const lines: any[] = [];
+          lines.push('═══════════════════════════════════════════════════════════');
+          lines.push(`                    ${String(title)}`);
+          lines.push('═══════════════════════════════════════════════════════════');
+          lines.push('');
+          // Render a slice window around sel for context
+          const start = Math.max(0, sel - 8);
+          const end = Math.min(opts.length, start + 16);
+          for (let i = start; i < end; i++) {
+            const o = opts[i] || {};
+            const prefix = i === sel ? '▶' : '  ';
+            const text = commandModal.type === 'select-task' ? `${o.id || ''} ${o.text || ''}` : `${o.run_id || ''} ${o.text || ''}`;
+            lines.push(`${prefix} ${String(text).substring(0, 120)}`);
+          }
+          lines.push('');
+          lines.push('  Use Up/Down to move, Enter to confirm, Esc to cancel');
+          lines.push('');
+          return React.createElement(
+            'box',
+            {
+              position: 'absolute',
+              top: 3,
+              left: 6,
+              right: 6,
+              bottom: 4,
+              backgroundColor: '#071029',
+              borderStyle: 'double',
+              borderColor: '#60a5fa',
+              zIndex: 160,
+            },
+            React.createElement('scrollbox', { height: '100%', width: '100%' }, ...lines.map((ln: string, i: number) => React.createElement('text', { key: `sel-${i}`, content: ln, fg: i === 0 ? '#ffffff' : '#c7d2fe' })))
+          );
+        }
+        return null;
+      };
+
       // Build UI using OpenTUI React primitive component names
       const actionsStyle = getPaneStyle('actions');
       const tasksStyle = getPaneStyle('tasks');
       const workersStyle = getPaneStyle('workers');
       const consoleStyle = getPaneStyle('console');
       
+      // Header extras: indicate if user selected a specific run to view
+      const headerExtra = selectedRunId ? ` VIEWING RUN: ${selectedRunId}` : '';
+
       return React.createElement(
         'box',
         { width: '100%', height: '100%', flexDirection: 'column' },
@@ -464,20 +839,26 @@ async function main() {
           { height: 3, backgroundColor: '#1e3a5f', style: { padding: 1 } },
           React.createElement('text', { 
             content: run 
-              ? `[${run.status.toUpperCase()}] Run: ${run.run_id} | Workers: ${run.worker_count} | Progress: ${run.completed_tasks}/${run.total_tasks} | ${focusedPane.toUpperCase()} (Tab=switch, Arrows=scroll, Shift+Arrows=scroll all)` 
-              : '[NO ACTIVE RUN] Press "r" to refresh or "q" to quit', 
+              ? `[${run.status.toUpperCase()}] Run: ${run.run_id} | Workers: ${run.worker_count} | Progress: ${run.completed_tasks}/${run.total_tasks} | ${focusedPane.toUpperCase()} (Tab=switch, Arrows=scroll, Shift+Arrows=scroll all) Keys: [E]merg [S]tart [A]ttach [R]efresh${headerExtra}` 
+              : `[NO ACTIVE RUN] Press "r" to refresh or "q" to quit. Keys: [E]merg [S]tart [A]ttach [R]efresh${headerExtra}`, 
             fg: '#ffffff' 
           })
+        ),
+        // Keymap line to show available keyboard shortcuts
+        React.createElement(
+          'box',
+          { height: 1, backgroundColor: '#0b1220', style: { paddingLeft: 1, paddingRight: 1 } },
+          React.createElement('text', { content: 'Keys: [E] Emergency-stop  [S] Start  [A] Attach/Inspect  [v] Select Run  [V] Clear Run  [t] Select Task  [r] Refresh  [q] Quit', fg: '#cbd5e1' })
         ),
         React.createElement(
           'scrollbox',
           { id: 'main-scroll', width: '100%', height: '100%', flexDirection: 'column' },
-          // Middle section with Actions, Tasks, and Workers
+        // Middle section with Actions, Tasks, and Workers
           React.createElement(
           'box',
           // Use percentage height instead of growing with item count to avoid
           // creating huge off-screen areas that break scrolling/cursor behavior.
-          { flexDirection: 'row', height: '60%' },
+          { flexDirection: 'row', height: '55%' },
             React.createElement(
               'scrollbox',
               { id: 'actions', width: '30%', title: ` Live Actions ${focusedPane === 'actions' ? '●' : ''} `, ...actionsStyle },
@@ -527,32 +908,36 @@ async function main() {
                        lines.push(React.createElement('text', { key: `rc-${i}`, content: `║ $${(c.cost || 0).toFixed(4).padStart(6)} T:${String(c.task_id).padStart(4)}║`, fg: '#c9d1d9' }));
                      });
                    }
-                   lines.push(React.createElement('text', { key: 'r-end', content: '╚══════════════════════╝', fg: '#c9d1d9' }));
-                   return lines;
-                 })()
-               ),
-              React.createElement('scrollbox', { id: 'workers', height: '40%', title: ` Workers ${focusedPane === 'workers' ? '●' : ''} `, ...workersStyle }, 
-                ...(workers || []).map((w: any, i: number) => {
-                  const fmt = formatWorkerItem(w, i);
-                  return React.createElement('text', { key: `w-${i}`, ...fmt });
-                })
-              )
-            )
+                    lines.push(React.createElement('text', { key: 'r-end', content: '╚══════════════════════╝', fg: '#c9d1d9' }));
+                    return lines;
+                  })()
+                ),
+               React.createElement('scrollbox', { id: 'workers', height: '30%', title: ` Workers ${focusedPane === 'workers' ? '●' : ''} `, ...workersStyle }, 
+                 ...(workers || []).map((w: any, i: number) => {
+                   const fmt = formatWorkerItem(w, i);
+                   return React.createElement('text', { key: `w-${i}`, ...fmt });
+                 })
+               )
+             )
           ),
           // Console section - show all logs, not just 15
+          // Ralph Live replaces the previous Console Log panel and now occupies
+          // the full-width bottom area. It shows run/project/model/state +
+          // a short activity stream.
           React.createElement(
-          'scrollbox', 
-          { id: 'console', height: '35%', title: ` Console Log ${focusedPane === 'console' ? '●' : ''} `, ...consoleStyle }, 
-            ...(logs || []).map((l: any, i: number) => React.createElement('text', { 
-              key: `c-${i}`, 
-              content: `W${String(l.worker_num).padStart(2)}  ${String(l.log_line || '').split('\n')[0].substring(0, 120)}`,
-              fg: focusedPane === 'console' && selectedIndex.console === i ? '#ffffff' : '#8b949e',
-              bg: focusedPane === 'console' && selectedIndex.console === i ? '#30363d' : undefined,
+            'scrollbox',
+            { id: 'ralph', height: '40%', title: ` Ralph Live ${focusedPane === 'ralph' ? '●' : ''} `, ...consoleStyle, borderColor: '#a855f7' },
+            ...(ralphLines.length > 0 ? ralphLines : ['Loading Ralph Live...']).map((ln: string, i: number) => React.createElement('text', {
+              key: `rlb-${i}`,
+              content: ln,
+              fg: i === 0 ? '#ffffff' : '#e9d5ff'
             }))
           )
         ),
         // Render detail view overlay if active
-        renderDetailView()
+        renderDetailView(),
+        // Render command modal overlay if active
+        renderCommandModal()
       );
     }
 

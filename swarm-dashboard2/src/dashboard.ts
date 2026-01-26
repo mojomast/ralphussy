@@ -12,10 +12,28 @@ export class SwarmDashboard2 {
   private lastLogTimestamp: number = 0;
   private logLines: Array<{ worker_num: string; log_line: string }> = [];
   // Scrolling / focus state for panes
-  private paneOffsets: Record<string, number> = { actions: 0, tasks: 0, workers: 0, console: 0 };
+  private paneOffsets: Record<string, number> = { actions: 0, tasks: 0, workers: 0, console: 0, ralph: 0 };
   // Track how many renderable lines each pane currently has so we can clamp scrolling
-  private paneCounts: Record<string, number> = { actions: 0, tasks: 0, workers: 0, console: 0 };
-  private focusedPane: 'actions' | 'tasks' | 'workers' | 'console' = 'tasks';
+  private paneCounts: Record<string, number> = { actions: 0, tasks: 0, workers: 0, console: 0, ralph: 0 };
+  private focusedPane: 'actions' | 'tasks' | 'workers' | 'console' | 'ralph' = 'tasks';
+  // Ralph-live state
+  private ralphLiveState: {
+    currentProject: string;
+    workdir: string;
+    devplanPath: string;
+    provider: string;
+    model: string;
+    swarmProvider: string;
+    swarmModel: string;
+  } = {
+    currentProject: '',
+    workdir: '',
+    devplanPath: '',
+    provider: '',
+    model: '',
+    swarmProvider: '',
+    swarmModel: '',
+  };
   private pageSize: number = 20;
 
   async init() {
@@ -85,8 +103,8 @@ export class SwarmDashboard2 {
         }
         this.refreshData();
       } else if (key.name === 'tab') {
-        // Cycle focus: tasks -> actions -> workers -> console
-        const order: Array<typeof this.focusedPane> = ['tasks', 'actions', 'workers', 'console'];
+        // Cycle focus: tasks -> actions -> workers -> ralph -> console
+        const order: Array<typeof this.focusedPane> = ['tasks', 'actions', 'workers', 'ralph', 'console'];
         const idx = order.indexOf(this.focusedPane);
         this.focusedPane = order[(idx + 1) % order.length];
         this.refreshData();
@@ -236,7 +254,7 @@ export class SwarmDashboard2 {
     const resourcesPanel = Box({
       id: 'resources-panel',
       width: '100%',
-      height: '60%',
+      height: '40%',
       backgroundColor: '#0d1117',
       borderStyle: 'double',
       borderColor: '#d29922',
@@ -258,7 +276,7 @@ export class SwarmDashboard2 {
     const workersPanel = Box({
       id: 'workers-panel',
       width: '100%',
-      height: '40%',
+      height: '30%',
       backgroundColor: '#0d1117',
       borderStyle: 'double',
       borderColor: '#58a6ff',
@@ -289,8 +307,44 @@ export class SwarmDashboard2 {
 
     workersPanel.add(workersList);
 
+    // Ralph Live panel - shows project, model settings, quick actions
+    const ralphPanel = Box({
+      id: 'ralph-panel',
+      width: '100%',
+      height: '30%',
+      backgroundColor: '#0f0a1a',
+      borderStyle: 'double',
+      borderColor: '#a855f7',
+      title: ' Ralph Live ',
+      position: 'relative',
+    });
+
+    const ralphText = Text({
+      id: 'ralph-text',
+      content: 'Loading Ralph Live...',
+      fg: '#e9d5ff',
+      position: 'absolute',
+      left: 1,
+      top: 1,
+    });
+
+    ralphPanel.add(ralphText);
+
+    const ralphList = Box({
+      id: 'ralph-list',
+      flexDirection: 'column',
+      width: '100%',
+      height: '100%',
+      position: 'absolute',
+      top: 1,
+      left: 0,
+    });
+
+    ralphPanel.add(ralphList);
+
     rightColumn.add(resourcesPanel);
     rightColumn.add(workersPanel);
+    rightColumn.add(ralphPanel);
 
     middleContainer.add(actionsPanel);
     middleContainer.add(tasksPanel);
@@ -354,10 +408,12 @@ export class SwarmDashboard2 {
         this.updateTasks(run.run_id);
         this.updateResources(run.run_id);
         this.updateConsole(run.run_id);
+        this.updateRalphLive(run.run_id);
       } else {
         this.updateHeaderNoRun();
         this.clearLists();
         this.clearConsole();
+        this.updateRalphLive(null);
       }
     } catch (error) {
       console.error('Error refreshing data:', error);
@@ -532,9 +588,126 @@ export class SwarmDashboard2 {
     }
   }
 
+  private updateRalphLive(runId: string | null) {
+    const ralphList = this.renderer.root.findDescendantById('ralph-list');
+    if (!ralphList) return;
+
+    // Clear existing content
+    while (ralphList.getChildrenCount() > 0) {
+      const child = ralphList.getChildren()[0];
+      ralphList.remove(child.id);
+    }
+
+    // Try to load ralph-live state from environment or files
+    this.loadRalphLiveState();
+
+    const lines: Array<{ content: string; fg: string }> = [];
+
+    // Project info
+    if (this.ralphLiveState.currentProject) {
+      lines.push({ content: `Project: ${this.ralphLiveState.currentProject}`, fg: '#a855f7' });
+    } else {
+      lines.push({ content: 'Project: (none)', fg: '#6b7280' });
+    }
+
+    // Workdir
+    if (this.ralphLiveState.workdir) {
+      const shortPath = this.ralphLiveState.workdir.length > 25 
+        ? '...' + this.ralphLiveState.workdir.slice(-22) 
+        : this.ralphLiveState.workdir;
+      lines.push({ content: `Workdir: ${shortPath}`, fg: '#9ca3af' });
+    }
+
+    // DevPlan
+    if (this.ralphLiveState.devplanPath) {
+      const devplanName = this.ralphLiveState.devplanPath.split('/').pop() || 'devplan.md';
+      lines.push({ content: `DevPlan: ${devplanName}`, fg: '#c084fc' });
+    }
+
+    lines.push({ content: '', fg: '#ffffff' }); // Spacer
+
+    // Model settings
+    const provider = this.ralphLiveState.provider || process.env.RALPH_LLM_PROVIDER || 'default';
+    const model = this.ralphLiveState.model || process.env.RALPH_LLM_MODEL || 'default';
+    lines.push({ content: `Provider: ${provider}`, fg: '#818cf8' });
+    lines.push({ content: `Model: ${model.split('/').pop() || model}`, fg: '#818cf8' });
+
+    // Swarm-specific settings if different
+    const swarmProvider = this.ralphLiveState.swarmProvider || process.env.SWARM_PROVIDER;
+    const swarmModel = this.ralphLiveState.swarmModel || process.env.SWARM_MODEL;
+    if (swarmProvider || swarmModel) {
+      lines.push({ content: '', fg: '#ffffff' }); // Spacer
+      lines.push({ content: `Swarm Provider: ${swarmProvider || 'agent'}`, fg: '#f472b6' });
+      lines.push({ content: `Swarm Model: ${(swarmModel || 'agent').split('/').pop()}`, fg: '#f472b6' });
+    }
+
+    lines.push({ content: '', fg: '#ffffff' }); // Spacer
+
+    // Quick commands hint
+    lines.push({ content: '─────────────────', fg: '#4b5563' });
+    lines.push({ content: 'Tab: cycle panes', fg: '#6b7280' });
+    lines.push({ content: 'q: quit  r: refresh', fg: '#6b7280' });
+    lines.push({ content: 'p: pause polling', fg: '#6b7280' });
+
+    // Focused pane indicator
+    if (this.focusedPane === 'ralph') {
+      lines.push({ content: '', fg: '#ffffff' });
+      lines.push({ content: '● FOCUSED', fg: '#a855f7' });
+    }
+
+    // Update pane count
+    this.paneCounts.ralph = lines.length;
+    const rOff = this.paneOffsets.ralph || 0;
+    const rWindow = lines.slice(rOff, rOff + this.pageSize);
+
+    rWindow.forEach((l, idx) => {
+      ralphList.add(Text({ id: `ralph-line-${idx}-${rOff}`, content: ` ${l.content}`, fg: l.fg, position: 'relative' }));
+    });
+  }
+
+  private loadRalphLiveState() {
+    // Try to read from environment variables or state files
+    const homeDir = process.env.HOME || '/home/mojo';
+    const projectsDir = process.env.SWARM_PROJECTS_BASE || `${homeDir}/projects`;
+    const currentProjectFile = `${projectsDir}/current`;
+
+    try {
+      // Read current project name
+      const fs = require('fs');
+      if (fs.existsSync(currentProjectFile)) {
+        const projectName = fs.readFileSync(currentProjectFile, 'utf-8').trim();
+        this.ralphLiveState.currentProject = projectName;
+
+        // Try to load project.env
+        const projectEnvPath = `${projectsDir}/${projectName}/project.env`;
+        if (fs.existsSync(projectEnvPath)) {
+          const envContent = fs.readFileSync(projectEnvPath, 'utf-8');
+          const lines = envContent.split('\n');
+          for (const line of lines) {
+            const match = line.match(/^(\w+)="?([^"]*)"?$/);
+            if (match) {
+              const [, key, value] = match;
+              if (key === 'WORKDIR') this.ralphLiveState.workdir = value;
+              if (key === 'DEVPLAN_PATH') this.ralphLiveState.devplanPath = value;
+            }
+          }
+        }
+      }
+    } catch (e) {
+      // Ignore errors reading state files
+    }
+
+    // Also check environment variables
+    this.ralphLiveState.provider = process.env.RALPH_LLM_PROVIDER || process.env.PROVIDER || '';
+    this.ralphLiveState.model = process.env.RALPH_LLM_MODEL || process.env.MODEL || '';
+    this.ralphLiveState.swarmProvider = process.env.SWARM_PROVIDER || '';
+    this.ralphLiveState.swarmModel = process.env.SWARM_MODEL || '';
+  }
+
   private clearLists() {
     const workersList = this.renderer.root.findDescendantById('workers-list');
     const tasksList = this.renderer.root.findDescendantById('tasks-list');
+    const ralphList = this.renderer.root.findDescendantById('ralph-list');
     
     if (workersList) {
       while (workersList.getChildrenCount() > 0) {
@@ -546,6 +719,12 @@ export class SwarmDashboard2 {
       while (tasksList.getChildrenCount() > 0) {
         const child = tasksList.getChildren()[0];
         tasksList.remove(child.id);
+      }
+    }
+    if (ralphList) {
+      while (ralphList.getChildrenCount() > 0) {
+        const child = ralphList.getChildren()[0];
+        ralphList.remove(child.id);
       }
     }
     
