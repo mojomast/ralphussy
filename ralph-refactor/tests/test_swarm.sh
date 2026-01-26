@@ -9,10 +9,14 @@ __TEST_SWARM_DIR__="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$__TEST_SWARM_DIR__/../lib/swarm_scheduler.sh"
 . "$__TEST_SWARM_DIR__/../lib/swarm_display.sh"
 
-TEST_RUN_DIR="/tmp/test_swarm_$(date +%s)"
+TEST_RUN_DIR="/tmp/test_swarm_$(date +%s%N)"
 mkdir -p "$TEST_RUN_DIR"
 
 export RALPH_DIR="$TEST_RUN_DIR"
+
+# Suppress SQLite warnings for cleaner test output
+# (UNIQUE constraint warnings are expected when tests run in same second)
+export SQLITE_SUPPRESS_WARNINGS=1
 
 # Swarm analyzer uses `opencode run` (via OpenCode CLI) rather than direct API calls.
 # Default provider/model here should reflect that.
@@ -22,10 +26,10 @@ export RALPH_LLM_MODEL="opencode/claude-sonnet-4-5"
 setup_test_db() {
     # ensure clean database for this test
     rm -f "$RALPH_DIR/swarm.db"
-    swarm_db_init
+    swarm_db_init 2>/dev/null
 
     local run_id
-    run_id=$(swarm_db_start_run "test" "test_file" "test_prompt" 4)
+    run_id=$(swarm_db_start_run "test" "test_file" "test_hash_$(date +%s%N)" "test_prompt" 4 2>/dev/null)
 
     local task_id_1
     task_id_1=$(swarm_db_add_task "$run_id" "Task 1" '["file1.txt"]' 1 1)
@@ -86,10 +90,10 @@ test_branch_normalization() {
 test_database_operations() {
     echo "Testing database operations..."
 
-    swarm_db_init
+    swarm_db_init 2>/dev/null
 
     local run_id
-    run_id=$(swarm_db_start_run "test" "test_file" "test_prompt" 2)
+    run_id=$(swarm_db_start_run "test" "test_file" "test_hash_$(date +%s%N)" "test_prompt" 2 2>/dev/null)
 
     # register a worker so claim can succeed
     local worker_id
@@ -178,10 +182,10 @@ test_database_operations() {
 test_file_locking() {
     echo "Testing file locking..."
 
-    swarm_db_init
+    swarm_db_init 2>/dev/null
 
     local run_id
-    run_id=$(swarm_db_start_run "test" "test_file" "test_prompt" 2)
+    run_id=$(swarm_db_start_run "test" "test_file" "test_hash_$(date +%s%N)" "test_prompt" 2 2>/dev/null)
 
     local worker_id_1
     worker_id_1=$(swarm_db_register_worker "$run_id" 1 1001 "swarm/test/run1/worker-1" "$TEST_RUN_DIR/runs/$run_id/worker-1")
@@ -223,10 +227,10 @@ test_file_locking() {
 test_worker_stale_detection() {
     echo "Testing worker stale detection..."
 
-    swarm_db_init
+    swarm_db_init 2>/dev/null
 
     local run_id
-    run_id=$(swarm_db_start_run "test" "test_file" "test_prompt" 1)
+    run_id=$(swarm_db_start_run "test" "test_file" "test_hash_$(date +%s%N)" "test_prompt" 1 2>/dev/null)
 
     local worker_id
     worker_id=$(swarm_db_register_worker "$run_id" 1 1001 "swarm/test/run1/worker-1" "$TEST_RUN_DIR/runs/$run_id/worker-1")
@@ -246,7 +250,8 @@ test_worker_stale_detection() {
     local worker_status
     worker_status=$(swarm_db_worker_status "$run_id" 1)
 
-    if echo "$worker_status" | grep -q "NULL"; then
+    # After cleanup, last_heartbeat should be NULL (shown as empty or ||)
+    if echo "$worker_status" | grep -qE '(\|\|$|idle\|\|)'; then
         echo "✅ Stale worker detected and cleaned"
     else
         echo "❌ Stale worker not detected"
@@ -261,10 +266,10 @@ test_worker_stale_detection() {
 test_task_priority() {
     echo "Testing task priority..."
 
-    swarm_db_init
+    swarm_db_init 2>/dev/null
 
     local run_id
-    run_id=$(swarm_db_start_run "test" "test_file" "test_prompt" 2)
+    run_id=$(swarm_db_start_run "test" "test_file" "test_hash_$(date +%s%N)" "test_prompt" 2 2>/dev/null)
 
     # Suppress stdout from helper (it prints inserted ids)
     swarm_db_add_task "$run_id" "Low priority task" '["file1.txt"]' 3 1 >/dev/null
@@ -345,10 +350,10 @@ run_all_tests() {
 test_artifact_collection() {
     echo "Testing artifact collection..."
 
-    swarm_db_init
+    swarm_db_init 2>/dev/null
 
     local run_id
-    run_id=$(swarm_db_start_run "test" "test_file" "test_prompt" 1)
+    run_id=$(swarm_db_start_run "test" "test_file" "test_hash_$(date +%s%N)" "test_prompt" 1 2>/dev/null)
 
     local worker_id
     worker_id=$(swarm_db_register_worker "$run_id" 1 4001 "swarm/test/run-artifacts/worker-1" "$TEST_RUN_DIR/runs/$run_id/worker-1")

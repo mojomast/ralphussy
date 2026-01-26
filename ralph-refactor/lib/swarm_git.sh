@@ -14,16 +14,19 @@ swarm_git_default_base_branch() {
         return 0
     fi
 
-    # Fall back to the current branch.
+    # Fall back to the current branch if it exists locally; otherwise prefer 'main'.
     local current
     current=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
     if [ -n "$current" ] && [ "$current" != "HEAD" ]; then
-        printf '%s' "$current"
-        return 0
+        # Ensure the current branch exists in refs/heads (sometimes HEAD points to a ref that isn't present)
+        if git show-ref --verify --quiet "refs/heads/$current" 2>/dev/null; then
+            printf '%s' "$current"
+            return 0
+        fi
     fi
 
-    # Last-resort default.
-    printf '%s' "master"
+    # Last-resort default: prefer 'main' which is common in new repos
+    printf '%s' "main"
 }
 
 

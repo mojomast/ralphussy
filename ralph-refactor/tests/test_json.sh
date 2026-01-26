@@ -62,13 +62,21 @@ test_extract_text_empty_json() {
 }
 
 test_extract_text_from_real_output() {
-    echo "Testing json_extract_text from real swarm output..."
+    echo "Testing json_extract_text from realistic swarm output..."
+    
+    # Create mock realistic swarm output
+    local mock_output
+    mock_output='{"type":"text","part":{"text":"Starting task execution..."}}
+{"type":"tool_use","part":{"name":"read","input":{"filePath":"/path/to/file.txt"}}}
+{"type":"text","part":{"text":"File read successfully"}}
+{"type":"text","part":{"text":"Task completed"}}
+{"type":"text","part":{"text":"<promise>COMPLETE</promise>"}}'
     
     local result
-    result=$(json_extract_text "$(cat /tmp/swarm_task_1663_output.json)")
+    result=$(json_extract_text "$mock_output")
     
     if [ "$result" = "<promise>COMPLETE</promise>" ]; then
-        echo "✅ Extracted completion marker from real output correctly"
+        echo "✅ Extracted completion marker from realistic output correctly"
         return 0
     else
         echo "❌ Expected '<promise>COMPLETE</promise>', got: '$result'"

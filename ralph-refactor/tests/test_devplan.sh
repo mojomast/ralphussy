@@ -85,7 +85,8 @@ run_all_tests() {
     test_yaml_frontmatter || failures=$((failures+1))
     test_html_comments_and_whitespace || failures=$((failures+1))
 
-    echo "\nDevplan tests completed: $failures failed"
+    echo ""
+    echo "Devplan tests completed: $failures failed"
     return $failures
 }
 
