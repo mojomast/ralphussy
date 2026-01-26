@@ -115,3 +115,15 @@ Next recommended steps (pick one)
 3) Add unit tests that feed representative LLM outputs (including the saved `last_devplan_response.txt`) to the parser and assert the DevPlan structure.
 
 If you want me to proceed with one of those, say which (1–3) and I'll run it.
+
+Recent changes (2026-01-26)
+---------------------------------
+- Committed and pushed a parser and docs update: `feat(devussy): robustly extract LLM text from opencode JSON logs and improve devplan parsing; document swarm-dashboard2` (commit `db3f60f` on `origin/main`).
+- Files changed in that commit: `devussyout/src/pipeline/basic_devplan.py`, `swarm-dashboard/README.md`.
+- Notes: the devplan parser now extracts LLM text from Opencode JSON log entries and prefers fenced JSON blocks when present; `swarm-dashboard` docs were updated to reference `swarm-dashboard2`.
+
+Recommended verification steps
+---------------------------------
+1. Run unit/integration tests: `./ralph-refactor/tests/run_all_tests.sh` or project-specific suites.
+2. Inspect the parser behavior with a recent devplan response: `cat .devussy_state/last_devplan_response.txt | sed -n '1,240p'` and re-run the generator.
+3. Check CI on GitHub to ensure there are no regressions after the push.
