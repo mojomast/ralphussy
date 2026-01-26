@@ -14,6 +14,7 @@ source "$SCRIPT_DIR/lib/json.sh"
 source "$SCRIPT_DIR/lib/devplan.sh"
 source "$SCRIPT_DIR/lib/swarm_db.sh"
 source "$SCRIPT_DIR/lib/swarm_git.sh"
+source "$SCRIPT_DIR/lib/devussy.sh"
 
 # Live mode state
 LIVE_PID_FILE=""
@@ -884,21 +885,45 @@ new_project_wizard() {
     local devplan_path="$dir/devplan.md"
 
     echo ""
-    echo -n -e "${YELLOW}Generate DevPlan with opencode? (Y/n): ${NC}"
-    local gen
-    read_user_input gen
-    if [[ "${gen:-}" =~ ^[Nn]$ ]]; then
-        project_write_devplan_template "$devplan_path" "$name"
-    else
-        echo ""
-        echo -e "${CYAN}Describe the project goal/requirements (Ctrl+D when done):${NC}"
-        local goal
-        goal=$(read_multiline_input)
-        if [ -z "$goal" ]; then
-            goal="$name"
-        fi
-        project_generate_devplan_with_opencode "$devplan_path" "$name" "$goal" || true
-    fi
+    echo -e "${CYAN}Choose devplan generation method:${NC}"
+    echo "  ${CYAN}1${NC}) Quick template (no AI)"
+    echo "  ${CYAN}2${NC}) Simple LLM generation"
+    echo "  ${CYAN}3${NC}) ${MAGENTA}Devussy (AI-powered, structured, parallel-aware)${NC}"
+    echo ""
+    echo -n -e "${YELLOW}Choice [2]: ${NC}"
+    local gen_choice
+    read_user_input gen_choice
+    gen_choice="${gen_choice:-2}"
+
+    case "$gen_choice" in
+        1)
+            project_write_devplan_template "$devplan_path" "$name"
+            ;;
+        2)
+            echo ""
+            echo -e "${CYAN}Describe the project goal/requirements (Ctrl+D when done):${NC}"
+            local goal
+            goal=$(read_multiline_input)
+            if [ -z "$goal" ]; then
+                goal="$name"
+            fi
+            project_generate_devplan_with_opencode "$devplan_path" "$name" "$goal" || true
+            ;;
+        3)
+            devussy_generate_for_project "$name" "$workdir" "$devplan_path"
+            ;;
+        *)
+            echo -e "${YELLOW}Invalid choice, using simple LLM generation${NC}"
+            echo ""
+            echo -e "${CYAN}Describe the project goal/requirements (Ctrl+D when done):${NC}"
+            local goal
+            goal=$(read_multiline_input)
+            if [ -z "$goal" ]; then
+                goal="$name"
+            fi
+            project_generate_devplan_with_opencode "$devplan_path" "$name" "$goal" || true
+            ;;
+    esac
 
     cat > "$dir/project.env" <<EOF
 NAME="$name"
@@ -1326,6 +1351,7 @@ project_menu() {
         echo -e "  ${CYAN}3${NC}) Start swarm on current DevPlan"
         echo -e "  ${CYAN}4${NC}) View all projects with swarm progress"
         echo -e "  ${CYAN}5${NC}) Resume swarm for a project"
+        echo -e "  ${CYAN}6${NC}) ${MAGENTA}Generate devplan with Devussy (AI-powered, structured)${NC}"
         echo ""
         echo -e "  ${CYAN}b${NC}) Back"
         echo ""
@@ -1371,6 +1397,12 @@ project_menu() {
                 ;;
             5)
                 project_swarm_select_resume || true
+                echo ""
+                echo -e "${CYAN}Press Enter to continue...${NC}"
+                read_user_input
+                ;;
+            6)
+                devussy_mode_wizard || true
                 echo ""
                 echo -e "${CYAN}Press Enter to continue...${NC}"
                 read_user_input

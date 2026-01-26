@@ -7,12 +7,53 @@ has_pending_tasks() {
         return 1
     fi
 
-    # Check for any pending tasks ([ ] or ⏳)
-    if grep -qE '^[ ]*- \[ \]|^[ ]*- \[⏳\]|^[ ]*- ⏳' "$devpath" 2>/dev/null; then
+    # Preprocess devplan to handle YAML frontmatter, HTML comments,
+    # plain list items (- task) and normalize unicode checkbox markers.
+    local pdev
+    pdev=$(preprocess_devplan "$devpath")
+
+    # Check for any pending tasks (standardized to '- [ ]' or '[⏳]').
+    if grep -qE '^[[:space:]]*- \[ \]|^[[:space:]]*- \[⏳\]' "$pdev" 2>/dev/null; then
         return 0  # Has pending tasks
     fi
 
     return 1  # No pending tasks
+}
+
+# Preprocess a devplan file and emit normalized content to stdout.
+# This strips YAML frontmatter fences (--- ... ---), removes HTML comments,
+# normalizes plain list items (`- task`) to `- [ ] task`, and ensures
+# checkbox variants are standardized to bracketed form so downstream
+# grep/awk patterns can be simpler.
+preprocess_devplan() {
+    local src="$1"
+    local out="${src}.preproc"
+
+    # If input is /dev/stdin or -, cat directly
+    if [ "$src" = "/dev/stdin" ] || [ "$src" = "-" ]; then
+        cat - | sed -e 's/\r$//' > "$out"
+    else
+        sed -e 's/\r$//' "$src" > "$out"
+    fi
+
+    # Strip YAML frontmatter (--- ... ---) if present at the top
+    if head -n1 "$out" | grep -qE '^---\s*$'; then
+        # remove from first --- through the next --- (inclusive)
+        awk 'BEGIN{del=0} /^---[[:space:]]*$/ { if (del==0) {del=1; next} else {del=0; next}} !del {print}' "$out" > "${out}.tmp" || true
+        mv "${out}.tmp" "$out" 2>/dev/null || true
+    fi
+
+    # Strip HTML comments, trim whitespace and normalize checkboxes.
+    sed -E 's/<!--.*-->//' "$out" \
+        | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' \
+        | sed -E 's/⏳/[⏳]/g; s/✅/[✅]/g; s/🔄/[🔄]/g' \
+        | sed -E 's/^- ([^[])/- [ ] \1/' \
+        > "${out}.norm" || true
+
+    mv "${out}.norm" "$out" 2>/dev/null || true
+
+    # Emit preprocessed path so callers can grep it
+    printf '%s' "$out"
 }
 
 count_devplan_tasks() {
@@ -23,17 +64,20 @@ count_devplan_tasks() {
         return 1
     fi
 
+    local pdev
+    pdev=$(preprocess_devplan "$devpath")
+
     local pending
-    pending=$(grep -cE '^[ ]*- \[ \]' "$devpath" 2>/dev/null || true)
+    pending=$(grep -cE '^[[:space:]]*- \[ \]' "$pdev" 2>/dev/null || true)
     [ -z "$pending" ] && pending=0
     local in_progress
-    in_progress=$(grep -cE '^[ ]*- \[⏳\]|^[ ]*- ⏳' "$devpath" 2>/dev/null || true)
+    in_progress=$(grep -cE '^[[:space:]]*- \[⏳\]' "$pdev" 2>/dev/null || true)
     [ -z "$in_progress" ] && in_progress=0
     local completed
-    completed=$(grep -cE '^[ ]*- \[✅\]|^[ ]*- ✅' "$devpath" 2>/dev/null || true)
+    completed=$(grep -cE '^[[:space:]]*- \[✅\]' "$pdev" 2>/dev/null || true)
     [ -z "$completed" ] && completed=0
     local needs_review
-    needs_review=$(grep -cE '^[ ]*- \[🔄\]|^[ ]*- 🔄' "$devpath" 2>/dev/null || true)
+    needs_review=$(grep -cE '^[[:space:]]*- \[🔄\]' "$pdev" 2>/dev/null || true)
     [ -z "$needs_review" ] && needs_review=0
 
     # Ensure all values are numbers
@@ -55,30 +99,26 @@ get_next_pending_task() {
     # Find first pending task (marked with ⏳ or unchecked)
     # Devplan uses format: - [✅] task or - ⏳ task or - [ ] task
     # Skip tasks marked with [🔄] (needs review)
+    local pdev
+    pdev=$(preprocess_devplan "$devpath")
+
     local task
     task=$(awk '
-    /^[ ]*- \[🔄\]/ { next }
-    /^[ ]*- 🔄/ { next }
-    /^[ ]*- \[✅\]/ { next }
-    /^[ ]*- \[⏳\]/ {
-        sub(/^[ ]*- \[⏳\] /, "")
-        gsub(/^\s+|\s+$/, "")
+    /^[[:space:]]*- \[🔄\]/ { next }
+    /^[[:space:]]*- \[✅\]/ { next }
+    /^[[:space:]]*- \[⏳\]/ {
+        sub(/^[[:space:]]*- \[⏳\] /, "")
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "")
         print
         exit
     }
-    /^[ ]*- ⏳/ {
-        sub(/^[ ]*- ⏳ /, "")
-        gsub(/^\s+|\s+$/, "")
+    /^[[:space:]]*- \[ \]/ {
+        sub(/^[[:space:]]*- \[ \] /, "")
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "")
         print
         exit
     }
-    /^[ ]*- \[ \]/ {
-        sub(/^[ ]*- \[ \] /, "")
-        gsub(/^\s+|\s+$/, "")
-        print
-        exit
-    }
-    ' "$devpath")
+    ' "$pdev")
 
     echo "$task"
 }
@@ -90,45 +130,32 @@ get_all_tasks_with_states() {
         return 1
     fi
 
+    local pdev
+    pdev=$(preprocess_devplan "$devpath")
+
     awk '
-    /^[ ]*- \[✅\]/ {
-        sub(/^[ ]*- \[✅\] /, "")
-        gsub(/^\s+|\s+$/, "")
+    /^[[:space:]]*- \[✅\]/ {
+        sub(/^[[:space:]]*- \[✅\] /, "")
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "")
         print "complete: " $0
     }
-    /^[ ]*- ✅/ {
-        sub(/^[ ]*- ✅ /, "")
-        gsub(/^\s+|\s+$/, "")
-        print "complete: " $0
-    }
-    /^[ ]*- \[⏳\]/ {
-        sub(/^[ ]*- \[⏳\] /, "")
-        gsub(/^\s+|\s+$/, "")
+    /^[[:space:]]*- \[⏳\]/ {
+        sub(/^[[:space:]]*- \[⏳\] /, "")
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "")
         print "in_progress: " $0
     }
-    /^[ ]*- ⏳/ {
-        sub(/^[ ]*- ⏳ /, "")
-        gsub(/^\s+|\s+$/, "")
-        print "in_progress: " $0
-    }
-    /^[ ]*- \[🔄\]/ {
-        sub(/^[ ]*- \[🔄\] /, "")
+    /^[[:space:]]*- \[🔄\]/ {
+        sub(/^[[:space:]]*- \[🔄\] /, "")
         gsub(/<!--.*-->/, "")
-        gsub(/^\s+|\s+$/, "")
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "")
         print "needs_review: " $0
     }
-    /^[ ]*- 🔄/ {
-        sub(/^[ ]*- 🔄 /, "")
-        gsub(/<!--.*-->/, "")
-        gsub(/^\s+|\s+$/, "")
-        print "needs_review: " $0
-    }
-    /^[ ]*- \[ \]/ {
-        sub(/^[ ]*- \[ \] /, "")
-        gsub(/^\s+|\s+$/, "")
+    /^[[:space:]]*- \[ \]/ {
+        sub(/^[[:space:]]*- \[ \] /, "")
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "")
         print "pending: " $0
     }
-    ' "$devpath"
+    ' "$pdev"
 }
 
 mark_task_in_progress() {
@@ -151,10 +178,9 @@ mark_task_in_progress() {
         match(line, /^[ \t]*/)
         indent = substr(line, RSTART, RLENGTH)
         body = substr(line, RLENGTH+1)
-        # possible prefixes: - [ ] , - ✅ , - ⏳ , - [🔄] etc.
-        if (body ~ /^- (\[[ ]\]|\[⏳\]|⏳|\[🔄\]|🔄|\[✅\]|✅) /) {
-          # remove checkbox/prefix for comparison
-          gsub(/^(- (\[[^]]*\]|[⏳✅🔄]) )/, "", body)
+        if (body ~ /^- /) {
+          # remove checkbox/prefix (either '- [x] ' or plain '- ')
+          gsub(/^(- (\[[^]]*\]|[⏳✅🔄]) |^- /, "", body)
           if (body == task) {
             print indent "- [⏳] " task
             updated=1
@@ -185,8 +211,8 @@ mark_task_complete() {
         match(line, /^[ \t]*/)
         indent = substr(line, RSTART, RLENGTH)
         body = substr(line, RLENGTH+1)
-        if (body ~ /^- (\[[ ]\]|\[⏳\]|⏳|\[🔄\]|🔄|\[✅\]|✅) /) {
-          gsub(/^(- (\[[^]]*\]|[⏳✅🔄]) )/, "", body)
+        if (body ~ /^- /) {
+          gsub(/^(- (\[[^]]*\]|[⏳✅🔄]) |^- /, "", body)
           if (body == task) {
             print indent "- [✅] " task
             updated=1
@@ -218,8 +244,8 @@ mark_task_needs_review() {
         match(line, /^[ \t]*/)
         indent = substr(line, RSTART, RLENGTH)
         body = substr(line, RLENGTH+1)
-        if (body ~ /^- (\[[ ]\]|\[⏳\]|⏳|\[🔄\]|🔄|\[✅\]|✅) /) {
-          gsub(/^(- (\[[^]]*\]|[⏳✅🔄]) )/, "", body)
+        if (body ~ /^- /) {
+          gsub(/^(- (\[[^]]*\]|[⏳✅🔄]) |^- /, "", body)
           if (body == task) {
             out = indent "- [🔄] " task
             if (reason != "") out = out " <!-- " reason " -->"
@@ -250,13 +276,13 @@ get_tasks_needing_review() {
     /^[ ]*- \[🔄\]/ {
         sub(/^[ ]*- \[🔄\] /, "")
         gsub(/<!--.*-->/, "")  # Remove comments
-        gsub(/^\s+|\s+$/, "")
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "")
         print
     }
     /^[ ]*- 🔄/ {
         sub(/^[ ]*- 🔄 /, "")
         gsub(/<!--.*-->/, "")  # Remove comments
-        gsub(/^\s+|\s+$/, "")
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "")
         print
     }
     ' "$devpath")

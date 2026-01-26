@@ -123,7 +123,6 @@ CREATE TABLE IF NOT EXISTS workers (
 
  -- Performance indexes for faster queries
  CREATE INDEX IF NOT EXISTS idx_tasks_hash ON tasks(task_hash);
- CREATE INDEX IF NOT EXISTS idx_completed_tasks_source ON completed_tasks(source_hash, task_hash);
  CREATE INDEX IF NOT EXISTS idx_workers_run_status ON workers(run_id, status);
  CREATE INDEX IF NOT EXISTS idx_tasks_run_status_priority ON tasks(run_id, status, priority);
 
@@ -469,6 +468,12 @@ WHERE run_id = (SELECT run_id FROM tasks WHERE id = $task_id);
 -- Record in completed_tasks table for cross-run resume
 INSERT OR IGNORE INTO completed_tasks (task_hash, task_text, source_hash, completed_at, run_id)
 VALUES ('$task_hash', '$task_text', '$source_hash', datetime('now'), '$run_id');
+
+-- Reset worker to idle status after completing task
+UPDATE workers
+SET status = 'idle',
+    current_task_id = NULL
+WHERE id = $worker_id;
 
 COMMIT;
 EOF

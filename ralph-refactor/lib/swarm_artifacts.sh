@@ -2,6 +2,114 @@
 
 source "$(dirname "${BASH_SOURCE[0]}")/swarm_git.sh"
 
+# Sanitize a source file by removing inappropriate markers/comments
+# This catches progress markers, swarm annotations, and merge conflict markers
+# that should never appear in compiled source files.
+swarm_sanitize_source_file() {
+    local file_path="$1"
+    local file_ext="${file_path##*.}"
+    
+    # Only sanitize source code files
+    case "$file_ext" in
+        go|rs|c|cpp|cc|h|hpp|java|kt|swift|py|rb|js|ts|jsx|tsx|cs|scala|pl|pm|php|sh|bash|zsh)
+            ;;
+        *)
+            # Not a source file we sanitize
+            return 0
+            ;;
+    esac
+    
+    if [ ! -f "$file_path" ]; then
+        return 0
+    fi
+    
+    local temp_file="${file_path}.sanitize.tmp"
+    local had_issues=false
+    
+    # Check for problematic patterns
+    if grep -qE '<!--.*-->|{#.*#}' "$file_path" 2>/dev/null; then
+        echo "  ⚠️  Removing HTML/Jinja comments from: $file_path"
+        had_issues=true
+    fi
+    
+    if grep -qE '^<<<<<<<|^=======|^>>>>>>>' "$file_path" 2>/dev/null; then
+        echo "  ⚠️  Found merge conflict markers in: $file_path"
+        echo "  ⚠️  WARNING: File needs manual conflict resolution!"
+        # Don't auto-remove conflict markers - they need manual review
+        return 1
+    fi
+    
+    if grep -qiE '// *(PROGRESS|SWARM|Worker [0-9]+|Task (completed|in.progress)|CHECKPOINT)' "$file_path" 2>/dev/null; then
+        echo "  ⚠️  Removing progress/swarm comments from: $file_path"
+        had_issues=true
+    fi
+    
+    if grep -qiE '# *(PROGRESS|SWARM|Worker [0-9]+|Task (completed|in.progress)|CHECKPOINT)' "$file_path" 2>/dev/null; then
+        echo "  ⚠️  Removing progress/swarm comments from: $file_path"
+        had_issues=true
+    fi
+    
+    if [ "$had_issues" = true ]; then
+        # Remove problematic patterns
+        sed -E \
+            -e 's/<!--[^>]*-->//g' \
+            -e 's/\{#[^}]*#\}//g' \
+            -e '/^[[:space:]]*(\/\/|#)[[:space:]]*(PROGRESS|SWARM|Worker [0-9]+|Task (completed|in.progress)|CHECKPOINT).*/d' \
+            "$file_path" > "$temp_file" 2>/dev/null || {
+                rm -f "$temp_file"
+                return 1
+            }
+        
+        # Only replace if sanitization succeeded and file is not empty
+        if [ -s "$temp_file" ]; then
+            mv "$temp_file" "$file_path"
+            echo "  ✓ Sanitized: $file_path"
+        else
+            rm -f "$temp_file"
+            echo "  ⚠️  Sanitization would empty file, skipping: $file_path"
+        fi
+    fi
+    
+    rm -f "$temp_file" 2>/dev/null || true
+    return 0
+}
+
+# Sanitize all source files in a directory
+swarm_sanitize_directory() {
+    local dir_path="$1"
+    local issues_found=0
+    
+    if [ ! -d "$dir_path" ]; then
+        return 0
+    fi
+    
+    echo "Sanitizing source files in: $dir_path"
+    
+    # Find and sanitize all source files
+    while IFS= read -r -d '' file; do
+        if ! swarm_sanitize_source_file "$file"; then
+            issues_found=$((issues_found + 1))
+        fi
+    done < <(find "$dir_path" -type f \( \
+        -name "*.go" -o -name "*.rs" -o -name "*.c" -o -name "*.cpp" -o \
+        -name "*.h" -o -name "*.hpp" -o -name "*.java" -o -name "*.kt" -o \
+        -name "*.swift" -o -name "*.py" -o -name "*.rb" -o -name "*.js" -o \
+        -name "*.ts" -o -name "*.jsx" -o -name "*.tsx" -o -name "*.cs" -o \
+        -name "*.scala" -o -name "*.pl" -o -name "*.php" -o -name "*.sh" \
+    \) -print0 2>/dev/null)
+    
+    if [ $issues_found -gt 0 ]; then
+        echo "  ⚠️  $issues_found files have merge conflicts requiring manual resolution"
+        return 1
+    fi
+    
+    echo "  ✓ Sanitization complete"
+    return 0
+}
+
+export -f swarm_sanitize_source_file 2>/dev/null || true
+export -f swarm_sanitize_directory 2>/dev/null || true
+
 # Merge all worker branches for a run into the project repo's main branch
 swarm_merge_to_project() {
     local run_id="$1"
@@ -240,6 +348,12 @@ swarm_merge_to_project() {
         fi
     done
     
+    # Sanitize source files before committing to remove any inappropriate markers
+    echo "Sanitizing merged source files..."
+    swarm_sanitize_directory "$project_dir" || {
+        echo "  ⚠️  Some files need manual conflict resolution"
+    }
+
     # Commit merged changes if any
     if [ "$merged_count" -gt 0 ]; then
         git add . 2>/dev/null || true
@@ -441,7 +555,7 @@ swarm_extract_merged_artifacts() {
         fi
     fi
     
-    # Final fallback: create swarm-$run_id directory
+    # Final fallback: create swarm-$run_id directory under dest_base
     if [ -z "$project_dir" ]; then
         project_name="swarm-$run_id"
         project_dir="$dest_base/$project_name"
@@ -449,6 +563,12 @@ swarm_extract_merged_artifacts() {
     
     echo "Extracting merged artifacts for run: $run_id"
     echo "Project directory: $project_dir"
+    # If destination is under the user's projects base, ensure a marker file so
+    # workers know this repo is intended to be exported to ~/projects and not
+    # treated as internal ralphussy files when merging future runs.
+    if [ -d "$project_dir" ]; then
+        touch "$project_dir/.ralph_project_marker" 2>/dev/null || true
+    fi
     echo
 
     local run_status total_tasks completed_tasks failed_tasks pending_tasks
@@ -594,13 +714,70 @@ swarm_extract_merged_artifacts() {
                     if [ -f "$src_file" ]; then
                         # Check for conflicts: if file exists and differs, warn
                         if [ -f "$dst_file" ]; then
-                            if ! cmp -s "$src_file" "$dst_file"; then
-                                echo "  ⚠️  CONFLICT: $file modified by multiple workers, using latest version"
-                                # TODO: Implement 3-way merge here
+                            if cmp -s "$src_file" "$dst_file"; then
+                                # identical, nothing to do
+                                :
+                            else
+                                echo "  ⚠️  CONFLICT: $file modified by multiple workers, attempting 3-way merge"
+
+                                # Prepare temp files
+                                base_tmp=""
+                                merged_tmp="$(mktemp)"
+
+                                # Try to obtain base version from worker repo if available
+                                if [ -n "${base_commit:-}" ]; then
+                                    base_tmp="$(mktemp)"
+                                    # If base commit has the file, write it; otherwise remove base_tmp
+                                    if git -C "$repo_dir" show "${base_commit}:$file" > "$base_tmp" 2>/dev/null; then
+                                        :
+                                    else
+                                        rm -f "$base_tmp" || true
+                                        base_tmp=""
+                                    fi
+                                fi
+
+                                # Attempt git merge-file (produces conflict markers on conflict)
+                                if [ -n "$base_tmp" ] && command -v git >/dev/null 2>&1; then
+                                    if git merge-file -p --marker-size=7 "$dst_file" "$base_tmp" "$src_file" > "$merged_tmp" 2>/dev/null; then
+                                        mv "$merged_tmp" "$dst_file" || true
+                                        echo "  ✓ 3-way merge applied: $file"
+                                    else
+                                        # git merge-file exits non-zero on conflicts but still writes merged output
+                                        mv "$merged_tmp" "$dst_file" || true
+                                        echo "  ⚠️  Merge produced conflicts (markers added) for: $file"
+                                    fi
+                                else
+                                    # No base available or git missing: fallback to diff3 if present
+                                    if command -v diff3 >/dev/null 2>&1 && [ -n "$base_tmp" ]; then
+                                        if diff3 -m "$dst_file" "$base_tmp" "$src_file" > "$merged_tmp" 2>/dev/null; then
+                                            mv "$merged_tmp" "$dst_file" || true
+                                            echo "  ✓ 3-way merge (diff3) applied: $file"
+                                        else
+                                            mv "$merged_tmp" "$dst_file" || true
+                                            echo "  ⚠️  diff3 produced conflicts (markers added) for: $file"
+                                        fi
+                                    else
+                                        # Worst-case: insert conflict markers with both versions preserved
+                                        {
+                                            echo "<<<<<<< WORKER_VERSION"
+                                            cat "$src_file"
+                                            echo "======="
+                                            cat "$dst_file"
+                                            echo ">>>>>>> PROJECT_VERSION"
+                                        } > "$merged_tmp" || true
+                                        mv "$merged_tmp" "$dst_file" || true
+                                        echo "  ⚠️  No base available; conflict markers inserted for: $file"
+                                    fi
+                                fi
+
+                                # Cleanup
+                                [ -n "$base_tmp" ] && rm -f "$base_tmp" || true
+                                [ -f "$merged_tmp" ] && rm -f "$merged_tmp" >/dev/null 2>&1 || true
                             fi
+                        else
+                            # Destination does not exist - straightforward copy
+                            cp "$src_file" "$dst_file" 2>/dev/null || true
                         fi
-                        
-                        cp "$src_file" "$dst_file" 2>/dev/null || true
                     fi
                 fi
             done <<< "$changed_files"
@@ -623,6 +800,16 @@ swarm_extract_merged_artifacts() {
     echo "Workers processed: $worker_count"
     echo "Total files added/modified: $total_files_added"
     echo "Total lines added: $total_lines_added"
+    echo
+
+    # CRITICAL: Sanitize source files before committing
+    # This removes any progress markers, swarm annotations, or HTML comments
+    # that may have been incorrectly inserted into source code files
+    echo "=== Sanitizing Source Files ==="
+    if ! swarm_sanitize_directory "$project_dir"; then
+        echo "⚠️  Some files have merge conflicts that need manual resolution"
+        echo "⚠️  Please resolve conflicts before continuing"
+    fi
     echo
 
     if [ "$worker_count" -gt 0 ]; then
@@ -845,4 +1032,3 @@ EOF
 }
 
 export -f swarm_list_runs 2>/dev/null || true
-

@@ -438,6 +438,29 @@ PY
         return 1
     fi
 
+    # Optionally stream partial/ongoing merged artifacts into the projects area while the
+    # run is active. This ensures work from workers appears under ~/projects/<project>
+    # even before the run completes. Enable with: export SWARM_STREAM_ARTIFACTS=true
+    # Optionally control interval with SWARM_STREAM_ARTIFACTS_INTERVAL (seconds).
+    local STREAM_PID=""
+    if [ "${SWARM_STREAM_ARTIFACTS:-false}" = "true" ]; then
+        local stream_interval
+        stream_interval="${SWARM_STREAM_ARTIFACTS_INTERVAL:-30}"
+        # background loop: periodically call swarm_extract_merged_artifacts
+        (
+            while true; do
+                sleep "$stream_interval"
+                # stop if run no longer exists or is completed/reset
+                run_status=$(sqlite3 "$RALPH_DIR/swarm.db" "SELECT status FROM swarm_runs WHERE run_id = '$run_id_result';" 2>/dev/null || true)
+                case "$run_status" in
+                    completed|reset|NULL|"") break ;;
+                esac
+                swarm_extract_merged_artifacts "$run_id_result" "${SWARM_PROJECTS_BASE:-$HOME/projects}" >/dev/null 2>&1 || true
+            done
+        ) &
+        STREAM_PID=$!
+    fi
+
     local scheduler_result
     scheduler_result=$(swarm_scheduler_main_loop "$run_id_result" "$timeout_seconds" "$verbose")
 
@@ -472,6 +495,24 @@ PY
     echo "$db_status"
 
     swarm_db_end_run "$run_id_result" >/dev/null
+
+    # Attempt to extract merged artifacts into projects folder so completed runs
+    # automatically publish their work under the projects area. This mirrors the
+    # behavior of the TUI when streaming artifacts, but runs once at completion.
+    # Destination defaults to ${SWARM_PROJECTS_BASE:-$HOME/projects}.
+    echo ""
+    echo "Extracting merged artifacts to projects folder..."
+    if ! swarm_extract_merged_artifacts "$run_id_result" "${SWARM_PROJECTS_BASE:-$HOME/projects}" >/dev/null 2>&1; then
+        echo "Warning: artifact extraction failed for run $run_id_result"
+    else
+        echo "Artifacts extracted to projects folder"
+    fi
+
+    # Stop background streamer if running
+    if [ -n "${STREAM_PID:-}" ]; then
+        kill "$STREAM_PID" 2>/dev/null || true
+        wait "$STREAM_PID" 2>/dev/null || true
+    fi
 
     echo ""
     echo "Swarm run $run_id_result completed"

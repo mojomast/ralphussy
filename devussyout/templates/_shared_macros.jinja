@@ -1,0 +1,76 @@
+{# Shared utility macros for devplan templates #}
+
+{% macro format_list(items) %}
+{% for item in items %}
+- {{ item }}
+{% endfor %}
+{% endmacro %}
+
+{% macro format_phase(phase) %}
+## Phase {{ phase.number }}: {{ phase.title }}
+{{ phase.description | default('') }}
+
+{% for step in phase.steps %}
+- [ ] {{ step.number }}: {{ step.description }}
+{% endfor %}
+{% endmacro %}
+
+{% macro format_task_group(group) %}
+**Group {{ group.group_number }}** [files: {{ group.estimated_files | join(', ') }}]
+
+{% for step in group.steps %}
+- [ ] {{ step.number }}: {{ step.description }}
+{% for detail in step.details %}
+  - {{ detail }}
+{% endfor %}
+{% endfor %}
+{% endmacro %}
+
+{% macro project_header(project_name) %}
+# Project: {{ project_name }}
+{% endmacro %}
+
+{% macro section_architecture(architecture) %}
+## Architecture
+{{ architecture }}
+{% endmacro %}
+
+{% macro section_challenges(challenges, mitigations=None) %}
+{% if challenges %}
+## Challenges
+{% for challenge in challenges %}
+- {{ challenge }}
+{% endfor %}
+{% if mitigations %}
+### Mitigations
+{% for mitigation in mitigations %}
+- {{ mitigation }}
+{% endfor %}
+{% endif %}
+{% endif %}
+{% endmacro %}
+
+{% macro section_objectives(objectives) %}
+{% if objectives %}
+## Objectives
+{% for objective in objectives %}
+- {{ objective }}
+{% endfor %}
+{% endif %}
+{% endmacro %}
+
+{% macro section_repo_context(repo_analysis) %}
+{% if repo_analysis %}
+## Repository Context
+{{ repo_analysis }}
+{% endif %}
+{% endmacro %}
+
+{% macro section_tech_stack(tech_stack) %}
+{% if tech_stack %}
+## Technology Stack
+{% for tech in tech_stack %}
+- {{ tech }}
+{% endfor %}
+{% endif %}
+{% endmacro %}

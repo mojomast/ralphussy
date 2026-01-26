@@ -14,16 +14,55 @@ swarm_git_default_base_branch() {
         return 0
     fi
 
-    # Fall back to the current branch.
+    # Fall back to the current branch if it exists locally; otherwise prefer 'main'.
     local current
     current=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
     if [ -n "$current" ] && [ "$current" != "HEAD" ]; then
-        printf '%s' "$current"
+        # Ensure the current branch exists in refs/heads (sometimes HEAD points to a ref that isn't present)
+        if git show-ref --verify --quiet "refs/heads/$current" 2>/dev/null; then
+            printf '%s' "$current"
+            return 0
+        fi
+    fi
+
+    # Last-resort default: prefer 'main' which is common in new repos
+    printf '%s' "main"
+}
+
+
+# Ensure local default branch exists and normalize master -> main when safe.
+# This performs a local rename only; it will not push or change remotes.
+# If SWARM_BASE_BRANCH is set, that value takes precedence.
+swarm_git_normalize_default_branch() {
+    local desired
+    desired=$(swarm_git_default_base_branch)
+
+    # If env override present, honor it
+    if [ -n "${SWARM_BASE_BRANCH:-}" ]; then
+        desired="$SWARM_BASE_BRANCH"
+    fi
+
+    # If desired branch exists locally, prefer it.
+    if git show-ref --verify --quiet "refs/heads/$desired"; then
+        echo "Using existing base branch: $desired"
         return 0
     fi
 
-    # Last-resort default.
-    printf '%s' "master"
+    # If desired doesn't exist but master exists and desired is 'main', rename master -> main locally.
+    if [ "$desired" = "main" ] && git show-ref --verify --quiet "refs/heads/master"; then
+        echo "Normalizing default branch: renaming local 'master' -> 'main'"
+        git branch -m master main || {
+            echo "Warning: failed to rename master -> main"
+            return 1
+        }
+        return 0
+    fi
+
+    # If desired missing and master missing, fall back to current branch
+    local current
+    current=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+    echo "Falling back to current branch: ${current:-master}"
+    return 0
 }
 
 swarm_git_create_worker_branch() {

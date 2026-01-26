@@ -489,6 +489,14 @@ Constraints:
   This allows the swarm to detect if this task was already completed.
 - When finished, you MUST output exactly: <promise>COMPLETE</promise>
 
+CRITICAL - SOURCE FILE CLEANLINESS:
+- NEVER insert progress markers, anchors, checkpoints, or annotations into source code files.
+- NEVER add HTML/Markdown comments (<!-- -->) into non-HTML/Markdown files.
+- NEVER add comments like "// PROGRESS:", "// SWARM:", "// Worker N:", "// Task completed" etc.
+- Source files (.go, .py, .rs, .js, .ts, .c, .cpp, etc.) must contain ONLY legitimate code and standard code comments.
+- Progress tracking is handled externally by the swarm system - do NOT track it in code files.
+- If you need to leave development notes, put them in a separate NOTES.md or TODO.md file, NEVER inline in source code.
+
 Remember: End your response with "<promise>COMPLETE</promise>" to signal task completion. This is required for the swarm system to recognize your work as done.
 
 If you need context, inspect files in the repo. Focus on building the requested functionality from scratch.
@@ -544,6 +552,10 @@ EOF
                 echo -e "${RED}✗${NC} Worker $worker_num task $task_id failed: opencode error"
                 echo -e "${RED}✗${NC}   $(echo "$json_output" | head -c 150)..."
             fi
+            # Persist full opencode output for offline inspection
+            if [ -n "$json_output" ]; then
+                echo "$json_output" > "${repo_dir}/.swarm_debug_${task_id}.json" 2>/dev/null || true
+            fi
         fi
         return 1
     fi
@@ -570,11 +582,15 @@ EOF
         swarm_db_record_task_cost "$run_id" "$task_id" "$prompt_tokens" "$completion_tokens" "$cost" >/dev/null 2>&1 || true
     fi
 
+    # Persist debug output when there are no completion tokens so we can inspect provider failures.
+    if [ "$completion_tokens" -eq 0 ] && [ -n "$json_output" ]; then
+        echo "$json_output" > "${repo_dir}/.swarm_debug_${task_id}.json" 2>/dev/null || true
+    fi
+
     if [ "${SWARM_OUTPUT_MODE:-}" = "live" ]; then
         echo -e "${BLUE}✓${NC} API call complete: ${prompt_tokens}→${completion_tokens} tokens | \$${cost}"
         if [ "$completion_tokens" -eq 0 ]; then
             echo -e "${YELLOW}⚠${NC} Warning: 0 tokens returned. Full response saved to: ${repo_dir}/.swarm_debug_${task_id}.json"
-            echo "$json_output" > "${repo_dir}/.swarm_debug_${task_id}.json"
         fi
         echo ""
     fi
