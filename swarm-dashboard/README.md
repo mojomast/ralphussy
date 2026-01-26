@@ -2,6 +2,8 @@
 
 Real-time dashboards for monitoring Ralph AI swarm operations.
 
+> **Note**: A newer React-based dashboard (`swarm-dashboard2`) is also available with improved scrolling and detail views. See `../swarm-dashboard2/README.md` or run `./run-swarm-dashboard2.sh` from the repository root.
+
 ## Features
 
 - **Live Worker Monitoring**: View status of all swarm workers in real-time

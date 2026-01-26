@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import re
+import json
 import sys
 import os
-from typing import Any, Optional
+from typing import Any, Optional, List
 
 # Set up paths for standalone execution
 _this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -123,12 +124,72 @@ class BasicDevPlanGenerator:
         devplan.raw_basic_response = response
         return devplan
 
+    def _extract_text_from_log_entries(self, response: str) -> str:
+        """Extract actual LLM text from JSON log entries if present.
+        
+        The response may contain JSON log entries from streaming sessions like:
+        {"type":"text","timestamp":...,"part":{"type":"text","text":"actual content..."}}
+        
+        This method detects and extracts the text content from such entries.
+        
+        Args:
+            response: Raw response string (may be plain text or JSON log entries)
+            
+        Returns:
+            Extracted text content ready for parsing
+        """
+        if not response or not response.strip():
+            return response
+        
+        # Quick check: if it doesn't start with '{', it's likely plain text
+        stripped = response.strip()
+        if not stripped.startswith('{'):
+            return response
+        
+        # Try to parse as JSON log entries (one per line)
+        extracted_parts: List[str] = []
+        lines = response.split('\n')
+        
+        for line in lines:
+            line = line.strip()
+            if not line or not line.startswith('{'):
+                continue
+            
+            try:
+                entry = json.loads(line)
+                # Look for text entries with part.text structure
+                if isinstance(entry, dict):
+                    entry_type = entry.get("type", "")
+                    part = entry.get("part", {})
+                    
+                    if entry_type == "text" and isinstance(part, dict):
+                        text_content = part.get("text", "")
+                        if text_content:
+                            extracted_parts.append(text_content)
+                    # Also handle direct text field
+                    elif "text" in entry and isinstance(entry["text"], str):
+                        extracted_parts.append(entry["text"])
+            except json.JSONDecodeError:
+                # Not valid JSON, might be regular text - keep original
+                continue
+        
+        if extracted_parts:
+            # Join all extracted text parts
+            return "\n".join(extracted_parts)
+        
+        # No JSON entries found or extracted, return original
+        return response
+
     def _parse_response(self, response: str, project_name: str) -> DevPlan:
+        # Extract text from JSON log entries if present
+        response = self._extract_text_from_log_entries(response)
+        
         phases = []
         current_phase = None
         current_items = []
         current_description = ""
         next_phase_number = 1
+        phase_num = 0
 
         lines = response.split("\n")
         phase_patterns = [
@@ -161,7 +222,7 @@ class BasicDevPlanGenerator:
                 if current_phase is not None:
                     description = current_description.strip()
                     description = re.sub(r'\*+', '', description)
-                    phases.append(DevPlanPhase(number=current_phase["number"], title=current_phase["title"], description=description if description else None, steps=[]))
+                    phases.append(DevPlanPhase(number=(current_phase["number"] if current_phase and "number" in current_phase else 1), title=(current_phase["title"] if current_phase and "title" in current_phase else f"Phase {(current_phase.get('number',1) if isinstance(current_phase, dict) else 1)}"), description=description if description else None, steps=[]))
 
                 phase_num = next_phase_number
                 next_phase_number += 1
@@ -192,7 +253,7 @@ class BasicDevPlanGenerator:
         if current_phase is not None:
             description = current_description.strip()
             description = re.sub(r'\*+', '', description)
-            phases.append(DevPlanPhase(number=current_phase["number"], title=current_phase["title"], description=description if description else None, steps=[]))
+            phases.append(DevPlanPhase(number=(current_phase["number"] if current_phase and "number" in current_phase else 1), title=(current_phase["title"] if current_phase and "title" in current_phase else "Phase 1"), description=description if description else None, steps=[]))
 
         if not phases:
             phases.append(DevPlanPhase(number=1, title="Implementation", steps=[]))
@@ -215,6 +276,9 @@ class BasicDevPlanGenerator:
           - Task 3
           - Task 4
         """
+        # Extract text from JSON log entries if present
+        response = self._extract_text_from_log_entries(response)
+        
         phases = []
         current_phase = None
         current_phase_groups = []
@@ -222,7 +286,41 @@ class BasicDevPlanGenerator:
         current_group_tasks = []
         current_description = ""
         next_phase_number = 1
+        phase_num = 0
         
+        # If the LLM included a machine-readable JSON block, prefer that for parsing.
+        json_block = None
+        m = re.search(r"```json\s*(\{.*?\})\s*```", response, re.S | re.IGNORECASE)
+        if m:
+            try:
+                json_block = json.loads(m.group(1))
+            except Exception:
+                json_block = None
+
+        if json_block:
+            phases = []
+            for p_idx, p in enumerate(json_block.get("phases", []) or []):
+                title = p.get("title") or p.get("name") or f"Phase {p_idx+1}"
+                task_groups = []
+                for g_idx, g in enumerate(p.get("task_groups", []) or []):
+                    files = g.get("estimated_files") or g.get("files") or []
+                    # steps may be list of strings or objects
+                    steps_raw = g.get("steps") or []
+                    steps = []
+                    for s_idx, s in enumerate(steps_raw):
+                        if isinstance(s, dict):
+                            desc = s.get("description") or s.get("title") or str(s)
+                        else:
+                            desc = str(s)
+                        steps.append(DevPlanStep(number=f"{p_idx+1}.{s_idx+1}", description=desc))
+                    task_groups.append(TaskGroup(group_number=(g_idx+1), description=g.get("description") or f"Task group {g_idx+1}", estimated_files=files, steps=steps))
+                phases.append(DevPlanPhase(number=(p_idx+1), title=title, description=p.get("description"), steps=[], task_groups=task_groups))
+
+            if not phases:
+                phases.append(DevPlanPhase(number=1, title="Implementation", steps=[], task_groups=[]))
+            summary = f"Development plan for {project_name} with {len(phases)} phases (grouped mode - from JSON)"
+            return DevPlan(phases=phases, summary=summary)
+
         lines = response.split("\n")
         
         # Patterns for parsing
@@ -233,11 +331,24 @@ class BasicDevPlanGenerator:
             re.compile(r"^#{1,6}\s*Phase\s+0*(\d+)\s*[:\-–—]\s*(.+)$", re.IGNORECASE),
         ]
         
-        # Group pattern: - **Group N** [estimated_files: pattern1, pattern2]
-        group_pattern = re.compile(
-            r'^-?\s*\*\*\s*Group\s+(\d+)\s*\*\*\s*\[estimated_files:\s*(.*?)\]',
-            re.IGNORECASE
+        # Group pattern: accept several common header styles.
+        # Examples matched:
+        # - **Group 1** [estimated_files: src/*, tests/*]
+        # - - **Group 1** [files: src/*]
+        # - **Group 1** files: src/*
+        # - - Group 1: files=src/*
+        # We try multiple patterns: with explicit [files], with inline files:, or just the group header.
+        group_pattern_bracket = re.compile(
+            r'^-?\s*\*\*?\s*Group\s+(\d+)\s*\*\*?\s*\[(?:estimated_files|files)\s*[:=]?\s*(.*?)\]\s*$',
+            re.IGNORECASE,
         )
+
+        group_pattern_inline = re.compile(
+            r'^-?\s*\*\*?\s*Group\s+(\d+)\s*\*\*?\s*[:\-–—]?\s*(?:\[(?:estimated_files|files)\s*[:=]?\s*(.*?)\]|(?:files|estimated_files)\s*[:=]\s*(.*?))\s*$',
+            re.IGNORECASE,
+        )
+
+        group_pattern_simple = re.compile(r'^-?\s*\*\*?\s*Group\s+(\d+)\s*\*\*?\s*[:\-–—]?\s*(.*)?$', re.IGNORECASE)
         
         for line in lines:
             stripped = line.strip()
@@ -259,11 +370,13 @@ class BasicDevPlanGenerator:
             if phase_match:
                 # Save previous group and phase
                 if current_group is not None:
+                    # Safely get phase number for step numbering
+                    phase_number_str = str(current_phase["number"]) if current_phase and "number" in current_phase else "1"
                     current_phase_groups.append(TaskGroup(
                         group_number=current_group["number"],
                         description=current_group["description"],
                         estimated_files=current_group["files"],
-                        steps=[DevPlanStep(number=f"{current_phase['number']}.{i+1}", description=t) 
+                        steps=[DevPlanStep(number=f"{phase_number_str}.{i+1}", description=t)
                                for i, t in enumerate(current_group_tasks)]
                     ))
                 
@@ -271,8 +384,8 @@ class BasicDevPlanGenerator:
                     description = current_description.strip()
                     description = re.sub(r'\*+', '', description)
                     phases.append(DevPlanPhase(
-                        number=current_phase["number"],
-                        title=current_phase["title"],
+                        number=(current_phase["number"] if current_phase and "number" in current_phase else 1),
+                        title=(current_phase["title"] if current_phase and "title" in current_phase else f"Phase {(current_phase['number'] if current_phase and 'number' in current_phase else 1)}"),
                         description=description if description else None,
                         steps=[],
                         task_groups=current_phase_groups
@@ -291,22 +404,59 @@ class BasicDevPlanGenerator:
                 current_description = ""
                 continue
             
-            # Check for group header
-            group_match = group_pattern.match(stripped)
-            if group_match and current_phase:
+            # Check for group header (try bracketed, then inline, then simple)
+            group_match = None
+            files_str = None
+            m = group_pattern_bracket.match(stripped)
+            if m:
+                group_match = m
+                files_str = m.group(2).strip()
+            else:
+                m = group_pattern_inline.match(stripped)
+                if m:
+                    group_match = m
+                    # inline pattern may place files in group 2 or 3 depending on which branch matched
+                    files_str = (m.group(2) or m.group(3) or "").strip()
+                else:
+                    m = group_pattern_simple.match(stripped)
+                    if m:
+                        group_match = m
+                        files_str = ""
+
+            if group_match:
+                # If we see a group header but no phase yet, create a default phase
+                if current_phase is None:
+                    phase_num = next_phase_number
+                    next_phase_number += 1
+                    current_phase = {"number": phase_num, "title": "Phase 1"}
+                    current_phase_groups = []
+
                 # Save previous group
                 if current_group is not None:
+                    try:
+                        phase_number_str = str(current_phase.get("number", 1))
+                    except Exception:
+                        phase_number_str = "1"
                     current_phase_groups.append(TaskGroup(
                         group_number=current_group["number"],
                         description=current_group["description"],
                         estimated_files=current_group["files"],
-                        steps=[DevPlanStep(number=f"{current_phase['number']}.{i+1}", description=t) 
+                        steps=[DevPlanStep(number=f"{phase_number_str}.{i+1}", description=t)
                                for i, t in enumerate(current_group_tasks)]
                     ))
+                # (previous group already saved above if present)
                 
-                group_num = int(group_match.group(1))
-                files_str = group_match.group(2).strip()
-                file_patterns = [f.strip() for f in files_str.split(',') if f.strip()]
+                try:
+                    group_num = int(group_match.group(1))
+                except Exception:
+                    # fallback: enumerate next group number
+                    group_num = (current_group["number"] + 1) if current_group and "number" in current_group else (len(current_phase_groups) + 1)
+
+                file_patterns = []
+                if files_str:
+                    # Normalize separators and split
+                    files_str = re.sub(r"[;|\\]+", ",", files_str)
+                    file_patterns = [f.strip() for f in files_str.split(',') if f.strip()]
                 
                 current_group = {
                     "number": group_num,
@@ -333,11 +483,12 @@ class BasicDevPlanGenerator:
         
         # Don't forget the last group and phase
         if current_group is not None:
+            phase_number_str = str(current_phase["number"]) if current_phase and "number" in current_phase else "1"
             current_phase_groups.append(TaskGroup(
                 group_number=current_group["number"],
                 description=current_group["description"],
                 estimated_files=current_group["files"],
-                steps=[DevPlanStep(number=f"{current_phase['number']}.{i+1}", description=t) 
+                steps=[DevPlanStep(number=f"{phase_number_str}.{i+1}", description=t)
                        for i, t in enumerate(current_group_tasks)]
             ))
         
@@ -345,8 +496,8 @@ class BasicDevPlanGenerator:
             description = current_description.strip()
             description = re.sub(r'\*+', '', description)
             phases.append(DevPlanPhase(
-                number=current_phase["number"],
-                title=current_phase["title"],
+                number=(current_phase["number"] if current_phase and "number" in current_phase else 1),
+                title=(current_phase["title"] if current_phase and "title" in current_phase else "Phase 1"),
                 description=description if description else None,
                 steps=[],
                 task_groups=current_phase_groups
