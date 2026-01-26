@@ -3,13 +3,18 @@ import { createCliRenderer, Box, Text, type BoxOptions, type TextOptions, Consol
 export class SwarmDashboard2 {
   private renderer!: Awaited<ReturnType<typeof createCliRenderer>>;
   private db!: ReturnType<typeof createSwarmDatabase>;
-  private refreshInterval: number = 2000;
+  private refreshInterval: number = 5000; // reduce refresh frequency to lower CPU usage
+  private paused: boolean = false;
+  private lastKeyHandledAt: number = 0;
+  private keyThrottleMs: number = 80; // throttle repeated key handling
   private refreshTimer: NodeJS.Timeout | null = null;
   private currentRunId: string | null = null;
   private lastLogTimestamp: number = 0;
   private logLines: Array<{ worker_num: string; log_line: string }> = [];
   // Scrolling / focus state for panes
   private paneOffsets: Record<string, number> = { actions: 0, tasks: 0, workers: 0, console: 0 };
+  // Track how many renderable lines each pane currently has so we can clamp scrolling
+  private paneCounts: Record<string, number> = { actions: 0, tasks: 0, workers: 0, console: 0 };
   private focusedPane: 'actions' | 'tasks' | 'workers' | 'console' = 'tasks';
   private pageSize: number = 20;
 
@@ -54,6 +59,11 @@ export class SwarmDashboard2 {
 
   private setupKeyboardHandlers() {
     this.renderer.keyInput.on('keypress', (key) => {
+      const now = Date.now();
+      // Throttle rapid key repeats to avoid flooding refreshes
+      if (now - this.lastKeyHandledAt < this.keyThrottleMs) return;
+      this.lastKeyHandledAt = now;
+
       if (key.ctrl && key.name === 'c') {
         this.cleanup();
         process.exit(0);
@@ -62,25 +72,52 @@ export class SwarmDashboard2 {
         process.exit(0);
       } else if (key.name === 'r') {
         this.refreshData();
+      } else if (key.name === 'p') {
+        // Toggle pause polling
+        this.paused = !this.paused;
+        if (this.paused) {
+          if (this.refreshTimer) {
+            clearInterval(this.refreshTimer);
+            this.refreshTimer = null;
+          }
+        } else {
+          this.startRefreshLoop();
+        }
+        this.refreshData();
       } else if (key.name === 'tab') {
         // Cycle focus: tasks -> actions -> workers -> console
         const order: Array<typeof this.focusedPane> = ['tasks', 'actions', 'workers', 'console'];
         const idx = order.indexOf(this.focusedPane);
         this.focusedPane = order[(idx + 1) % order.length];
         this.refreshData();
-      } else if (key.name === 'up' || key.name === 'down' || key.name === 'pageup' || key.name === 'pagedown') {
-        // Scroll the focused pane
-        let delta = 0;
-        if (key.name === 'up') delta = -1;
-        else if (key.name === 'down') delta = 1;
-        else if (key.name === 'pageup') delta = -Math.max(1, Math.floor(this.pageSize * 0.8));
-        else if (key.name === 'pagedown') delta = Math.max(1, Math.floor(this.pageSize * 0.8));
+        } else if (key.name === 'up' || key.name === 'down' || key.name === 'pageup' || key.name === 'pagedown') {
+          // Scroll the focused pane
+          let delta = 0;
+          if (key.name === 'up') delta = -1;
+          else if (key.name === 'down') delta = 1;
+          else if (key.name === 'pageup') delta = -Math.max(1, Math.floor(this.pageSize * 0.8));
+          else if (key.name === 'pagedown') delta = Math.max(1, Math.floor(this.pageSize * 0.8));
 
-        const cur = this.paneOffsets[this.focusedPane] || 0;
-        let next = cur + delta;
-        if (next < 0) next = 0;
-        this.paneOffsets[this.focusedPane] = next;
-        this.refreshData();
+        // If Shift is held, scroll all panes together
+        if (key.shift) {
+          for (const pane of Object.keys(this.paneOffsets)) {
+            const curOff = this.paneOffsets[pane] || 0;
+            let nextOff = curOff + delta;
+            const maxOff = Math.max(0, (this.paneCounts[pane] || 0) - this.pageSize);
+            if (nextOff < 0) nextOff = 0;
+            if (nextOff > maxOff) nextOff = maxOff;
+            this.paneOffsets[pane] = nextOff;
+          }
+        } else {
+          const cur = this.paneOffsets[this.focusedPane] || 0;
+          let next = cur + delta;
+          const maxOff = Math.max(0, (this.paneCounts[this.focusedPane] || 0) - this.pageSize);
+          if (next < 0) next = 0;
+          if (next > maxOff) next = maxOff;
+          this.paneOffsets[this.focusedPane] = next;
+        }
+
+    if (!this.paused) this.refreshData();
       }
     });
   }
@@ -375,6 +412,9 @@ export class SwarmDashboard2 {
       workerLines.push({ content: parts.join(' '), fg: statusColor });
     });
 
+    // Update pane count for scrolling bounds
+    this.paneCounts.workers = workerLines.length;
+
     // Clear and render visible window
     while (workersList.getChildrenCount() > 0) {
       const child = workersList.getChildren()[0];
@@ -395,7 +435,7 @@ export class SwarmDashboard2 {
         actionsList.remove(child.id);
       }
 
-      const logs = this.db.getRecentLogs(runId, 200);
+      const logs = this.db.getRecentLogs(runId, 100); // reduce how many recent logs we fetch
       const actionLines: Array<{ content: string; fg: string }> = [];
       for (const log of logs) {
         const clean = String(log.log_line).replace(/\x1b\[[0-9;]*m/g, '').trim();
@@ -403,6 +443,8 @@ export class SwarmDashboard2 {
         actionLines.push({ content: `W${log.worker_num.padStart(2)}  ${clean}`, fg: this.getLogColor(clean) });
       }
 
+      // Track total lines for actions pane and render visible window
+      this.paneCounts.actions = actionLines.length;
       const aOff = this.paneOffsets.actions || 0;
       const aWindow = actionLines.slice(aOff, aOff + this.pageSize);
       aWindow.forEach((l, idx) => {
@@ -417,46 +459,34 @@ export class SwarmDashboard2 {
     
     if (!tasksList) return;
 
-    while (tasksList.getChildrenCount() > 0) {
-      const child = tasksList.getChildren()[0];
-      tasksList.remove(child.id);
-    }
-
-    tasks.forEach((task) => {
+    // Build flattened lines for tasks (main + wrapped lines) to support scrolling
+    const taskLines: Array<{ content: string; fg: string }> = [];
+    for (const task of tasks) {
       const statusColor = this.getStatusColor(task.status);
       const firstLine = task.task_text.split('\n')[0].substring(0, 80);
-      const taskText = Text({
-        id: `task-${task.id}`,
-        content: `${task.id.toString().padStart(2)}. ${task.status.padEnd(12)} ${firstLine}`,
-        fg: statusColor,
-        position: 'relative',
-      });
-
-      tasksList.add(taskText);
+      taskLines.push({ content: `${task.id.toString().padStart(2)}. ${task.status.padEnd(12)} ${firstLine}`, fg: statusColor });
 
       const remaining = task.task_text.length > 80 ? task.task_text.substring(80) : '';
       if (remaining) {
         const wrapped = remaining.match(/.{1,80}(?:\s|$)|\S+/g) || [];
-        wrapped.forEach((line, idx) => {
-          const extra = Text({
-            id: `task-${task.id}-extra-${idx}`,
-            content: `    ${line.trim()}`,
-            fg: '#8b949e',
-            position: 'relative',
-          });
-          tasksList.add(extra);
+        wrapped.forEach((line) => {
+          taskLines.push({ content: `    ${line.trim()}`, fg: '#8b949e' });
         });
       }
-    });
-
-    // Apply scrolling for tasks pane
-    const tOff = this.paneOffsets.tasks || 0;
-    for (let i = 0; i < tOff; i++) {
-      if (tasksList.getChildrenCount() > 0) {
-        const child = tasksList.getChildren()[0];
-        tasksList.remove(child.id);
-      }
     }
+
+    // Update pane count and render the visible window
+    this.paneCounts.tasks = taskLines.length;
+    const tOff = this.paneOffsets.tasks || 0;
+    const tWindow = taskLines.slice(tOff, tOff + this.pageSize);
+
+    while (tasksList.getChildrenCount() > 0) {
+      const child = tasksList.getChildren()[0];
+      tasksList.remove(child.id);
+    }
+    tWindow.forEach((l, idx) => {
+      tasksList.add(Text({ id: `task-line-${idx}-${tOff}`, content: l.content, fg: l.fg, position: 'relative' }));
+    });
   }
 
   private updateResources(runId: string) {
@@ -535,41 +565,29 @@ export class SwarmDashboard2 {
 
     this.logLines = logs;
 
-    while (consoleList.getChildrenCount() > 0) {
-      const child = consoleList.getChildren()[0];
-      consoleList.remove(child.id);
-    }
-
+    // Build console lines and support scrolling window
+    const consoleLines: Array<{ content: string; fg: string }> = [];
     for (const log of logs) {
       const cleanLogLine = log.log_line
         .replace(/\x1b\[[0-9;]*m/g, '')
         .replace(/\[\d+m/g, '')
         .trim();
-      
       if (cleanLogLine.length === 0) continue;
-
-      const truncatedLog = cleanLogLine.length > 80 
-        ? cleanLogLine.substring(0, 77) + '...'
-        : cleanLogLine;
-
-      const logText = Text({
-        id: `console-${log.worker_num}-${Math.random().toString(36).substring(7)}`,
-        content: `W${log.worker_num.padStart(2)}  ${truncatedLog}`,
-        fg: this.getLogColor(cleanLogLine),
-        position: 'relative',
-      });
-
-      consoleList.add(logText);
+      const truncatedLog = cleanLogLine.length > 80 ? cleanLogLine.substring(0, 77) + '...' : cleanLogLine;
+      consoleLines.push({ content: `W${log.worker_num.padStart(2)}  ${truncatedLog}`, fg: this.getLogColor(cleanLogLine) });
     }
 
-    // Apply scrolling for console pane
+    this.paneCounts.console = consoleLines.length;
     const cOff = this.paneOffsets.console || 0;
-    for (let i = 0; i < cOff; i++) {
-      if (consoleList.getChildrenCount() > 0) {
-        const child = consoleList.getChildren()[0];
-        consoleList.remove(child.id);
-      }
+    const cWindow = consoleLines.slice(cOff, cOff + this.pageSize);
+
+    while (consoleList.getChildrenCount() > 0) {
+      const child = consoleList.getChildren()[0];
+      consoleList.remove(child.id);
     }
+    cWindow.forEach((l, idx) => {
+      consoleList.add(Text({ id: `console-line-${idx}-${cOff}`, content: l.content, fg: l.fg, position: 'relative' }));
+    });
   }
 
   private clearConsole() {

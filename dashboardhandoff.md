@@ -1,6 +1,8 @@
 Dashboard Handoff
 =================
 
+> **Note**: A newer dashboard (`swarm-dashboard2`) is now available with full scrolling support (including global scroll with Shift+arrows), dynamic sizing, and detail views. See `handoff.md` or `swarm-dashboard2/README.md` for details. Run with `./run-swarm-dashboard2.sh`.
+
 What I changed (summary)
 - Fixed the accidental import in `swarm-dashboard/src/index.ts` to import `./dashboard.js` so Bun/Node can run the src files without TypeScript import-extension errors.
 - Improved launcher DB selection in `swarm-dashboard/run.sh`:
