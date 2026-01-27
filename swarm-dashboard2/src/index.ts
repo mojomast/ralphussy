@@ -213,32 +213,49 @@ async function main() {
                 return;
               }
             } else if (commandModal.type === 'select-run') {
-              // navigate selection with up/down, confirm with return, cancel with escape
-              if (k === 'up') {
-                setCommandModal((cm: any) => ({ ...cm, sel: Math.max(0, (cm.sel || 0) - 1) }));
-                return;
-              } else if (k === 'down') {
-                setCommandModal((cm: any) => ({ ...cm, sel: Math.min(((cm.options || []).length - 1) || 0, (cm.sel || 0) + 1) }));
-                return;
-              } else if (k === 'return') {
-                try {
-                  const idx = commandModal.sel || 0;
-                  const item = (commandModal.options || [])[idx];
-                  if (item) {
-                    // item.run_id === null means show current (all) runs
-                    applySelectedRunId(item.run_id || null);
-                    selectedRunIdRef.current = item.run_id || null;
-                    appendRalphLines(`[UI] Showing run: ${item.run_id || '(current)'} `);
-                    // force immediate reload
-                    lastDbMtimeRef.current = 0;
-                  }
-                } catch (e) {}
-                setCommandModal(null);
-                return;
-              } else if (k === 'escape' || k === 'q') {
-                setCommandModal(null);
-                return;
-              }
+               // navigate selection with up/down, confirm with return, cancel with escape
+               if (k === 'up') {
+                 setCommandModal((cm: any) => ({ ...cm, sel: Math.max(0, (cm.sel || 0) - 1) }));
+                 return;
+               } else if (k === 'down') {
+                 setCommandModal((cm: any) => ({ ...cm, sel: Math.min(((cm.options || []).length - 1) || 0, (cm.sel || 0) + 1) }));
+                 return;
+               } else if (k === 'return') {
+                 try {
+                   const idx = commandModal.sel || 0;
+                   const item = (commandModal.options || [])[idx];
+                   if (item) {
+                     // Apply selected run id (null means current)
+                     applySelectedRunId(item.run_id || null);
+                     selectedRunIdRef.current = item.run_id || null;
+                     // Provide immediate UI feedback and trigger reload
+                     try {
+                       if (item.run_id) {
+                         // try to lookup run details for a helpful message
+                         const info = (typeof db.getRunById === 'function') ? db.getRunById(item.run_id) : null;
+                         if (info) {
+                           appendRalphLines(`[UI] Showing run ${info.run_id} status=${(info.status||'').toUpperCase()}`);
+                           if ((info.status||'') !== 'running') appendRalphLines('[UI] NOTE: Viewing historical run — updates may be stale');
+                         } else {
+                           appendRalphLines(`[UI] Showing run: ${item.run_id}`);
+                         }
+                       } else {
+                         appendRalphLines('[UI] Showing current run');
+                       }
+                     } catch (e) {
+                       appendRalphLines(`[UI] Showing run: ${item.run_id || '(current)'} `);
+                     }
+                     // force immediate reload and schedule load shortly after modal closes
+                     lastDbMtimeRef.current = 0;
+                     setTimeout(() => { try { load(); } catch (e) {} }, 120);
+                   }
+                 } catch (e) {}
+                 setCommandModal(null);
+                 return;
+               } else if (k === 'escape' || k === 'q') {
+                 setCommandModal(null);
+                 return;
+               }
             }
           }
           // Close detail view on Escape or q (if detail view is open)

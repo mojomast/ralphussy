@@ -1,129 +1,222 @@
-Swarm Dashboard2 Handoff
-=======================
+Handoff: Next Steps for Ralph Live Dashboard
 
-What I delivered
-- A React-based OpenTUI successor to the original dashboard named `swarm-dashboard2`.
-- Live TUI that reads the same swarm DB and renders scrollable panes for Actions, Tasks, Resources, Workers and a Console log.
-- A root launcher script `run-swarm-dashboard2.sh` with the same DB discovery heuristics as the original `swarm-dashboard` launcher.
-- **Full scrolling support**: Users can scroll through all content using arrow keys (per-pane) or Shift+arrows (global dashboard scroll).
-- **Dynamic sizing**: Panes grow based on content size rather than fixed percentages, so all tasks/logs are accessible.
-- **Detail views**: Press Enter/Space on a task or worker to see full details in an overlay panel.
+## What I changed (this session)
 
-Quick start (interactive terminal required)
-1. Make launcher executable (one-time):
-   - `chmod +x run-swarm-dashboard2.sh`
-2. Run the dashboard from the repository root:
-   - `./run-swarm-dashboard2.sh`
-   - (Alternative) `bun swarm-dashboard2/src/index.ts`
-3. If your environment blocks TTY detection for debugging, you may run:
-   - `ALLOW_NO_TTY=1 ./run-swarm-dashboard2.sh` (not recommended for normal use).
+### Continuous LLM Chat Interview Mode (NEW)
 
-What the launcher does
-- Prints which DB it chose: `Using swarm DB at: <path>/swarm.db`.
-- Prefers source-mode (runs `swarm-dashboard2/src/index.ts`) so local edits are used during development.
-- Uses the same DB candidate scoring (heartbeat, in_progress count, started_at) as `swarm-dashboard/run.sh`.
+Created a complete interview module for continuous LLM chat-based devplan generation at `devussyout/src/interview/`:
 
-Keyboard controls (implemented)
-- `Tab` — cycle focused pane (order: tasks → actions → workers → console).
-- `Up` / `Down` — scroll focused pane by one line.
-- `PageUp` / `PageDown` — scroll focused pane by 10 lines.
-- `Shift+Up` / `Shift+Down` — scroll the entire dashboard (global scroll).
-- `Shift+PageUp` / `Shift+PageDown` — scroll entire dashboard by 10 lines.
-- `Enter` / `Space` — open detail view for selected task or worker.
-- `Escape` / `q` (in detail view) — close detail view.
-- `r` — manual refresh (UI auto-polls every ~2s).
-- `q` or `Ctrl-C` — quit; renderer now traps signals and restores the terminal.
+1. **Core Components**:
+   - `conversation_history.py` - Stores messages with role, timestamp, stage tracking; supports save/load
+   - `json_extractor.py` - Extracts JSON from LLM responses (code blocks, log entries, regex fallback)
+   - `stage_coordinator.py` - Manages stage transitions (interview → design → devplan → detailed → handoff)
+   - `interview_manager.py` - Main orchestrator handling chat, slash commands, stage progression
 
-Troubleshooting (if terminal appears garbled or stuck)
-- The app uses the terminal alternate screen and turns off local echo; if you see only a blank screen or the alternate screen remains after exit:
-  1. Try `Ctrl-C` or press `q`.
-  2. From another terminal run:
-     - `tput rmcup || true`
-     - `stty echo || true`
-     - `reset`
-- I added signal handlers in `swarm-dashboard2/src/index.ts` to restore state on SIGINT/SIGTERM and unhandled errors, but older runs may leave the terminal altered.
+2. **System Prompts** in `devussyout/prompts/`:
+   - `interview_system_prompt.md` - Requirements gathering through conversation
+   - `design_system_prompt.md` - Project design generation
+   - `devplan_system_prompt.md` - High-level development plan
+   - `detailed_system_prompt.md` - Detailed implementation steps
+   - `handoff_system_prompt.md` - Handoff prompt for implementation agent
 
-Implementation notes
-- UI: `swarm-dashboard2/src/index.ts` is the React OpenTUI entry. It uses `scrollbox` components for scrollable panes and polls the DB every 2s for live updates.
-- Scrolling: The main content is wrapped in a `scrollbox` with id `main-scroll`. Individual panes (tasks, actions, workers, console) each have their own scrollbox. Arrow keys scroll the focused pane; Shift+arrows scroll the entire dashboard.
-- Dynamic sizing: Pane heights are calculated based on content (e.g., `Math.max(20, tasks.length + 5)`) rather than fixed percentages, ensuring all content is accessible.
-- Console: Shows all logs (previously limited to 15) with 120-character line width.
-- DB: the original compiled DB helper is re-used. A small wrapper `swarm-dashboard2/src/database-bun.js` exists to aid resolution; the app loads `../../swarm-dashboard/dist/database-bun.js` at runtime.
-- Launcher: `run-swarm-dashboard2.sh` lives in the project root and uses the same DB discovery heuristics as the original dashboard launcher.
+3. **CLI Entry Points**:
+   - `devussyout/interview_cli.py` - CLI for running interviews
+   - `devussyout/src/pipeline/interview_pipeline.py` - Integrates with existing pipeline generators
 
-Files added/modified
-- `swarm-dashboard2/src/index.ts` — React + OpenTUI app (live polling, scrollboxes, keyboard handlers).
-- `swarm-dashboard2/src/dashboard.ts` — original class-based copy (left for reference).
-- `swarm-dashboard2/src/database-bun.js` — small wrapper to re-export the compiled DB helper.
-- `swarm-dashboard2/README.md` — comprehensive documentation for dashboard2.
-- `run-swarm-dashboard2.sh` — root launcher for `swarm-dashboard2`.
+4. **Features**:
+   - Single conversation spanning all 5 stages
+   - Slash commands: `/done`, `/skip`, `/back`, `/status`, `/help`, `/save`, `/reset`, `/model`, `/stage`
+   - Auto-save after each stage completion
+   - Streaming support with callbacks
+   - Progress tracking
 
-Known issues / limitations
-1. ~~Focus visual polish: the focused pane is functional, but border/title color could be clearer — will improve.~~ **FIXED**
-2. ~~Scroll persistence: scroll offsets are applied programmatically, but persistence across updates will be hardened.~~ **FIXED**
-3. ~~Detail view: full-task and full-worker detail view (open on Enter/Space) is not yet implemented.~~ **FIXED**
-4. Type/ts diagnostics: TypeScript language-server shows type warnings for some dynamic imports and missing types for `react` in this workspace; these do not prevent running with Bun but should be fixed if you plan to build a typed package.
+**Usage:**
+```bash
+cd devussyout
+python interview_cli.py --model opencode/claude-sonnet-4-5
+```
 
-Recommended next steps (pick one)
-1. ~~Finish polish: implement persistent scroll offsets, clear visual focus indicator, and a detail panel for tasks/workers (I can implement now).~~ **DONE**
-2. ~~Add a README and package.json scripts for `swarm-dashboard2`, and add type declarations or adjust `tsconfig` to eliminate LSP warnings.~~ **README DONE** (package.json scripts and type declarations still pending)
-3. Write tests and a small demo dataset runner for CI validation.
+### Previous: Dynamic OpenCode Model Selection
 
-If you want me to proceed with option 1, say "go" and I will implement detail view, persistent scroll, improved focus visuals, and verify live interactions end-to-end.
+1. ✅ **(High) Dynamic Model Fetching from OpenCode** - Models are now fetched dynamically from OpenCode CLI:
+   - Runs `opencode models` command on startup to get available models
+   - Models are automatically organized by provider (e.g., `opencode/`, `firmware/`, `github-copilot/`)
+   - Fallback to hardcoded models if CLI fails
+   - Models can be refreshed via Settings > "Refresh Models" option
 
-Contact / context
-- Original dashboard left unchanged in `swarm-dashboard/`.
-- I ran the app and iterated until it produced a stable interactive prototype (logged large runs during tests). If you see anything odd paste the console output lines starting with `Candidate DB:` and I'll refine DB selection.
+2. ✅ **(High) Provider-First Model Selection** - Improved UX in Options modal:
+   - User first selects a provider, then selects from available models for that provider
+   - Model lists update dynamically when provider changes
+   - Shows count of available providers and models for each
+   - When focused on model field, shows preview of available models
 
--- Gippity
+3. ✅ **(High) All Model Selectors Use OpenCode Models** - Applies to:
+   - **SWARM** section: Provider and Model selection
+   - **RALPH** section: Provider and Model selection
+   - **DEVPLAN** section: All 5 stages (interview/design/devplan/phase/handoff)
 
----
+4. ✅ **(Medium) Refresh Models Option** - In Settings section:
+   - Shows current count: "X providers, Y models"
+   - Press ENTER to refresh models from OpenCode CLI
+   - Logs refresh results to Ralph Live console
 
-Devussy / Basic DevPlan Parser Update
--------------------------------------
+## Where the code lives
+- UI and logic: `swarm-dashboard2/src/index.ts`
+- DevPlan pipeline: `devussyout/src/pipeline/` (Python)
+- DB helper (source): `swarm-dashboard/src/database-bun.ts`
+- DB helper (runtime): `swarm-dashboard/dist/database-bun.js`
+- CLI used by UI: `ralph-refactor/ralph-swarm`
 
-What I did
-- Improved robustness of the basic devplan parser so it tolerates LLM output variations and prefers an explicit JSON block when present.
-- Added multiple group-header regexes (bracketed, inline, simple), normalised file-pattern separators, and defensive guards for missing phase/group state.
-- Added a JSON fenced-block fallback: if the LLM emits a ```json { ... } ``` block the parser will parse that directly into phases, task_groups and steps.
+## How to run locally
+1. From repo root run: `./run-swarm-dashboard2.sh` (this runs `bun swarm-dashboard2/src/index.ts`)
+2. Use a real interactive terminal (the launcher refuses non-interactive TTYs).
+3. To rebuild database module: `cd swarm-dashboard && bun run build`
 
-Files changed
-- `devussyout/src/pipeline/basic_devplan.py` — added JSON-block parsing, new group header patterns, safer phase/group handling and normalization of file patterns.
+## Quick verification (manual checks)
 
-Why this change
-- The LLM sometimes emits group/phase headers in different formats (e.g. `[files: ...]`, `files: ...` or plain headers) which the original strict regexes missed and caused a coarse single-task devplan.
-- A machine-readable JSON block (when present) is much more reliable to parse; the parser now prefers it if available.
+### Dynamic Model Selection (NEW)
+- Press `o`: Options menu opens - models should be loaded from OpenCode
+- Navigate to SWARM section: Should show "Provider" and "Model" with counts like "(X available)" and "(Y for provider)"
+- Focus on Provider field, press ENTER: Should cycle through providers from OpenCode (e.g., opencode, firmware, github-copilot)
+- Focus on Model field, press ENTER: Should cycle through models for the selected provider
+- When Model field is focused, should show a preview list of available models
+- Navigate to SETTINGS section: First field should be "Refresh Models" with count of providers/models
+- Press ENTER on "Refresh Models": Should refresh from `opencode models` CLI and show confirmation in Ralph Live console
 
-How to reproduce / verify
-- Regenerate the devplan so the pipeline writes the LLM response: `.devussy_state/last_devplan_response.txt` will be created.
-- Inspect the raw response:
-  - `cat .devussy_state/last_devplan_response.txt | sed -n '1,240p'`
-- If you want to test the parser locally, run the devussy generator (same command you usually use) and confirm `.devussy_state/last_devplan_response.txt` exists, then re-run the pipeline that consumes it.
-- Run the swarm and verify multiple task groups spawn: (example)
-  - `cd ~/projects/hello-world-python`
-  - `export RALPH_PROVIDER="zai-coding-plan"`
-  - `export RALPH_MODEL="glm-4.7"`
-  - `/home/mojo/projects/ralphussy/ralph-refactor/ralph-swarm --devplan devplan.md --project hello-world-python --workers 2`
+### Options Menu
+- Press `o`: Options menu opens with 5 tabs (MODE, SWARM, RALPH, DEVPLAN, SETTINGS)
+- Use ←/→ or H/L to switch sections, ↑/↓ to navigate, ENTER/SPACE to change values
+- Press ESC to close options (changes auto-save to `~/.ralph/config.json`)
+- Header shows current mode: `Mode: SWARM` (or RALPH/DEVPLAN based on selection)
 
-Quick debug notes
-- If the LLM includes a fenced JSON block (```json ... ```), the parser will use it. If not, it falls back to regex parsing with several tolerant patterns.
-- Step numbering is defensive: if a phase number is missing the parser falls back to `1` to avoid crashes.
+### DevPlan & Other Features
+- Press `d`: DevPlan interview modal appears with 5 fields. Fill in project details and press Enter on last field to start generation.
+- Watch progress modal show stages completing: Design → DevPlan → Phases → Handoff
+- Check `~/.ralph/devplans/{project_name}/` for generated files after completion
+- Press `s`: Start-run configuration modal appears (worker count defaults to config.swarmAgentCount)
+- Press `v`: Run selector overlay appears
+- Press `V`: Clears selection and returns to current run
+- Press `e`: Emergency stop confirmation modal appears
+- Check `~/.ralph/dashboard-ui.log` for debug entries
 
-Next recommended steps (pick one)
-1) Run a generation, inspect `.devussy_state/last_devplan_response.txt`, and confirm the parser extracted multiple groups (I can do this and paste the parsed DevPlan). (Recommended)
-2) Update `devussyout/templates/basic_devplan.jinja` to instruct the LLM to append an explicit JSON block (machine-readable) at the end of its response — this is the most robust long-term fix.
-3) Add unit tests that feed representative LLM outputs (including the saved `last_devplan_response.txt`) to the parser and assert the DevPlan structure.
+## Known issues / notes
+- Editor/TypeScript diagnostics appear (missing `@types/react`, implicit `any`s). These are lint/LSP warnings and do not prevent runtime under Bun.
+- The devplan pipeline requires Python 3 with access to `opencode` CLI for LLM calls
+- If the pipeline fails, check that `devussyout/src/pipeline/` modules are accessible
+- The interview modal supports multiline input in Requirements field (Enter adds newline, Ctrl+Enter submits)
 
-If you want me to proceed with one of those, say which (1–3) and I'll run it.
+## Config Structure (`~/.ralph/config.json`)
+```json
+{
+  "mode": "swarm",                    // "ralph" | "devplan" | "swarm"
+  "swarmModel": {
+    "provider": "opencode",           // Provider from `opencode models` (e.g., opencode, firmware, github-copilot)
+    "model": "opencode/claude-sonnet-4-5"  // Full model identifier (provider/model)
+  },
+  "ralphModel": {
+    "provider": "opencode",
+    "model": "opencode/claude-sonnet-4-5"
+  },
+  "devplanModels": {
+    "interview": { "provider": "opencode", "model": "opencode/claude-sonnet-4-5" },
+    "design": { "provider": "opencode", "model": "opencode/claude-sonnet-4-5" },
+    "devplan": { "provider": "opencode", "model": "opencode/claude-sonnet-4-5" },
+    "phase": { "provider": "opencode", "model": "opencode/claude-sonnet-4-5" },
+    "handoff": { "provider": "opencode", "model": "opencode/claude-sonnet-4-5" }
+  },
+  "swarmAgentCount": 4,
+  "commandTimeout": 300,
+  "llmTimeout": 120,
+  "pollInterval": 5,
+  "autoRefresh": true,
+  "showCosts": true,
+  "maxLogLines": 200,
+  "debugMode": false
+}
+```
 
-Recent changes (2026-01-26)
----------------------------------
-- Committed and pushed a parser and docs update: `feat(devussy): robustly extract LLM text from opencode JSON logs and improve devplan parsing; document swarm-dashboard2` (commit `db3f60f` on `origin/main`).
-- Files changed in that commit: `devussyout/src/pipeline/basic_devplan.py`, `swarm-dashboard/README.md`.
-- Notes: the devplan parser now extracts LLM text from Opencode JSON log entries and prefers fenced JSON blocks when present; `swarm-dashboard` docs were updated to reference `swarm-dashboard2`.
+Note: Models are now dynamically fetched from `opencode models` CLI. The provider/model values
+should use the full format returned by OpenCode CLI (e.g., `opencode/claude-sonnet-4-5`).
 
-Recommended verification steps
----------------------------------
-1. Run unit/integration tests: `./ralph-refactor/tests/run_all_tests.sh` or project-specific suites.
-2. Inspect the parser behavior with a recent devplan response: `cat .devussy_state/last_devplan_response.txt | sed -n '1,240p'` and re-run the generator.
-3. Check CI on GitHub to ensure there are no regressions after the push.
+## Files created/modified this session
+
+### Interview Module (NEW)
+- `devussyout/src/interview/__init__.py` - Module exports
+- `devussyout/src/interview/conversation_history.py` - Message storage with stage tracking
+- `devussyout/src/interview/json_extractor.py` - JSON extraction from LLM responses
+- `devussyout/src/interview/stage_coordinator.py` - Stage management and transitions
+- `devussyout/src/interview/interview_manager.py` - Main orchestrator
+- `devussyout/src/pipeline/interview_pipeline.py` - Pipeline integration
+- `devussyout/interview_cli.py` - CLI entry point
+- `devussyout/prompts/interview_system_prompt.md` - Interview stage prompt
+- `devussyout/prompts/design_system_prompt.md` - Design stage prompt
+- `devussyout/prompts/devplan_system_prompt.md` - DevPlan stage prompt
+- `devussyout/prompts/detailed_system_prompt.md` - Detailed steps prompt
+- `devussyout/prompts/handoff_system_prompt.md` - Handoff stage prompt
+
+### Previous: Dashboard
+- `swarm-dashboard2/src/index.ts` - Added dynamic OpenCode model selection:
+  - `fetchOpenCodeModels()` - Fetches models from `opencode models` CLI command
+  - `FALLBACK_PROVIDERS` - Fallback models if CLI fails
+  - `cachedProviders` - Global cache of fetched providers/models
+  - `openCodeModels` state - React state for dynamic models
+  - `getProviders()` / `getModelsForProvider()` - Helper functions for model access
+  - `refreshOpenCodeModels()` - Function to re-fetch models from CLI
+  - Updated keyboard handlers to use dynamic models instead of hardcoded PROVIDERS
+  - Updated Options modal UI to show available providers/models with counts
+  - Added "Refresh Models" option in Settings section
+
+### Previous session: Options Menu with Provider/Model Configuration
+- Config types: `RalphConfig`, `ProviderModel`, `DevPlanModels` interfaces
+- `loadConfig()` and `saveConfig()` functions for `~/.ralph/config.json`
+- Config state: `config`, `optionsSection`, `optionsFocusedField`
+- Helper functions: `updateConfig()`, `updateDevplanModel()`
+- Keyboard handler for `o` key to open options modal
+- Options modal keyboard handling (section navigation, field cycling)
+- Options modal UI rendering with 5 tabbed sections
+- Wired config values to: swarmAgentCount, pollInterval, maxLogLines
+- Added mode indicator to header
+- Updated keymap help line to show `[O] Options`
+
+### Previous session: DevPlan Generation with Interview & Progress Tracking
+- Devplan generation feature with interview modal and progress tracking
+- `runDevplanPipeline()` function to spawn Python pipeline
+
+## Build commands
+```bash
+# Rebuild database module after source changes
+cd swarm-dashboard && bun run build
+
+# Run the dashboard
+./run-swarm-dashboard2.sh
+# or: bun swarm-dashboard2/src/index.ts
+```
+
+## DevPlan Pipeline Stages
+The pipeline runs through these stages with progress updates:
+
+| Stage | Progress | Description |
+|-------|----------|-------------|
+| design | 10-25% | Generates project design from interview data |
+| devplan | 35-50% | Creates basic devplan with phases |
+| phases | 55-80% | Generates detailed steps for each phase |
+| handoff | 85-95% | Creates handoff prompt |
+| complete | 100% | Pipeline finished, files saved |
+
+## OpenCode Model Format
+
+Models returned by `opencode models` CLI follow this format:
+```
+opencode/claude-sonnet-4-5
+opencode/gpt-5
+opencode/gemini-3-pro
+firmware/claude-sonnet-4-5
+firmware/gpt-4o
+github-copilot/claude-sonnet-4
+```
+
+The format is `provider/model-name`. The TUI parses this and:
+1. Extracts the provider (everything before `/`)
+2. Groups models by provider
+3. Shows full model identifiers in the UI
+4. Stores the full `provider/model` string in the config
