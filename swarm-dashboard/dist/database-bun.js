@@ -14,11 +14,10 @@ export class SwarmDatabase {
         this.db.close();
     }
     getCurrentRun() {
-        // Prefer run that is currently running and has most recent heartbeat activity
         const run = this.db.query(`
-      SELECT * FROM swarm_runs
-      WHERE status = 'running'
-      ORDER BY started_at DESC
+      SELECT * FROM swarm_runs 
+      WHERE status = 'running' 
+      ORDER BY started_at DESC 
       LIMIT 1
     `).get();
         return run || null;
@@ -65,9 +64,8 @@ export class SwarmDatabase {
     }
     getRunById(runId) {
         const run = this.db.query(`
-      SELECT * FROM swarm_runs
+      SELECT * FROM swarm_runs 
       WHERE run_id = ?
-      LIMIT 1
     `).get(runId);
         return run || null;
     }
@@ -103,7 +101,7 @@ export class SwarmDatabase {
         return costs;
     }
     getRecentLogs(runId, limit = 20) {
-        const ralphDir = process.env.RALPH_DIR || path.join(process.env.HOME || '', '.ralph');
+        const ralphDir = process.env.RALPH_DIR || path.join(process.env.HOME || '', 'projects', '.ralph');
         const runDir = path.join(ralphDir, 'swarm', 'runs', runId);
         const logs = [];
         try {
@@ -151,7 +149,7 @@ export class SwarmDatabase {
     }
 }
 export function getSwarmDatabasePath() {
-    const ralphDir = process.env.RALPH_DIR || path.join(process.env.HOME || '', '.ralph');
+    const ralphDir = process.env.RALPH_DIR || path.join(process.env.HOME || '', 'projects', '.ralph');
     return path.join(ralphDir, 'swarm.db');
 }
 export function createSwarmDatabase(dbPath) {

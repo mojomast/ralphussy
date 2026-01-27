@@ -6,6 +6,9 @@ export declare class SwarmDashboard {
     private currentRunId;
     private lastLogTimestamp;
     private logLines;
+    private paneOffsets;
+    private focusedPane;
+    private pageSize;
     init(): Promise<void>;
     private setupKeyboardHandlers;
     private createLayout;

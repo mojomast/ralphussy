@@ -61,6 +61,7 @@ export declare class SwarmDatabase {
     getTaskCostsByRun(runId: string): TaskCost[];
     getRecentTaskCosts(runId: string, limit?: number): TaskCost[];
     getRecentRuns(limit?: number): SwarmRun[];
+    getRunById(runId: string): SwarmRun | null;
     getFileLocksByRun(runId: string): {
         pattern: string;
         worker_id: number;

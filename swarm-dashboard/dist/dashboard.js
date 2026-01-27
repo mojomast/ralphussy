@@ -8,6 +8,10 @@ export class SwarmDashboard {
     currentRunId = null;
     lastLogTimestamp = 0;
     logLines = [];
+    // Scrolling / focus state for panes
+    paneOffsets = { actions: 0, tasks: 0, workers: 0, console: 0 };
+    focusedPane = 'tasks';
+    pageSize = 20;
     async init() {
         try {
             this.renderer = await createCliRenderer({
@@ -54,6 +58,31 @@ export class SwarmDashboard {
             else if (key.name === 'r') {
                 this.refreshData();
             }
+            else if (key.name === 'tab') {
+                // Cycle focus: tasks -> actions -> workers -> console
+                const order = ['tasks', 'actions', 'workers', 'console'];
+                const idx = order.indexOf(this.focusedPane);
+                this.focusedPane = order[(idx + 1) % order.length];
+                this.refreshData();
+            }
+            else if (key.name === 'up' || key.name === 'down' || key.name === 'pageup' || key.name === 'pagedown') {
+                // Scroll the focused pane
+                let delta = 0;
+                if (key.name === 'up')
+                    delta = -1;
+                else if (key.name === 'down')
+                    delta = 1;
+                else if (key.name === 'pageup')
+                    delta = -Math.max(1, Math.floor(this.pageSize * 0.8));
+                else if (key.name === 'pagedown')
+                    delta = Math.max(1, Math.floor(this.pageSize * 0.8));
+                const cur = this.paneOffsets[this.focusedPane] || 0;
+                let next = cur + delta;
+                if (next < 0)
+                    next = 0;
+                this.paneOffsets[this.focusedPane] = next;
+                this.refreshData();
+            }
         });
     }
     createLayout() {
@@ -88,6 +117,7 @@ export class SwarmDashboard {
             top: 5,
             left: 0,
         });
+        // Layout: left = actions stream, middle = tasks, right = vertical column (resources over workers)
         const middleContainer = Box({
             id: 'middle',
             flexDirection: 'row',
@@ -95,38 +125,29 @@ export class SwarmDashboard {
             height: '60%',
             position: 'relative',
         });
-        const workersPanel = Box({
-            id: 'workers-panel',
-            width: '40%',
+        const actionsPanel = Box({
+            id: 'actions-panel',
+            width: '30%',
             height: '100%',
-            backgroundColor: '#0d1117',
+            backgroundColor: '#071129',
             borderStyle: 'double',
-            borderColor: '#58a6ff',
-            title: ' Workers ',
+            borderColor: '#39a0ed',
+            title: ' Live Actions ',
             position: 'relative',
         });
-        const workersHeader = Text({
-            id: 'workers-header',
-            content: '#  Worker    Status       Task',
-            fg: '#8b949e',
-            position: 'absolute',
-            left: 1,
-            top: 1,
-        });
-        workersPanel.add(workersHeader);
-        const workersList = Box({
-            id: 'workers-list',
+        const actionsList = Box({
+            id: 'actions-list',
             flexDirection: 'column',
             width: '100%',
             height: '100%',
             position: 'absolute',
-            top: 3,
+            top: 1,
             left: 0,
         });
-        workersPanel.add(workersList);
+        actionsPanel.add(actionsList);
         const tasksPanel = Box({
             id: 'tasks-panel',
-            width: '35%',
+            width: '45%',
             height: '100%',
             backgroundColor: '#0d1117',
             borderStyle: 'double',
@@ -153,10 +174,17 @@ export class SwarmDashboard {
             left: 0,
         });
         tasksPanel.add(tasksList);
-        const resourcesPanel = Box({
-            id: 'resources-panel',
+        const rightColumn = Box({
+            id: 'right-column',
+            flexDirection: 'column',
             width: '25%',
             height: '100%',
+            position: 'relative',
+        });
+        const resourcesPanel = Box({
+            id: 'resources-panel',
+            width: '100%',
+            height: '60%',
             backgroundColor: '#0d1117',
             borderStyle: 'double',
             borderColor: '#d29922',
@@ -172,9 +200,40 @@ export class SwarmDashboard {
             top: 1,
         });
         resourcesPanel.add(resourcesText);
-        middleContainer.add(workersPanel);
+        const workersPanel = Box({
+            id: 'workers-panel',
+            width: '100%',
+            height: '40%',
+            backgroundColor: '#0d1117',
+            borderStyle: 'double',
+            borderColor: '#58a6ff',
+            title: ' Workers ',
+            position: 'relative',
+        });
+        const workersHeader = Text({
+            id: 'workers-header',
+            content: '#  Worker    Status       Task',
+            fg: '#8b949e',
+            position: 'absolute',
+            left: 1,
+            top: 1,
+        });
+        workersPanel.add(workersHeader);
+        const workersList = Box({
+            id: 'workers-list',
+            flexDirection: 'column',
+            width: '100%',
+            height: '100%',
+            position: 'absolute',
+            top: 3,
+            left: 0,
+        });
+        workersPanel.add(workersList);
+        rightColumn.add(resourcesPanel);
+        rightColumn.add(workersPanel);
+        middleContainer.add(actionsPanel);
         middleContainer.add(tasksPanel);
-        middleContainer.add(resourcesPanel);
+        middleContainer.add(rightColumn);
         const consolePanel = Box({
             id: 'console-panel',
             width: '100%',
@@ -259,25 +318,67 @@ export class SwarmDashboard {
         const workersList = this.renderer.root.findDescendantById('workers-list');
         if (!workersList)
             return;
+        // Build mapping of tasks by id for quick lookup
+        const allTasks = this.db.getTasksByRun(runId);
+        const taskById = new Map();
+        for (const t of allTasks)
+            taskById.set(t.id, t);
+        // Build stable worker lines (include branch and task first line). We'll
+        // render a window slice to avoid modifying nodes while scrolling.
+        const workerLines = [];
+        workers.forEach((worker, index) => {
+            const statusColor = this.getStatusColor(worker.status);
+            const statusIcon = this.getStatusIcon(worker.status);
+            const assignedTaskId = worker.current_task_id ?? (allTasks.find(t => t.worker_id === worker.id)?.id ?? null);
+            const taskName = assignedTaskId ? (String(taskById.get(assignedTaskId)?.task_text || '').split('\n')[0] || '') : '';
+            const branch = worker.branch_name ? ` ${worker.branch_name}` : '';
+            const parts = [`${index + 1}. W${worker.worker_num.toString().padStart(2)}`, statusIcon, worker.status];
+            if (assignedTaskId)
+                parts.push(`[T#${assignedTaskId}]`);
+            if (branch)
+                parts.push(branch);
+            if (taskName)
+                parts.push('-', taskName);
+            workerLines.push({ content: parts.join(' '), fg: statusColor });
+        });
+        // Clear and render visible window
         while (workersList.getChildrenCount() > 0) {
             const child = workersList.getChildren()[0];
             workersList.remove(child.id);
         }
-        workers.forEach((worker, index) => {
-            const statusColor = this.getStatusColor(worker.status);
-            const statusIcon = this.getStatusIcon(worker.status);
-            const taskInfo = worker.current_task_id ? `Task #${worker.current_task_id}` : 'Idle';
-            const workerText = Text({
-                id: `worker-${worker.id}`,
-                content: `${index + 1}.  Worker-${worker.worker_num.toString().padStart(2)}  ${statusIcon}${worker.status.padEnd(10)}  ${taskInfo}`,
-                fg: statusColor,
-                position: 'relative',
-            });
-            workersList.add(workerText);
+        const wOff = this.paneOffsets.workers || 0;
+        const wWindow = workerLines.slice(wOff, wOff + this.pageSize);
+        wWindow.forEach((l, idx) => {
+            workersList.add(Text({ id: `worker-line-${idx}-${wOff}`, content: l.content, fg: l.fg, position: 'relative' }));
         });
+        // Actions pane: show recent log lines (activity stream). Do not include
+        // branch/path here — leave that for the workers pane.
+        const actionsList = this.renderer.root.findDescendantById('actions-list');
+        if (actionsList) {
+            while (actionsList.getChildrenCount() > 0) {
+                const child = actionsList.getChildren()[0];
+                actionsList.remove(child.id);
+            }
+            const logs = this.db.getRecentLogs(runId, 200);
+            const actionLines = [];
+            for (const log of logs) {
+                const clean = String(log.log_line).replace(/\x1b\[[0-9;]*m/g, '').trim();
+                if (!clean)
+                    continue;
+                actionLines.push({ content: `W${log.worker_num.padStart(2)}  ${clean}`, fg: this.getLogColor(clean) });
+            }
+            const aOff = this.paneOffsets.actions || 0;
+            const aWindow = actionLines.slice(aOff, aOff + this.pageSize);
+            aWindow.forEach((l, idx) => {
+                actionsList.add(Text({ id: `action-line-${idx}-${aOff}`, content: l.content, fg: l.fg, position: 'relative' }));
+            });
+        }
     }
     updateTasks(runId) {
-        const tasks = this.db.getTasksByRun(runId).slice(0, 20);
+        // Show all tasks (pending/in_progress first) and allow scrolling in the
+        // TUI by not truncating here. We'll fetch and order tasks so the pane can
+        // render many entries.
+        const tasks = this.db.getTasksByRun(runId);
         const tasksList = this.renderer.root.findDescendantById('tasks-list');
         if (!tasksList)
             return;
@@ -287,17 +388,39 @@ export class SwarmDashboard {
         }
         tasks.forEach((task) => {
             const statusColor = this.getStatusColor(task.status);
-            const truncatedText = task.task_text.length > 40
-                ? task.task_text.substring(0, 37) + '...'
-                : task.task_text;
+            // Word-wrap the task text to avoid overflowing the pane. Keep an
+            // abbreviated first line for quick scanning.
+            const firstLine = task.task_text.split('\n')[0].substring(0, 80);
             const taskText = Text({
                 id: `task-${task.id}`,
-                content: `${task.id.toString().padStart(2)}.  ${task.status.padEnd(8)}  ${truncatedText}`,
+                content: `${task.id.toString().padStart(2)}. ${task.status.padEnd(12)} ${firstLine}`,
                 fg: statusColor,
                 position: 'relative',
             });
             tasksList.add(taskText);
+            // Add wrapped additional lines as separate Text nodes so panes can scroll
+            const remaining = task.task_text.length > 80 ? task.task_text.substring(80) : '';
+            if (remaining) {
+                const wrapped = remaining.match(/.{1,80}(?:\s|$)|\S+/g) || [];
+                wrapped.forEach((line, idx) => {
+                    const extra = Text({
+                        id: `task-${task.id}-extra-${idx}`,
+                        content: `    ${line.trim()}`,
+                        fg: '#8b949e',
+                        position: 'relative',
+                    });
+                    tasksList.add(extra);
+                });
+            }
         });
+        // Apply scrolling for tasks pane
+        const tOff = this.paneOffsets.tasks || 0;
+        for (let i = 0; i < tOff; i++) {
+            if (tasksList.getChildrenCount() > 0) {
+                const child = tasksList.getChildren()[0];
+                tasksList.remove(child.id);
+            }
+        }
     }
     updateResources(runId) {
         const costs = this.db.getTotalCosts(runId);
@@ -385,6 +508,14 @@ export class SwarmDashboard {
                 position: 'relative',
             });
             consoleList.add(logText);
+        }
+        // Apply scrolling for console pane
+        const cOff = this.paneOffsets.console || 0;
+        for (let i = 0; i < cOff; i++) {
+            if (consoleList.getChildrenCount() > 0) {
+                const child = consoleList.getChildren()[0];
+                consoleList.remove(child.id);
+            }
         }
     }
     clearConsole() {

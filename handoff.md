@@ -138,6 +138,62 @@ python interview_cli.py --model opencode/claude-sonnet-4-5
 Note: Models are now dynamically fetched from `opencode models` CLI. The provider/model values
 should use the full format returned by OpenCode CLI (e.g., `opencode/claude-sonnet-4-5`).
 
+### Interview Mode Integration
+
+**New**: The DevPlan generation now supports a continuous LLM chat-based interview mode at `devussyout/interview_cli.py`.
+
+This provides a more natural conversational approach compared to the older staged prompts:
+
+#### How It Works
+
+1. **Multi-Stage Conversation** - A single conversation spans all 5 stages:
+   - **Interview Stage** - Requirements gathering through natural dialogue
+   - **Design Stage** - Project design generation
+   - **DevPlan Stage** - High-level development plan
+   - **Phases Stage** - Detailed implementation steps
+   - **Handoff Stage** - Handoff prompt creation
+
+2. **Slash Commands** - Interactive control:
+   - `/done` - Mark requirements gathering complete
+   - `/skip` - Skip current question
+   - `/back` - Go back to previous topic
+   - `/status` - Show current progress
+   - `/help` - Show available commands
+   - `/save` - Save current state
+   - `/reset` - Restart conversation
+   - `/model <provider>` - Switch LLM model
+   - `/stage` - Show current pipeline stage
+
+3. **Model Selection** - Dynamic model switching:
+   - Default model loaded from `~/.ralph/config.json`
+   - Use `/model opencode` to switch to OpenCode provider
+   - Use `/model openai` to switch to OpenAI provider
+   - Use `/model anthropic` to switch to Anthropic provider
+   - Models can also be changed via Options menu (`o` key)
+
+4. **Progress Tracking** - Visual indicators for:
+   - Stage completion (interview → design → devplan → phases → handoff)
+   - Message streaming from LLM responses
+   - Auto-save after each stage completes
+
+#### Running Interview Mode
+
+```bash
+# From devussyout directory
+cd devussyout
+python interview_cli.py --model opencode/claude-sonnet-4-5
+```
+
+#### Key Differences from Previous System
+
+| Feature | Previous (Staged Prompts) | New (Interview Mode) |
+|----------|---------------------------|----------------------|
+| Interface | Sequential prompts | Continuous conversation |
+| Model Selection | Static config per stage | Dynamic `/model` command |
+| State Management | Per-stage restarts | Single session with `/save`/`/reset` |
+| User Experience | Fill forms one-by-one | Natural chat flow |
+| Flexibility | Limited to predefined stages | Skip `/back`, change model anytime |
+
 ## Files created/modified this session
 
 ### Interview Module (NEW)

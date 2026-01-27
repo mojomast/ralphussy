@@ -4,7 +4,27 @@
 
 Ralphussy is a comprehensive distribution of the "Ralph" autonomous agent tooling, evolved into a powerful suite for AI-assisted software engineering. It includes a robust CLI loop agent, a terminal user interface (TUI), and a swarm runner for parallel task execution.
 
-## ✨ Recent Improvements (2026-01-24)
+## ✨ Recent Improvements (2026-01-27)
+
+**New: Options Menu & Configuration System:**
+- ✅ **Options Menu** (`o` key) - Full settings UI with 5 tabbed sections
+- ✅ **Provider/Model Selection** - Support for anthropic, openai, openrouter, ollama
+- ✅ **Granular DevPlan Models** - Configure models per pipeline stage (interview/design/devplan/phase/handoff)
+- ✅ **Config Persistence** - Settings saved to `~/.ralph/config.json`
+- ✅ **Mode Selection** - Switch between ralph, devplan, and swarm modes
+- ✅ **Configurable Settings** - Timeouts, poll interval, agent count, and more
+
+**NEW: Major TUI Upgrades - Mouse Support & Visual Enhancements:**
+- ✅ **Mouse Support** (`brrrrrrrr`!) - Enabled full mouse interaction (clicks, hover, scroll)
+- ✅ **Modern Color Scheme** - GitHub Dark theme with consistent palette
+- ✅ **ASCII Art Title** - Animated RALPH logo in header
+- ✅ **Help System** - Press `?` for comprehensive keyboard shortcuts
+- ✅ **Visual Enhancements** - Better borders, emojis, and color coding
+- ✅ **Hover States** - Interactive feedback on all elements
+- ✅ **Animated Spinners** - Loading states with rotating characters
+- ✅ **Enhanced Modals** - All modals use new color scheme
+
+## Previous Improvements (2026-01-24)
 
 **15 Critical and Performance Fixes Implemented:**
 - ✅ Fixed stall detection with duration-based accuracy
@@ -75,21 +95,29 @@ The TUI allows you to:
 
 ### Swarm Dashboard Setup
 
-For real-time swarm monitoring, set up the dashboard:
+For real-time swarm monitoring with a powerful TUI:
 
 ```bash
-cd swarm-dashboard
-npm install
-npm run build
+# Run the dashboard (recommended)
+./run-swarm-dashboard2.sh
 
-# Run the simple CLI version (works in any terminal)
-./run-simple.sh
-
-# Or run the full TUI version
-./run.sh
+# Or run directly with Bun
+bun swarm-dashboard2/src/index.ts
 ```
 
-The dashboard monitors worker status, task progress, and resource usage automatically.
+**Dashboard Features:**
+- **Options Menu** (`o`) - Configure providers, models, and settings
+- **DevPlan Generation** (`d`) - Generate development plans from requirements
+- **Start Run** (`s`) - Launch swarm with configurable worker count
+- **Run History** (`v`) - View and switch between historical runs
+- **Live Monitoring** - Real-time task progress, worker status, and logs
+
+**Configuration** is saved to `~/.ralph/config.json` and includes:
+- Operation mode (ralph/devplan/swarm)
+- Provider and model selection for each component
+- Swarm agent count, timeouts, and behavioral settings
+
+See [swarm-dashboard2/README.md](swarm-dashboard2/README.md) for full documentation.
 
   ### Running a Swarm
  
