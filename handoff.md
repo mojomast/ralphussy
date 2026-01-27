@@ -1,5 +1,87 @@
 Handoff: Next Steps for Ralph Live Dashboard
 
+## CURRENT ISSUE: TTY Detection Problem (2026-01-27)
+
+### Problem
+The swarm dashboard launcher script (`run-swarm-dashboard2.sh`) is blocking execution in SSH environments (specifically Windows Terminal over SSH) due to overly strict TTY detection at lines 104-114.
+
+**Symptoms:**
+- User runs `./run-swarm-dashboard2.sh` in Windows Terminal over SSH
+- Script exits with error: "Dashboard requires an interactive terminal"
+- Dashboard never launches despite being in a real interactive terminal
+- All recent enhancements (mouse support, visual improvements) ARE present in code but user can't access them
+
+**Root Cause:**
+- The script checks `[ ! -t 0 ] || [ ! -t 1 ]` which fails in some SSH configurations
+- This is blocking legitimate interactive terminal usage
+- The check is meant to prevent running via pipes/non-TTY, but it's too strict for SSH
+
+### Solution Options
+
+**Option 1: Quick Workaround (For User)**
+```bash
+# Set bypass flag when running
+ALLOW_NO_TTY=1 ./run-swarm-dashboard2.sh
+```
+
+**Option 2: Fix TTY Detection (Recommended for Next Developer)**
+Modify `run-swarm-dashboard2.sh` lines 104-114 to be smarter about SSH sessions:
+
+```bash
+# Improved TTY check that works with SSH
+if [ -z "${ALLOW_NO_TTY:-}" ]; then
+    # Check if we have a TERM set (indicates terminal environment)
+    if [ -z "$TERM" ] || [ "$TERM" = "dumb" ]; then
+        echo "Error: Dashboard requires an interactive terminal."
+        echo "Set ALLOW_NO_TTY=1 to bypass this check."
+        exit 1
+    fi
+    # Warn but allow if only one of stdin/stdout is not a TTY (SSH scenario)
+    if [ ! -t 0 ] && [ ! -t 1 ]; then
+        echo "Error: Dashboard requires an interactive terminal."
+        echo "Please run this directly in your terminal, not through a pipe."
+        echo "Set ALLOW_NO_TTY=1 to bypass this check."
+        exit 1
+    fi
+fi
+```
+
+**Option 3: Add Command-Line Flag**
+Add `--force` or `--ssh` flag to bypass check more cleanly:
+```bash
+# In argument parsing section
+FORCE_RUN=false
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --force|--ssh) FORCE_RUN=true; shift ;;
+        *) shift ;;
+    esac
+done
+
+# Use in TTY check
+if [ -z "${ALLOW_NO_TTY:-}" ] && [ "$FORCE_RUN" != "true" ]; then
+    # ... TTY checks ...
+fi
+```
+
+### Important Clarification
+There are **TWO separate components** that users may confuse:
+
+| Component | File | TTY Mode | Purpose |
+|-----------|------|----------|---------|
+| **Python Interview CLI** | `devussyout/interview_cli.py` | ✅ Dual-mode (TTY & non-TTY) | DevPlan generation via chat |
+| **TypeScript Swarm Dashboard** | `swarm-dashboard2/src/index.ts` | ⚠️ Requires TTY | Visual TUI for swarm monitoring |
+
+The documentation in `devussyout/NON_TTY_MODE.md` is about the **Python interview CLI**, NOT the swarm dashboard. The swarm dashboard REQUIRES a real TTY for mouse support and keyboard navigation via OpenTUI.
+
+### Next Steps for Developer
+1. **Test in real SSH environment**: Run dashboard directly in SSH session (not through Claude Code)
+2. **Implement Option 2 or 3 above**: Fix TTY detection to work with SSH
+3. **Add documentation**: Clarify difference between interview CLI and dashboard in README
+4. **Verify**: Test on Windows Terminal SSH, Mac Terminal SSH, and Linux terminals
+
+---
+
 ## What I changed (this session)
 
 ### Continuous LLM Chat Interview Mode (NEW)
@@ -276,3 +358,52 @@ The format is `provider/model-name`. The TUI parses this and:
 2. Groups models by provider
 3. Shows full model identifiers in the UI
 4. Stores the full `provider/model` string in the config
+
+---
+
+## Testing Checklist (After TTY Fix)
+
+### Verify Dashboard Launches
+```bash
+# Test 1: Direct run in SSH terminal
+./run-swarm-dashboard2.sh
+# Should launch without error
+
+# Test 2: With bypass flag
+ALLOW_NO_TTY=1 ./run-swarm-dashboard2.sh
+# Should launch
+
+# Test 3: With force flag (if implemented)
+./run-swarm-dashboard2.sh --force
+# Should launch
+```
+
+### Verify Recent Features Work
+Once dashboard launches, check:
+- [ ] ASCII art RALPH title displays at top
+- [ ] Modern GitHub Dark color scheme visible
+- [ ] Mouse clicking works on tabs/options
+- [ ] Press `?` to see help modal with keyboard shortcuts
+- [ ] Press `o` to open Options menu with mouse support
+- [ ] Hover states work on panes
+- [ ] Animated spinner visible when loading
+- [ ] All visual enhancements from commit c182827 are present
+
+### Verify Different Terminals
+Test on:
+- [ ] Windows Terminal over SSH (user's environment)
+- [ ] Standard Linux terminal (if available)
+- [ ] macOS Terminal over SSH (if available)
+- [ ] tmux/screen sessions
+
+### Files to Modify for Fix
+- `run-swarm-dashboard2.sh` (lines 102-114) - TTY detection logic
+- Optional: `swarm-dashboard2/README.md` - Add SSH usage notes
+- Optional: `handoff.md` - Update when issue is resolved
+
+### Success Criteria
+✅ Dashboard launches in SSH sessions without ALLOW_NO_TTY flag
+✅ TTY check still blocks true non-TTY environments (pipes, background)
+✅ All visual enhancements work as expected
+✅ User can see and use mouse support features
+✅ Documentation clarifies interview CLI vs dashboard differences
