@@ -129,6 +129,14 @@ export class SwarmDatabase {
     `).all(limit) as SwarmRun[];
   }
 
+  getRunById(runId: string): SwarmRun | null {
+    const run = this.db.query(`
+      SELECT * FROM swarm_runs 
+      WHERE run_id = ?
+    `).get(runId) as SwarmRun | undefined;
+    return run || null;
+  }
+
   getFileLocksByRun(runId: string): { pattern: string; worker_id: number; acquired_at: string }[] {
     return this.db.query(`
       SELECT pattern, worker_id, acquired_at 

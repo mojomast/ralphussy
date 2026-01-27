@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import React from 'react';
-import { createRoot, useKeyboard, useRenderer, useMouse } from '@opentui/react';
+import { createRoot, useKeyboard, useRenderer } from '@opentui/react';
 import { createCliRenderer, ConsolePosition, RGBA, t, bold, fg, bg, underline } from '@opentui/core';
 import fs from 'fs';
 import os from 'os';
@@ -316,27 +316,13 @@ async function main() {
         actions: 0, tasks: 0, workers: 0, console: 0, ralph: 0
       });
       
-      // Animate spinner
+       // Animate spinner
       React.useEffect(() => {
         const interval = setInterval(() => {
           setSpinnerFrame(prev => (prev + 1) % SPINNER_FRAMES.length);
         }, 100);
         return () => clearInterval(interval);
       }, []);
-      
-      // BRRRRR - Mouse event handling
-      try {
-        useMouse((mouseEvent) => {
-          // Track mouse hover for visual feedback
-          // In a real implementation, we'd check coordinates against element positions
-          // For now, we'll just note that mouse is moving
-          if (mouseEvent.action === 'move') {
-            // Could implement coordinate-based hover detection here
-          }
-        });
-      } catch (e) {
-        // useMouse might not be available, gracefully fallback
-      }
 
       // Page size used for visible window when computing auto-scroll behavior
       const PAGE_SIZE = 15;
@@ -1258,51 +1244,68 @@ asyncio.run(run_pipeline())
               appendRalphLines('[UI] Cleared run selection — showing current run');
               lastDbMtimeRef.current = 0;
             } else if (key.name === 'd') {
-              // Open devplan generation interview modal
-              debugLog('Devplan generation initiated');
-              appendRalphLines('[UI] Opening devplan generation wizard...');
-              
-              // Auto-detect project name from ~/projects/current
-              let pname = '';
+              // Show modal with instructions to launch interactive interview
+              debugLog('Devplan interactive interview help');
+
+              // Auto-detect project directory
+              let projectDir = process.cwd();
+              let projectName = 'current';
               try {
                 const projFile = `${process.env.HOME}/projects/current`;
                 const fsLocal = require('fs');
                 if (fsLocal.existsSync(projFile)) {
-                  pname = fsLocal.readFileSync(projFile, 'utf8').trim();
+                  projectName = fsLocal.readFileSync(projFile, 'utf8').trim();
+                  projectDir = `${process.env.HOME}/projects/${projectName}`;
                 }
               } catch (e) { /* ignore */ }
-              
-              // Initialize interview form
-              setInputBuffer({
-                project_name: pname,
-                languages: 'TypeScript, Python',
-                frameworks: '',
-                apis: '',
-                requirements: '',
-              });
+
+              const interviewCommand = `cd ~/projects/ralphussy/devussy/devussy && python3 -m src.cli interactive-design --llm-interview --streaming --repo-dir ${projectDir}`;
+
+              // Remember where we start adding lines
+              const startIdx = ralphLines.length;
+
+              // Add all the instruction lines to ralphLines
+              const instructionLines = [
+                '',
+                '═══════════════════════════════════════════════════════════════',
+                '  🎵 DevPlan Interactive Interview - Instructions',
+                '═══════════════════════════════════════════════════════════════',
+                '',
+                '  The interactive interview requires full terminal control.',
+                '  To launch it:',
+                '',
+                '  1. Press ESC or Q to close this TUI',
+                '  2. Run this command:',
+                '',
+                `     ${interviewCommand}`,
+                '',
+                '  3. The interview will guide you through:',
+                '     • Project requirements gathering',
+                '     • Technology stack selection',
+                '     • Architecture planning',
+                '',
+                '  4. During the interview:',
+                '     • Answer questions naturally in chat',
+                '     • Use /help to see available commands',
+                '     • Use /done when ready to generate devplan',
+                '     • Use /quit to exit without generating',
+                '',
+                '  5. Outputs will be saved to:',
+                `     ~/.ralph/devplans/${projectName}/`,
+                '',
+                '═══════════════════════════════════════════════════════════════',
+                '  Press ESC or Q to close this help',
+                '═══════════════════════════════════════════════════════════════',
+                '',
+              ];
+
+              setRalphLines((prev: string[]) => [...prev, ...instructionLines]);
+
+              // Show output modal starting from where we added the instructions
               setCommandModal({
-                type: 'devplan-interview',
-                title: 'DevPlan Generation - Project Interview',
-                step: 0, // Current step in multi-step form
-                totalSteps: 5,
-                fields: [
-                  { key: 'project_name', label: 'Project Name', value: pname, required: true, hint: 'Name of your project' },
-                  { key: 'languages', label: 'Languages', value: 'TypeScript, Python', required: true, hint: 'Comma-separated (e.g., TypeScript, Python)' },
-                  { key: 'frameworks', label: 'Frameworks', value: '', required: false, hint: 'Comma-separated (e.g., React, FastAPI)' },
-                  { key: 'apis', label: 'APIs / Integrations', value: '', required: false, hint: 'External APIs (e.g., OpenAI, Stripe)' },
-                  { key: 'requirements', label: 'Requirements', value: '', required: true, hint: 'Describe what you want to build', multiline: true },
-                ],
-                focusedField: 0,
-                onConfirm: (values: any) => {
-                  debugLog(`Devplan interview confirmed: ${JSON.stringify(values)}`);
-                  appendRalphLines('[UI] Starting devplan generation pipeline...');
-                  runDevplanPipeline(values);
-                },
-                onCancel: () => {
-                  appendRalphLines('[UI] Devplan generation cancelled');
-                  setDevplanStage('idle');
-                  setDevplanProgress({ stage: 'idle', message: '', progress: 0 });
-                }
+                type: 'output',
+                title: '🎵 DevPlan Interactive Interview',
+                startAt: startIdx,
               });
             } else if (key.name === 'o') {
               // Open options menu
@@ -1322,6 +1325,330 @@ asyncio.run(run_pipeline())
           console.error('keyboard handler error', err);
         }
       });
+
+      // Mouse event handling - BRRRRR mouse support!
+      React.useEffect(() => {
+        if (!renderer) {
+          debugLog('No renderer available for mouse handler');
+          return;
+        }
+
+        // Try multiple ways to access the blessed screen
+        let screen = (renderer as any).screen;
+        if (!screen) {
+          screen = (renderer as any)._screen;
+        }
+        if (!screen) {
+          screen = (renderer as any).program?.screen;
+        }
+        if (!screen) {
+          // Last resort - try to find screen in renderer properties
+          const keys = Object.keys(renderer as any);
+          debugLog(`Renderer keys: ${keys.join(', ')}`);
+          for (const key of keys) {
+            const val = (renderer as any)[key];
+            if (val && typeof val === 'object' && val.on && typeof val.on === 'function') {
+              screen = val;
+              debugLog(`Found potential screen object at renderer.${key}`);
+              break;
+            }
+          }
+        }
+
+        if (!screen) {
+          debugLog('Could not find screen object for mouse handling');
+          appendRalphLines('[MOUSE] Could not initialize mouse handler - screen not found');
+          return;
+        }
+
+        debugLog(`Screen object found: ${typeof screen}, has 'on': ${typeof screen.on}`);
+
+        const handleMouse = (event: any) => {
+          try {
+            const { x, y, action } = event;
+
+            // Always log mouse events when options menu is open
+            if (commandModal && commandModal.type === 'options') {
+              appendRalphLines(`[MOUSE] ${action} at (${x}, ${y}) - Options menu is open`);
+            } else if (config.debugMode) {
+              appendRalphLines(`[MOUSE] ${action} at (${x}, ${y})`);
+            }
+
+            debugLog(`Mouse event: action=${action}, x=${x}, y=${y}, modal=${commandModal?.type || 'none'}`);
+
+            // Only handle click events
+            if (action !== 'mousedown' && action !== 'wheeldown' && action !== 'wheelup') {
+              return;
+            }
+
+            // Check if options modal is open and handle clicks within it
+            if (commandModal && commandModal.type === 'options') {
+            // Options modal boundaries (approximate from rendering code)
+            // Position: left: 3, right: 3, top: 2, bottom: 2
+            // This means it spans from x=3 to width-3, y=2 to height-2
+            const screenWidth = screen.width;
+            const screenHeight = screen.height;
+            const modalLeft = 3;
+            const modalRight = screenWidth - 3;
+            const modalTop = 2;
+            const modalBottom = screenHeight - 2;
+
+            // Check if click is within modal bounds
+            if (x >= modalLeft && x <= modalRight && y >= modalTop && y <= modalBottom) {
+              // Relative position within modal
+              const relY = y - modalTop;
+
+              // Header and tabs occupy first ~5 lines, fields start around line 7
+              const contentStartLine = 7;
+
+              if (relY >= contentStartLine) {
+                const fieldLine = relY - contentStartLine;
+
+                // Each section has different field layouts
+                if (optionsSection === 'mode') {
+                  // Mode section has 3 options starting around line 7-10
+                  // Just clicking anywhere in mode cycles the mode
+                  if (action === 'mousedown') {
+                    const modes: Array<'ralph' | 'devplan' | 'swarm'> = ['ralph', 'devplan', 'swarm'];
+                    const currentIdx = modes.indexOf(config.mode);
+                    const nextMode = modes[(currentIdx + 1) % modes.length];
+                    setConfig((c: RalphConfig) => ({ ...c, mode: nextMode }));
+                    saveConfig({ ...config, mode: nextMode });
+                    appendRalphLines(`[CFG] Mode changed to ${nextMode}`);
+                  }
+                } else if (optionsSection === 'swarm') {
+                  // Swarm section has 3 fields: Provider, Model, Agent Count
+                  // Clicking on a field line focuses it and cycles the value
+                  if (fieldLine >= 0 && fieldLine <= 10 && action === 'mousedown') {
+                    let targetField = 0;
+                    if (fieldLine >= 0 && fieldLine <= 2) targetField = 0; // Provider
+                    else if (fieldLine >= 3 && fieldLine <= 5) targetField = 1; // Model
+                    else if (fieldLine >= 6 && fieldLine <= 8) targetField = 2; // Agent Count
+
+                    setOptionsFocusedField(targetField);
+
+                    // Also cycle the value
+                    if (targetField === 0) {
+                      const providers = getProviders();
+                      const idx = providers.indexOf(config.swarmModel.provider);
+                      const nextProvider = providers[(idx + 1) % providers.length];
+                      const nextModels = getModelsForProvider(nextProvider);
+                      setConfig((c: RalphConfig) => ({
+                        ...c,
+                        swarmModel: { provider: nextProvider, model: nextModels[0] || 'default' }
+                      }));
+                      saveConfig({ ...config, swarmModel: { provider: nextProvider, model: nextModels[0] || 'default' } });
+                    } else if (targetField === 1) {
+                      const models = getModelsForProvider(config.swarmModel.provider);
+                      const idx = models.indexOf(config.swarmModel.model);
+                      const nextModel = models[(idx + 1) % models.length];
+                      setConfig((c: RalphConfig) => ({
+                        ...c,
+                        swarmModel: { ...c.swarmModel, model: nextModel }
+                      }));
+                      saveConfig({ ...config, swarmModel: { ...config.swarmModel, model: nextModel } });
+                    } else if (targetField === 2) {
+                      const counts = [1, 2, 3, 4, 5, 8, 10];
+                      const idx = counts.indexOf(config.swarmAgentCount);
+                      const nextCount = counts[(idx + 1) % counts.length];
+                      setConfig((c: RalphConfig) => ({ ...c, swarmAgentCount: nextCount }));
+                      saveConfig({ ...config, swarmAgentCount: nextCount });
+                    }
+                  }
+                } else if (optionsSection === 'ralph') {
+                  // Ralph section has 2 fields: Provider, Model
+                  if (fieldLine >= 0 && fieldLine <= 8 && action === 'mousedown') {
+                    let targetField = 0;
+                    if (fieldLine >= 0 && fieldLine <= 3) targetField = 0; // Provider
+                    else if (fieldLine >= 4 && fieldLine <= 7) targetField = 1; // Model
+
+                    setOptionsFocusedField(targetField);
+
+                    // Cycle value
+                    if (targetField === 0) {
+                      const providers = getProviders();
+                      const idx = providers.indexOf(config.ralphModel.provider);
+                      const nextProvider = providers[(idx + 1) % providers.length];
+                      const nextModels = getModelsForProvider(nextProvider);
+                      setConfig((c: RalphConfig) => ({
+                        ...c,
+                        ralphModel: { provider: nextProvider, model: nextModels[0] || 'default' }
+                      }));
+                      saveConfig({ ...config, ralphModel: { provider: nextProvider, model: nextModels[0] || 'default' } });
+                    } else if (targetField === 1) {
+                      const models = getModelsForProvider(config.ralphModel.provider);
+                      const idx = models.indexOf(config.ralphModel.model);
+                      const nextModel = models[(idx + 1) % models.length];
+                      setConfig((c: RalphConfig) => ({
+                        ...c,
+                        ralphModel: { ...c.ralphModel, model: nextModel }
+                      }));
+                      saveConfig({ ...config, ralphModel: { ...config.ralphModel, model: nextModel } });
+                    }
+                  }
+                } else if (optionsSection === 'devplan') {
+                  // Devplan section has 5 stages x 2 fields = 10 fields total
+                  // Clicking focuses and cycles
+                  if (fieldLine >= 0 && fieldLine <= 50 && action === 'mousedown') {
+                    const stages: (keyof DevPlanModels)[] = ['interview', 'design', 'devplan', 'phase', 'handoff'];
+                    const stageIdx = Math.floor(fieldLine / 5); // Each stage takes ~5 lines
+                    const lineInStage = fieldLine % 5;
+
+                    if (stageIdx < stages.length) {
+                      const stage = stages[stageIdx];
+                      const isProvider = lineInStage <= 1; // First 2 lines are provider
+                      const fieldOffset = stageIdx * 2 + (isProvider ? 0 : 1);
+
+                      setOptionsFocusedField(fieldOffset);
+
+                      // Cycle value
+                      if (isProvider) {
+                        const providers = getProviders();
+                        const idx = providers.indexOf(config.devplanModels[stage].provider);
+                        const nextProvider = providers[(idx + 1) % providers.length];
+                        const nextModels = getModelsForProvider(nextProvider);
+                        setConfig((c: RalphConfig) => ({
+                          ...c,
+                          devplanModels: {
+                            ...c.devplanModels,
+                            [stage]: { provider: nextProvider, model: nextModels[0] || 'default' }
+                          }
+                        }));
+                        saveConfig({
+                          ...config,
+                          devplanModels: {
+                            ...config.devplanModels,
+                            [stage]: { provider: nextProvider, model: nextModels[0] || 'default' }
+                          }
+                        });
+                      } else {
+                        const models = getModelsForProvider(config.devplanModels[stage].provider);
+                        const idx = models.indexOf(config.devplanModels[stage].model);
+                        const nextModel = models[(idx + 1) % models.length];
+                        setConfig((c: RalphConfig) => ({
+                          ...c,
+                          devplanModels: {
+                            ...c.devplanModels,
+                            [stage]: { ...c.devplanModels[stage], model: nextModel }
+                          }
+                        }));
+                        saveConfig({
+                          ...config,
+                          devplanModels: {
+                            ...config.devplanModels,
+                            [stage]: { ...config.devplanModels[stage], model: nextModel }
+                          }
+                        });
+                      }
+                    }
+                  }
+                } else if (optionsSection === 'settings') {
+                  // Settings section has 8 fields
+                  if (fieldLine >= 0 && fieldLine <= 20 && action === 'mousedown') {
+                    const targetField = Math.floor(fieldLine / 2); // Each field takes ~2 lines
+                    if (targetField < 8) {
+                      setOptionsFocusedField(targetField);
+
+                      // Toggle or cycle based on field
+                      if (targetField === 0) {
+                        // Refresh models - trigger refresh
+                        appendRalphLines('[CFG] Refreshing provider/model list from OpenCode...');
+                        refreshProvidersAndModels();
+                      } else if (targetField === 1) {
+                        // Command timeout - cycle through common values
+                        const timeouts = [30, 60, 120, 180, 300, 600];
+                        const idx = timeouts.indexOf(config.commandTimeout);
+                        const nextTimeout = timeouts[(idx + 1) % timeouts.length];
+                        setConfig((c: RalphConfig) => ({ ...c, commandTimeout: nextTimeout }));
+                        saveConfig({ ...config, commandTimeout: nextTimeout });
+                      } else if (targetField === 2) {
+                        // LLM timeout
+                        const timeouts = [30, 60, 120, 180, 300, 600];
+                        const idx = timeouts.indexOf(config.llmTimeout);
+                        const nextTimeout = timeouts[(idx + 1) % timeouts.length];
+                        setConfig((c: RalphConfig) => ({ ...c, llmTimeout: nextTimeout }));
+                        saveConfig({ ...config, llmTimeout: nextTimeout });
+                      } else if (targetField === 3) {
+                        // Poll interval
+                        const intervals = [1, 2, 3, 5, 10, 15];
+                        const idx = intervals.indexOf(config.pollInterval);
+                        const nextInterval = intervals[(idx + 1) % intervals.length];
+                        setConfig((c: RalphConfig) => ({ ...c, pollInterval: nextInterval }));
+                        saveConfig({ ...config, pollInterval: nextInterval });
+                      } else if (targetField === 4) {
+                        // Auto refresh toggle
+                        setConfig((c: RalphConfig) => ({ ...c, autoRefresh: !c.autoRefresh }));
+                        saveConfig({ ...config, autoRefresh: !config.autoRefresh });
+                      } else if (targetField === 5) {
+                        // Show costs toggle
+                        setConfig((c: RalphConfig) => ({ ...c, showCosts: !c.showCosts }));
+                        saveConfig({ ...config, showCosts: !config.showCosts });
+                      } else if (targetField === 6) {
+                        // Debug mode toggle
+                        setConfig((c: RalphConfig) => ({ ...c, debugMode: !c.debugMode }));
+                        saveConfig({ ...config, debugMode: !config.debugMode });
+                      } else if (targetField === 7) {
+                        // Max log lines
+                        const maxes = [100, 200, 500, 1000, 2000, 5000];
+                        const idx = maxes.indexOf(config.maxLogLines);
+                        const nextMax = maxes[(idx + 1) % maxes.length];
+                        setConfig((c: RalphConfig) => ({ ...c, maxLogLines: nextMax }));
+                        saveConfig({ ...config, maxLogLines: nextMax });
+                      }
+                    }
+                  }
+                }
+              }
+
+              // Clicking on tabs (first few lines) switches sections
+              if (relY >= 1 && relY <= 3) {
+                // Tab line is around relY = 3
+                // Approximate tab positions: MODE (~5-15), SWARM (~20-30), RALPH (~35-45), DEVPLAN (~50-60), SETTINGS (~65-75)
+                const sections: OptionsSection[] = ['mode', 'swarm', 'ralph', 'devplan', 'settings'];
+                const tabWidth = Math.floor(screenWidth / sections.length);
+                const clickedTab = Math.floor((x - modalLeft) / tabWidth);
+
+                if (clickedTab >= 0 && clickedTab < sections.length) {
+                  setOptionsSection(sections[clickedTab]);
+                  setOptionsFocusedField(0);
+                }
+              }
+
+              // Click outside tabs but inside modal - prevent event from bubbling
+              return;
+            }
+
+            // Click outside modal - close it
+            if (action === 'mousedown') {
+              appendRalphLines('[UI] Options menu closed (saved)');
+              setCommandModal(null);
+            }
+          }
+          } catch (err) {
+            debugLog(`Mouse handler error: ${err}`);
+            if (config.debugMode) {
+              appendRalphLines(`[MOUSE ERR] ${String(err)}`);
+            }
+          }
+        };
+
+        try {
+          screen.on('mouse', handleMouse);
+          debugLog('Mouse handler registered successfully');
+          appendRalphLines('[MOUSE] Mouse handler initialized - try clicking!');
+        } catch (err) {
+          debugLog(`Mouse handler setup error: ${err}`);
+          appendRalphLines(`[MOUSE ERR] Failed to initialize: ${String(err)}`);
+        }
+
+        return () => {
+          try {
+            screen.off('mouse', handleMouse);
+          } catch (err) {
+            // Ignore cleanup errors
+          }
+        };
+      }, [renderer, commandModal, optionsSection, optionsFocusedField, config]);
 
         // DB polling/load function exposed so other actions can trigger it.
         const dbPath = (process.env.RALPH_DIR ? `${process.env.RALPH_DIR.replace(/\/+$/,'')}/swarm.db` : `${os.homedir()}/.ralph/swarm.db`);
