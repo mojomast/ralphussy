@@ -34,15 +34,19 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.RalphCLI = void 0;
 const child_process_1 = require("child_process");
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
+const sdk_1 = require("@opencode-ai/sdk");
 class RalphCLI {
     stateDir;
     progressFile;
     historyFile;
+    client = null;
+    server = null;
     constructor() {
-        this.stateDir = '.ralph';
+        this.stateDir = 'projects/.ralph';
         this.progressFile = path.join(this.stateDir, 'progress.md');
         this.historyFile = path.join(this.stateDir, 'history.json');
     }
@@ -53,6 +57,24 @@ class RalphCLI {
         console.log(`✅ Completion promise: ${options.completionPromise}\n`);
         this.ensureStateDir();
         this.initState(options.prompt, options.completionPromise, options.maxIterations);
+        // Initialize OpenCode Client
+        try {
+            if (options.attach) {
+                console.log(`🔌 Attaching to OpenCode at ${options.attach}...`);
+                this.client = (0, sdk_1.createOpencodeClient)({
+                    baseUrl: options.attach
+                });
+            }
+            else {
+                console.log('🔌 Starting OpenCode server...');
+                const instance = await (0, sdk_1.createOpencode)();
+                this.client = instance.client;
+                this.server = instance.server;
+            }
+        }
+        catch (error) {
+            console.warn('⚠️  Failed to initialize OpenCode SDK, falling back to CLI spawn:', error);
+        }
         let iteration = 0;
         let success = false;
         while (iteration < options.maxIterations) {
@@ -78,18 +100,13 @@ class RalphCLI {
         if (!success) {
             console.log(`\n⚠️  Reached max iterations (${options.maxIterations})`);
         }
+        if (this.server) {
+            this.server.close();
+        }
         this.printSummary(iteration, success);
     }
     async runIteration(options, iteration) {
         const startTime = Date.now();
-        // Build command
-        const cmd = ['run'];
-        if (options.model) {
-            cmd.push('--model', options.model);
-        }
-        if (options.attach) {
-            cmd.push('--attach', options.attach);
-        }
         // Get context if exists
         let prompt = options.prompt;
         const contextFile = path.join(this.stateDir, 'context.md');
@@ -101,7 +118,21 @@ class RalphCLI {
             }
         }
         // Run OpenCode
-        const output = await this.runOpenCode(cmd, prompt);
+        let output = '';
+        if (this.client) {
+            output = await this.runWithClient(options, prompt);
+        }
+        else {
+            // Build command for legacy path
+            const cmd = ['run'];
+            if (options.model) {
+                cmd.push('--model', options.model);
+            }
+            if (options.attach) {
+                cmd.push('--attach', options.attach);
+            }
+            output = await this.runOpenCode(cmd, prompt);
+        }
         const duration = Date.now() - startTime;
         // Extract tools
         const tools = this.extractTools(output);
@@ -110,6 +141,53 @@ class RalphCLI {
         // Detect struggle
         const struggle = this.detectStruggle();
         return { success, struggle, duration, tools };
+    }
+    async runWithClient(options, prompt) {
+        if (!this.client)
+            throw new Error("Client not initialized");
+        const sessionResponse = await this.client.session.create();
+        if (sessionResponse.error || !sessionResponse.data) {
+            throw new Error(`Failed to create session: ${JSON.stringify(sessionResponse.error)}`);
+        }
+        const session = sessionResponse.data;
+        // Parse model if provided
+        let modelOpt;
+        if (options.model) {
+            const parts = options.model.split('/');
+            if (parts.length === 2) {
+                modelOpt = { providerID: parts[0], modelID: parts[1] };
+            }
+        }
+        const response = await this.client.session.prompt({
+            path: { id: session.id },
+            body: {
+                model: modelOpt,
+                parts: [{
+                        type: 'text',
+                        text: prompt
+                    }]
+            }
+        });
+        if (response.error) {
+            return `Error: ${JSON.stringify(response.error)}`;
+        }
+        const result = response.data;
+        if (!result)
+            return "";
+        let output = "";
+        for (const part of result.parts) {
+            if (part.type === 'text') {
+                output += part.text;
+                process.stdout.write(part.text);
+            }
+            else if (part.type === 'tool') {
+                // Reconstruct tool usage for log/struggle detection
+                const toolLog = `\n[Tool: ${part.tool}]\n`;
+                output += toolLog;
+                process.stdout.write(toolLog);
+            }
+        }
+        return output;
     }
     async runOpenCode(args, prompt) {
         return new Promise((resolve, reject) => {
@@ -266,6 +344,7 @@ class RalphCLI {
         console.log('✅ Context cleared');
     }
 }
+exports.RalphCLI = RalphCLI;
 async function main() {
     const cli = new RalphCLI();
     const args = process.argv.slice(2);
@@ -374,5 +453,7 @@ For more information, visit: https://github.com/anomalyco/opencode
         attach
     });
 }
-main().catch(console.error);
+if (typeof require !== 'undefined' && require.main === module) {
+    main().catch(console.error);
+}
 //# sourceMappingURL=cli.js.map

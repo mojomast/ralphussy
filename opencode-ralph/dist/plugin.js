@@ -10,8 +10,8 @@ const defaultConfig = {
     completionPromise: 'COMPLETE',
     autoCommit: true,
     staleTimeout: 3600,
-    progressFile: '.ralph/progress.md',
-    historyFile: '.ralph/history.json'
+    progressFile: 'projects/.ralph/progress.md',
+    historyFile: 'projects/.ralph/history.json'
 };
 exports.defaultConfig = defaultConfig;
 let config = { ...defaultConfig };

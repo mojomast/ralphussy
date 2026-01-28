@@ -22,5 +22,9 @@
     "@opencode-ai/plugin": ">=1.1.0",
     "@opencode-ai/sdk": ">=1.1.0",
     "zod": ">=3.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.1.0",
+    "typescript": "^5.9.3"
   }
 }
