@@ -52,6 +52,7 @@ export interface TaskCost {
 }
 export declare class SwarmDatabase {
     private db;
+    private logCache;
     constructor(dbPath: string);
     close(): void;
     getCurrentRun(): SwarmRun | null;
@@ -78,6 +79,7 @@ export declare class SwarmDatabase {
         total_prompt_tokens: number;
         total_completion_tokens: number;
     };
+    private readLogFile;
     getRecentLogs(runId: string, limit?: number): Array<{
         worker_num: string;
         log_line: string;
