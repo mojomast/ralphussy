@@ -3,6 +3,7 @@ import path from 'path';
 import fs from 'fs';
 export class SwarmDatabase {
     db;
+    logCache = new Map();
     constructor(dbPath) {
         const absolutePath = path.resolve(dbPath);
         if (!fs.existsSync(absolutePath)) {
@@ -100,6 +101,45 @@ export class SwarmDatabase {
     `).get(runId);
         return costs;
     }
+    readLogFile(filePath, stats) {
+        const cached = this.logCache.get(filePath);
+        if (cached && cached.mtime === stats.mtimeMs && cached.size === stats.size) {
+            return cached.lines;
+        }
+        let content = '';
+        const BUFFER_SIZE = 64 * 1024; // 64KB
+        if (stats.size > BUFFER_SIZE) {
+            const fd = fs.openSync(filePath, 'r');
+            try {
+                const buffer = Buffer.alloc(BUFFER_SIZE);
+                const position = stats.size - BUFFER_SIZE;
+                const bytesRead = fs.readSync(fd, buffer, 0, BUFFER_SIZE, position);
+                content = buffer.toString('utf-8', 0, bytesRead);
+                // If we did a partial read, the first line might be incomplete.
+                // We find the first newline and discard everything before it.
+                if (position > 0) {
+                    const firstNewline = content.indexOf('\n');
+                    if (firstNewline !== -1) {
+                        content = content.substring(firstNewline + 1);
+                    }
+                }
+            }
+            finally {
+                fs.closeSync(fd);
+            }
+        }
+        else {
+            content = fs.readFileSync(filePath, 'utf-8');
+        }
+        const lines = content.split('\n').reverse().filter(line => line.trim());
+        // Cache the result
+        this.logCache.set(filePath, {
+            mtime: stats.mtimeMs,
+            size: stats.size,
+            lines
+        });
+        return lines;
+    }
     getRecentLogs(runId, limit = 20) {
         const ralphDir = process.env.RALPH_DIR || path.join(process.env.HOME || '', 'projects', '.ralph');
         const runDir = path.join(ralphDir, 'swarm', 'runs', runId);
@@ -113,17 +153,17 @@ export class SwarmDatabase {
                 const logsDir = path.join(runDir, workerDir.name, 'logs');
                 if (!fs.existsSync(logsDir))
                     continue;
-                const logFiles = fs.readdirSync(logsDir)
+                // Optimize: Get stats once and sort
+                const logEntries = fs.readdirSync(logsDir)
                     .filter(file => file.endsWith('.log'))
-                    .sort((a, b) => {
-                    const statA = fs.statSync(path.join(logsDir, a));
-                    const statB = fs.statSync(path.join(logsDir, b));
-                    return statB.mtimeMs - statA.mtimeMs;
-                });
-                for (const logFile of logFiles) {
-                    const logPath = path.join(logsDir, logFile);
-                    const stats = fs.statSync(logPath);
-                    const lines = fs.readFileSync(logPath, 'utf-8').split('\n').reverse().filter(line => line.trim());
+                    .map(file => {
+                    const fullPath = path.join(logsDir, file);
+                    // We need stats for both sorting and reading
+                    return { file, fullPath, stats: fs.statSync(fullPath) };
+                })
+                    .sort((a, b) => b.stats.mtimeMs - a.stats.mtimeMs);
+                for (const { fullPath, stats } of logEntries) {
+                    const lines = this.readLogFile(fullPath, stats);
                     for (const line of lines) {
                         logs.push({
                             worker_num: workerDir.name.replace('worker-', ''),
