@@ -21,6 +21,7 @@ setup_test_env() {
     export HISTORY_FILE="$RALPH_DIR/history.json"
     export LOG_DIR="$RALPH_DIR/logs"
     export RUNS_DIR="$RALPH_DIR/runs"
+    export CURRENT_RUN_FILE="$RUNS_DIR/current"
     export CONTEXT_FILE="$RALPH_DIR/context.md"
     export PROGRESS_FILE="$RALPH_DIR/progress.md"
     export BLOCKERS_FILE="$RALPH_DIR/blockers.txt"
