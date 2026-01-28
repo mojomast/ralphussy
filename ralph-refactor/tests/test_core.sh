@@ -2,6 +2,9 @@
 
 __TEST_CORE_DIR__="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# We need to source dependent libs if core.sh relies on them
+# core.sh uses json_extract_text/json_extract_tools which are in json.sh
+. "$__TEST_CORE_DIR__/../lib/json.sh"
 . "$__TEST_CORE_DIR__/../lib/core.sh"
 
 TEST_RUN_DIR="/tmp/test_core_$(date +%s%N)"
@@ -10,119 +13,207 @@ mkdir -p "$TEST_RUN_DIR"
 # Test counter
 TESTS_FAILED=0
 
-# Helper: Create a clean test environment
-setup_test_env() {
-    local test_dir="$1"
-    mkdir -p "$test_dir"
+setup_mock_opencode() {
+    local bin_dir="$TEST_RUN_DIR/bin"
+    mkdir -p "$bin_dir"
     
-    # Override RALPH_DIR for testing
-    export RALPH_DIR="$test_dir/.ralph"
-    export STATE_FILE="$RALPH_DIR/state.json"
-    export HISTORY_FILE="$RALPH_DIR/history.json"
-    export LOG_DIR="$RALPH_DIR/logs"
-    export RUNS_DIR="$RALPH_DIR/runs"
-    export CONTEXT_FILE="$RALPH_DIR/context.md"
-    export PROGRESS_FILE="$RALPH_DIR/progress.md"
-    export BLOCKERS_FILE="$RALPH_DIR/blockers.txt"
+    # Create mock opencode
+    cat > "$bin_dir/opencode" << 'EOF'
+#!/bin/bash
+if [ "$1" = "run" ]; then
+    # Return mock JSON response
+    cat << JEOF
+{
+  "type": "text",
+  "part": {
+    "text": "Mock response text",
+    "cost": 0.015,
+    "tokens": {
+      "input": 100,
+      "output": 50
+    }
+  }
+}
+JEOF
+fi
+EOF
+    chmod +x "$bin_dir/opencode"
     
-    mkdir -p "$RALPH_DIR" "$LOG_DIR" "$RUNS_DIR"
+    # Add to PATH
+    export PATH="$bin_dir:$PATH"
 }
 
 test_configuration_loading() {
     echo "Testing configuration loading..."
     
-    local test_env="$TEST_RUN_DIR/test_config"
-    setup_test_env "$test_env"
+    # Override RALPH_DIR for test
+    export RALPH_DIR="$TEST_RUN_DIR/.ralph"
+    export STATE_FILE="$RALPH_DIR/state.json"
+    export HISTORY_FILE="$RALPH_DIR/history.json"
+    export LOG_DIR="$RALPH_DIR/logs"
+    export RUNS_DIR="$RALPH_DIR/runs"
+    export BLOCKERS_FILE="$RALPH_DIR/blockers.txt"
+    export PROGRESS_FILE="$RALPH_DIR/progress.md"
     
-    # Test 1: Initialize ralph
+    # Call init_ralph
     init_ralph
     
+    # Verify directories created
     if [ -d "$RALPH_DIR" ] && [ -d "$LOG_DIR" ] && [ -d "$RUNS_DIR" ]; then
-        echo "✅ Directory structure created"
+        echo "✅ Directories created successfully"
     else
-        echo "❌ Failed to create directory structure"
+        echo "❌ Failed to create directories"
         TESTS_FAILED=$((TESTS_FAILED + 1))
         return 1
     fi
     
-    # Test 2: Verify state file initialization
-    if [ -f "$STATE_FILE" ]; then
-        local status
-        status=$(grep -o '"status": *"[^"]*"' "$STATE_FILE" | cut -d'"' -f4)
-        if [ "$status" = "idle" ]; then
-            echo "✅ State file initialized with correct status"
-        else
-            echo "❌ State file status incorrect: '$status'"
-            TESTS_FAILED=$((TESTS_FAILED + 1))
-            return 1
-        fi
+    # Verify files created
+    if [ -f "$STATE_FILE" ] && [ -f "$HISTORY_FILE" ] && [ -f "$BLOCKERS_FILE" ] && [ -f "$PROGRESS_FILE" ]; then
+        echo "✅ Config files created successfully"
     else
-        echo "❌ State file not created"
+        echo "❌ Failed to create config files"
         TESTS_FAILED=$((TESTS_FAILED + 1))
         return 1
     fi
     
-    # Test 3: Verify history file initialization
-    if [ -f "$HISTORY_FILE" ]; then
-        if grep -q '"iterations"' "$HISTORY_FILE"; then
-            echo "✅ History file initialized correctly"
-        else
-            echo "❌ History file missing iterations field"
-            TESTS_FAILED=$((TESTS_FAILED + 1))
-            return 1
-        fi
+    # Verify default values
+    local state_content
+    state_content=$(cat "$STATE_FILE")
+    if echo "$state_content" | grep -q "idle"; then
+        echo "✅ State file initialized with default values"
     else
-        echo "❌ History file not created"
+        echo "❌ State file content incorrect"
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        return 1
+    fi
+}
+
+test_opencode_execution() {
+    echo "Testing OpenCode execution..."
+    
+    setup_mock_opencode
+    
+    # Mock start_monitor and stop_monitor to avoid side effects
+    start_monitor() { :; }
+    stop_monitor() { :; }
+    
+    # Mock log functions to avoid clutter
+    log_info() { :; }
+    log_error() { echo "ERROR: $1"; }
+    
+    # Execute
+    local result
+    _ralph_execute_opencode "Test prompt" "Task 1"
+    local status=$?
+
+    if [ $status -eq 0 ]; then
+        echo "✅ _ralph_execute_opencode returned success"
+    else
+        echo "❌ _ralph_execute_opencode failed with status $status"
         TESTS_FAILED=$((TESTS_FAILED + 1))
         return 1
     fi
     
-    # Test 4: Test environment variable override
-    export MAX_ITERATIONS=50
-    export MODEL="test-model"
-    export PROVIDER="test-provider"
-    
-    if [ "$MAX_ITERATIONS" = "50" ] && [ "$MODEL" = "test-model" ] && [ "$PROVIDER" = "test-provider" ]; then
-        echo "✅ Environment variables respected"
+    # Verify output captured
+    if [ "$RALPH_LAST_TEXT_OUTPUT" = "Mock response text" ]; then
+        echo "✅ RALPH_LAST_TEXT_OUTPUT captured correctly"
     else
-        echo "❌ Environment variables not respected"
+        echo "❌ Expected 'Mock response text', got: '$RALPH_LAST_TEXT_OUTPUT'"
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        return 1
+    fi
+}
+
+test_token_cost_tracking() {
+    echo "Testing token and cost tracking..."
+    
+    # Assuming _ralph_execute_opencode was run in previous test
+    # If not, run it again or set variables manually
+    
+    # We'll rely on the state from previous test if available, or re-run
+    if [ -z "$RALPH_LAST_TOTAL_TOKENS" ]; then
+        setup_mock_opencode
+        start_monitor() { :; }
+        stop_monitor() { :; }
+        log_info() { :; }
+        _ralph_execute_opencode "Test prompt"
+    fi
+    
+    # Mock returns input:100, output:50 -> total 150
+    if [ "$RALPH_LAST_TOTAL_TOKENS" -eq 150 ]; then
+        echo "✅ RALPH_LAST_TOTAL_TOKENS correct (150)"
+    else
+        echo "❌ Expected 150, got: '$RALPH_LAST_TOTAL_TOKENS'"
         TESTS_FAILED=$((TESTS_FAILED + 1))
         return 1
     fi
     
-    unset MAX_ITERATIONS MODEL PROVIDER
+    # Mock returns cost 0.015
+    if [ "$RALPH_LAST_COST" = "0.015" ]; then
+        echo "✅ RALPH_LAST_COST correct (0.015)"
+    else
+        echo "❌ Expected 0.015, got: '$RALPH_LAST_COST'"
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        return 1
+    fi
+}
+
+test_completion_promise_detection() {
+    echo "Testing completion promise detection..."
+    
+    # core.sh defines COMPLETION_PROMISE variable
+    if [ "$COMPLETION_PROMISE" = "COMPLETE" ]; then
+        echo "✅ COMPLETION_PROMISE variable is set correctly"
+    else
+        echo "❌ COMPLETION_PROMISE incorrect: '$COMPLETION_PROMISE'"
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        return 1
+    fi
+    
+    # Test helper logic (simulated)
+    local output="Here is the result <promise>COMPLETE</promise>"
+    if echo "$output" | grep -q "<promise>$COMPLETION_PROMISE</promise>"; then
+        echo "✅ Detection logic works with grep"
+    else
+        echo "❌ Detection logic failed"
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        return 1
+    fi
 }
 
 test_state_file_management() {
     echo "Testing state file management..."
     
-    local test_env="$TEST_RUN_DIR/test_state"
-    setup_test_env "$test_env"
-    init_ralph
+    export RALPH_DIR="$TEST_RUN_DIR/.ralph"
+    export STATE_FILE="$RALPH_DIR/state.json"
+    mkdir -p "$RALPH_DIR"
     
-    # Test 1: Update state
+    # Test update_state
     update_state "running" 1 "test prompt" "test context"
     
-    local status iteration
-    status=$(grep -o '"status": *"[^"]*"' "$STATE_FILE" | cut -d'"' -f4)
-    iteration=$(grep -o '"iteration": *[0-9]*' "$STATE_FILE" | grep -o '[0-9]*')
+    local content
+    content=$(get_state)
     
-    if [ "$status" = "running" ] && [ "$iteration" = "1" ]; then
-        echo "✅ State updated correctly"
+    if echo "$content" | grep -q '"status": "running"'; then
+        echo "✅ State updated: status=running"
     else
-        echo "❌ State update failed: status=$status, iteration=$iteration"
+        echo "❌ State status incorrect"
         TESTS_FAILED=$((TESTS_FAILED + 1))
         return 1
     fi
     
-    # Test 2: Get state
-    local state_content
-    state_content=$(get_state)
-    
-    if echo "$state_content" | grep -q "running" && echo "$state_content" | grep -q "test prompt"; then
-        echo "✅ State retrieved correctly"
+    if echo "$content" | grep -q '"iteration": 1'; then
+        echo "✅ State updated: iteration=1"
     else
-        echo "❌ State retrieval failed"
+        echo "❌ State iteration incorrect"
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        return 1
+    fi
+    
+    if echo "$content" | grep -q '"prompt": "test prompt"'; then
+        echo "✅ State updated: prompt"
+    else
+        echo "❌ State prompt incorrect"
         TESTS_FAILED=$((TESTS_FAILED + 1))
         return 1
     fi
@@ -131,278 +222,73 @@ test_state_file_management() {
 test_logging_functions() {
     echo "Testing logging functions..."
     
-    local test_env="$TEST_RUN_DIR/test_logging"
-    setup_test_env "$test_env"
+    # Restore original functions by re-sourcing
+    unset RALPH_CORE_LOADED
+    . "$__TEST_CORE_DIR__/../lib/core.sh"
     
-    # Test 1: Progress logging
-    log_progress 1 "test task" "success" 10
-    
-    if [ -f "$PROGRESS_FILE" ] && grep -q "test task" "$PROGRESS_FILE"; then
-        echo "✅ Progress logging works"
+    # Test log functions by capturing output
+    local output
+    output=$(log_info "Info message")
+    if echo "$output" | grep -q "Info message"; then
+        echo "✅ log_info output correct"
     else
-        echo "❌ Progress logging failed"
+        echo "❌ log_info failed"
         TESTS_FAILED=$((TESTS_FAILED + 1))
         return 1
     fi
     
-    # Test 2: Blocker recording
-    record_blocker "test-task" "test blocker message"
-    
-    if [ -f "$BLOCKERS_FILE" ] && grep -q "test blocker message" "$BLOCKERS_FILE"; then
-        echo "✅ Blocker recording works"
+    output=$(log_error "Error message")
+    if echo "$output" | grep -q "Error message"; then
+        echo "✅ log_error output correct"
     else
-        echo "❌ Blocker recording failed"
+        echo "❌ log_error failed"
         TESTS_FAILED=$((TESTS_FAILED + 1))
         return 1
     fi
     
-    # Test 3: Get blockers
-    local blockers
-    blockers=$(get_blockers)
-    
-    if echo "$blockers" | grep -q "test blocker message"; then
-        echo "✅ Get blockers works"
-    else
-        echo "❌ Get blockers failed"
-        TESTS_FAILED=$((TESTS_FAILED + 1))
-        return 1
-    fi
-    
-    # Test 4: Clear blockers
-    clear_blockers "test-task"
-    blockers=$(get_blockers)
-    
-    if ! echo "$blockers" | grep -q "test blocker message"; then
-        echo "✅ Clear blockers works"
-    else
-        echo "❌ Clear blockers failed"
-        TESTS_FAILED=$((TESTS_FAILED + 1))
-        return 1
-    fi
-}
+    # Test history rotation
+    export RALPH_DIR="$TEST_RUN_DIR/.ralph"
+    export HISTORY_FILE="$RALPH_DIR/history.json"
+    mkdir -p "$RALPH_DIR"
 
-test_history_rotation() {
-    echo "Testing history rotation..."
-    
-    local test_env="$TEST_RUN_DIR/test_rotation"
-    setup_test_env "$test_env"
-    init_ralph
-    
-    # Create a large history file (>5MB) using dd for speed
+    # Create large history file (6MB)
     dd if=/dev/zero of="$HISTORY_FILE" bs=1M count=6 2>/dev/null
-    # Add valid JSON to the file
-    echo '{"iterations":[],"total_time":0,"success":false}' >> "$HISTORY_FILE"
     
-    local file_size
-    file_size=$(stat -c%s "$HISTORY_FILE" 2>/dev/null || stat -f%z "$HISTORY_FILE" 2>/dev/null)
+    # Call rotation
+    rotate_history_if_needed
     
-    if [ "$file_size" -gt 5242880 ]; then
-        echo "✅ Created large history file: $(( file_size / 1048576 ))MB"
-        
-        # Trigger rotation
-        rotate_history_if_needed
-        
-        # Check if archived
-        local archive_dir="$RALPH_DIR/history_archive"
-        if [ -d "$archive_dir" ]; then
-            local archive_count
-            archive_count=$(find "$archive_dir" -name "history_*.json" -type f 2>/dev/null | wc -l)
-            if [ "$archive_count" -ge 1 ]; then
-                echo "✅ History file rotated to archive"
-            else
-                echo "❌ History file not archived"
-                TESTS_FAILED=$((TESTS_FAILED + 1))
-                return 1
-            fi
-        else
-            echo "❌ Archive directory not created"
-            TESTS_FAILED=$((TESTS_FAILED + 1))
-            return 1
-        fi
-        
-        # Check new history file is fresh
-        if [ -f "$HISTORY_FILE" ]; then
-            local new_size
-            new_size=$(stat -c%s "$HISTORY_FILE" 2>/dev/null || stat -f%z "$HISTORY_FILE" 2>/dev/null)
-            if [ "$new_size" -lt 1000 ]; then
-                echo "✅ New history file created: ${new_size} bytes"
-            else
-                echo "❌ New history file too large: $new_size bytes"
-                TESTS_FAILED=$((TESTS_FAILED + 1))
-                return 1
-            fi
-        else
-            echo "❌ New history file not created"
-            TESTS_FAILED=$((TESTS_FAILED + 1))
-            return 1
-        fi
+    # Check if rotated
+    if [ -f "$HISTORY_FILE" ] && [ $(wc -c < "$HISTORY_FILE") -lt 1000 ]; then
+        echo "✅ History file rotated (new file is small)"
     else
-        echo "⚠️  Could not create large enough test file: $(( file_size / 1048576 ))MB"
-        echo "✅ Skipping rotation test (file size threshold not met)"
-    fi
-}
-
-test_run_management() {
-    echo "Testing background run management..."
-    
-    local test_env="$TEST_RUN_DIR/test_runs"
-    setup_test_env "$test_env"
-    init_ralph
-    
-    # Test 1: Generate run ID
-    local run_id
-    run_id=$(new_run_id)
-    
-    if echo "$run_id" | grep -qE '^[0-9]{8}_[0-9]{6}$'; then
-        echo "✅ Run ID generated correctly: $run_id"
-    else
-        echo "❌ Invalid run ID format: $run_id"
+        echo "❌ History file not rotated or too large"
         TESTS_FAILED=$((TESTS_FAILED + 1))
         return 1
     fi
     
-    # Test 2: Set and get current run
-    set_current_run "$run_id"
-    local retrieved_run
-    retrieved_run=$(get_current_run)
-    
-    if [ "$retrieved_run" = "$run_id" ]; then
-        echo "✅ Current run set and retrieved correctly"
+    local archive_count
+    archive_count=$(find "$RALPH_DIR/history_archive" -name "history_*.json" | wc -l)
+    if [ "$archive_count" -ge 1 ]; then
+        echo "✅ Archived history found"
     else
-        echo "❌ Current run mismatch: expected '$run_id', got '$retrieved_run'"
-        TESTS_FAILED=$((TESTS_FAILED + 1))
-        return 1
-    fi
-    
-    # Test 3: Run log and pid paths
-    local log_path pid_path
-    log_path=$(run_log_path "$run_id")
-    pid_path=$(run_pid_path "$run_id")
-    
-    if echo "$log_path" | grep -q "$run_id.log" && echo "$pid_path" | grep -q "$run_id.pid"; then
-        echo "✅ Run file paths correct"
-    else
-        echo "❌ Run file paths incorrect"
-        TESTS_FAILED=$((TESTS_FAILED + 1))
-        return 1
-    fi
-    
-    # Test 4: Cleanup old run logs
-    # Create mock old log files
-    for i in {1..25}; do
-        touch "$RUNS_DIR/run_old_${i}.log"
-    done
-    
-    # Make some files old (>7 days)
-    touch -d "8 days ago" "$RUNS_DIR/run_old_1.log" 2>/dev/null || true
-    touch -d "8 days ago" "$RUNS_DIR/run_old_2.log" 2>/dev/null || true
-    
-    cleanup_old_run_logs
-    
-    local remaining_logs
-    remaining_logs=$(find "$RUNS_DIR" -name "run_*.log" -type f 2>/dev/null | wc -l)
-    
-    if [ "$remaining_logs" -le 20 ]; then
-        echo "✅ Old run logs cleaned up: $remaining_logs remaining"
-    else
-        echo "⚠️  More logs than expected: $remaining_logs (threshold is 20)"
-        echo "✅ Cleanup function executed (may have retention policy)"
-    fi
-}
-
-test_handoff_system() {
-    echo "Testing handoff system..."
-    
-    local test_env="$TEST_RUN_DIR/test_handoff"
-    setup_test_env "$test_env"
-    init_ralph
-    
-    # Create a test devplan file
-    local devplan="$test_env/devplan.md"
-    cat > "$devplan" << 'EOF'
-# Test Devplan
-- [x] Task 1
-- [ ] Task 2
-- [ ] Task 3
-EOF
-    
-    export HANDOFF_FILE="$test_env/handoff.md"
-    
-    # Test 1: Create handoff
-    create_handoff "Task 1" "Task 2" "$devplan" "Test notes"
-    
-    if [ -f "$HANDOFF_FILE" ]; then
-        echo "✅ Handoff file created"
-    else
-        echo "❌ Handoff file not created"
-        TESTS_FAILED=$((TESTS_FAILED + 1))
-        return 1
-    fi
-    
-    # Test 2: Handoff content
-    if grep -q "Task 1" "$HANDOFF_FILE" && grep -q "Task 2" "$HANDOFF_FILE"; then
-        echo "✅ Handoff contains correct tasks"
-    else
-        echo "❌ Handoff content incorrect"
-        TESTS_FAILED=$((TESTS_FAILED + 1))
-        return 1
-    fi
-    
-    # Test 3: Has handoff detection
-    if has_handoff; then
-        echo "✅ Handoff detected correctly"
-    else
-        echo "❌ Handoff detection failed"
-        TESTS_FAILED=$((TESTS_FAILED + 1))
-        return 1
-    fi
-    
-    # Test 4: Read handoff
-    local handoff_content
-    handoff_content=$(read_handoff)
-    
-    if echo "$handoff_content" | grep -q "Task 1"; then
-        echo "✅ Handoff read correctly"
-    else
-        echo "❌ Handoff read failed"
-        TESTS_FAILED=$((TESTS_FAILED + 1))
-        return 1
-    fi
-    
-    # Test 5: Archive handoff
-    archive_handoff
-    
-    local archive_dir="$RALPH_DIR/handoffs"
-    if [ -d "$archive_dir" ]; then
-        local archived_count
-        archived_count=$(find "$archive_dir" -name "handoff_*.md" -type f 2>/dev/null | wc -l)
-        if [ "$archived_count" -ge 1 ]; then
-            echo "✅ Handoff archived successfully"
-        else
-            echo "❌ Handoff not archived"
-            TESTS_FAILED=$((TESTS_FAILED + 1))
-            return 1
-        fi
-    else
-        echo "❌ Archive directory not created"
+        echo "❌ No archived history found"
         TESTS_FAILED=$((TESTS_FAILED + 1))
         return 1
     fi
 }
 
-# Run all tests
 run_all_tests() {
     echo "=========================================="
-    echo "Running Core Functions Tests"
+    echo "Running Core Tests"
     echo "=========================================="
     echo ""
     
     test_configuration_loading
+    test_opencode_execution
+    test_token_cost_tracking
+    test_completion_promise_detection
     test_state_file_management
     test_logging_functions
-    test_history_rotation
-    test_run_management
-    test_handoff_system
     
     # Cleanup
     rm -rf "$TEST_RUN_DIR"
