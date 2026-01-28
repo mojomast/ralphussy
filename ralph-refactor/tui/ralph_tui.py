@@ -1661,7 +1661,8 @@ class RalphTUI(App):
 
     async def refresh_status_async(self) -> None:
         """Refresh swarm status periodically."""
-        run_info = self.db_reader.get_latest_run()
+        loop = asyncio.get_running_loop()
+        run_info = await loop.run_in_executor(None, self.db_reader.get_latest_run)
 
         if not run_info:
             return
@@ -1671,13 +1672,13 @@ class RalphTUI(App):
             return
 
         # Update workers
-        workers = self.db_reader.get_run_workers(run_id)
+        workers = await loop.run_in_executor(None, self.db_reader.get_run_workers, run_id)
         worker_pane = self.query_one("#worker-pane", WorkerPane)
         worker_pane.update_workers(workers)
 
         # Update progress
-        stats = self.db_reader.get_task_stats(run_id)
-        total_cost = self.db_reader.get_run_cost(run_id)
+        stats = await loop.run_in_executor(None, self.db_reader.get_task_stats, run_id)
+        total_cost = await loop.run_in_executor(None, self.db_reader.get_run_cost, run_id)
         progress_pane = self.query_one("#progress-pane", ProgressPane)
         progress_pane.update_progress(run_info, stats, total_cost)
 
@@ -1698,7 +1699,7 @@ class RalphTUI(App):
                 log_pane.write_log(f"New swarm run started: {run_id[:12]}...", "info")
 
         # We need to fetch tasks to check for status changes
-        current_tasks = self.db_reader.get_run_tasks(run_id)
+        current_tasks = await loop.run_in_executor(None, self.db_reader.get_run_tasks, run_id)
         chat_pane = self.query_one("#chat-pane", ChatPane)
 
         for task in current_tasks:
