@@ -1438,6 +1438,38 @@ class FilePane(Vertical):
         self.set_root(self.root_path)
 
 
+class AsyncThreadedReader:
+    """Reads lines from a blocking file object in a separate thread."""
+    def __init__(self, file_obj: Any, loop: asyncio.AbstractEventLoop):
+        self.file_obj = file_obj
+        self.loop = loop
+        self.queue: asyncio.Queue = asyncio.Queue()
+        self.finished = False
+        self._start_thread()
+
+    def _start_thread(self) -> None:
+        def reader() -> None:
+            try:
+                # Iterate over lines directly
+                for line in self.file_obj:
+                    self.loop.call_soon_threadsafe(self.queue.put_nowait, line)
+            except Exception:
+                pass
+            finally:
+                self.loop.call_soon_threadsafe(self.queue.put_nowait, None)
+
+        self.loop.run_in_executor(None, reader)
+
+    async def readline(self) -> str:
+        if self.finished:
+            return ""
+        item = await self.queue.get()
+        if item is None:
+            self.finished = True
+            return ""
+        return item
+
+
 class RalphTUI(App):
     """Main Ralph TUI Application."""
 
@@ -2241,21 +2273,20 @@ class RalphTUI(App):
             return
         name = self.process_names.get(pid, pid)
 
+        # Optimization: Use AsyncThreadedReader
+        reader = AsyncThreadedReader(proc.stdout, asyncio.get_running_loop())
+
         try:
             if name == "orchestrator":
-                await self._read_orchestrator_output(proc, chat_pane)
+                await self._read_orchestrator_output(reader, chat_pane)
                 return
 
             spinner_re = re.compile(r"^\s*(?:[|\\/\-]|[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏])\s")
             last_spinner_emit = 0.0
             last_spinner_text = ""
 
-            stdout = proc.stdout
-            if stdout is None:
-                return
-
             while True:
-                line = await asyncio.get_event_loop().run_in_executor(None, stdout.readline)
+                line = await reader.readline()
                 if not line:
                     break
 
@@ -2301,7 +2332,7 @@ class RalphTUI(App):
                 self.refresh_timer.stop()
             self.refresh_timer = self.set_interval(self.config.refresh_interval_sec, self.refresh_status)
 
-    async def _read_orchestrator_output(self, proc: subprocess.Popen, chat_pane: ChatPane) -> None:
+    async def _read_orchestrator_output(self, reader: AsyncThreadedReader, chat_pane: ChatPane) -> None:
         """Read opencode output without flooding the chat.
 
         We run the orchestrator as `opencode run --format json` and only emit the
@@ -2342,16 +2373,12 @@ class RalphTUI(App):
 
             return ""
 
-        stdout = proc.stdout
-        if stdout is None:
-            return
-
         # Keep a small buffer for debugging if JSON parsing fails.
         raw_debug = ""
         last_text = ""
         try:
             while True:
-                line = await asyncio.get_event_loop().run_in_executor(None, stdout.readline)
+                line = await reader.readline()
                 if not line:
                     break
                 raw_debug += line
