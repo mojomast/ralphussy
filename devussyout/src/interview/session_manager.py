@@ -87,8 +87,8 @@ class SessionManager:
         """Check if a session exists."""
         return self._get_session_file(session_id).exists()
 
-    def save_state(self) -> None:
-        """Save current session state to disk."""
+    async def save_state(self) -> None:
+        """Save current session state to disk asynchronously."""
         if not self.state or not self.manager:
             return
 
@@ -99,8 +99,13 @@ class SessionManager:
 
         # Save to file
         session_file = self._get_session_file(self.state.session_id)
-        with open(session_file, 'w') as f:
-            json.dump(self.state.to_dict(), f, indent=2)
+        state_data = self.state.to_dict()
+
+        def _write_file():
+            with open(session_file, 'w') as f:
+                json.dump(state_data, f, indent=2)
+
+        await asyncio.to_thread(_write_file)
 
     def load_state(self, session_id: str) -> bool:
         """Load session state from disk.
@@ -189,7 +194,7 @@ class SessionManager:
         self.state.message_count = 1
 
         # Save state
-        self.save_state()
+        await self.save_state()
 
         return response
 
@@ -213,7 +218,7 @@ class SessionManager:
         self.state.message_count += 1
 
         # Save state
-        self.save_state()
+        await self.save_state()
 
         # If complete, clear active session
         if self.manager.is_complete:
