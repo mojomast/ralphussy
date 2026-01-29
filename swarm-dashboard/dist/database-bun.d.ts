@@ -78,11 +78,11 @@ export declare class SwarmDatabase {
         total_prompt_tokens: number;
         total_completion_tokens: number;
     };
-    getRecentLogs(runId: string, limit?: number): Array<{
+    getRecentLogs(runId: string, limit?: number): Promise<Array<{
         worker_num: string;
         log_line: string;
         timestamp: number;
-    }>;
+    }>>;
 }
 export declare function getSwarmDatabasePath(): string;
 export declare function createSwarmDatabase(dbPath?: string): SwarmDatabase;
