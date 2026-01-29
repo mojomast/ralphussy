@@ -355,7 +355,13 @@ export class SwarmDashboard {
     // Build mapping of tasks by id for quick lookup
     const allTasks = this.db.getTasksByRun(runId);
     const taskById = new Map<number, any>();
-    for (const t of allTasks) taskById.set(t.id, t);
+    const taskByWorkerId = new Map<number, any>();
+    for (const t of allTasks) {
+      taskById.set(t.id, t);
+      if (t.worker_id !== null && !taskByWorkerId.has(t.worker_id)) {
+        taskByWorkerId.set(t.worker_id, t);
+      }
+    }
 
     // Build stable worker lines (include branch and task first line). We'll
     // render a window slice to avoid modifying nodes while scrolling.
@@ -363,7 +369,7 @@ export class SwarmDashboard {
     workers.forEach((worker, index) => {
       const statusColor = this.getStatusColor(worker.status);
       const statusIcon = this.getStatusIcon(worker.status);
-      const assignedTaskId = worker.current_task_id ?? (allTasks.find(t => t.worker_id === worker.id)?.id ?? null);
+      const assignedTaskId = worker.current_task_id ?? (taskByWorkerId.get(worker.id)?.id ?? null);
       const taskName = assignedTaskId ? (String(taskById.get(assignedTaskId)?.task_text || '').split('\n')[0] || '') : '';
       const branch = worker.branch_name ? ` ${worker.branch_name}` : '';
       const parts = [`${index + 1}. W${worker.worker_num.toString().padStart(2)}`, statusIcon, worker.status];
