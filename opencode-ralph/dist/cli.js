@@ -41,10 +41,11 @@ class RalphCLI {
     stateDir;
     progressFile;
     historyFile;
+    history = [];
     constructor() {
-        this.stateDir = '.ralph';
+        this.stateDir = 'projects/.ralph';
         this.progressFile = path.join(this.stateDir, 'progress.md');
-        this.historyFile = path.join(this.stateDir, 'history.json');
+        this.historyFile = path.join(this.stateDir, 'history.jsonl');
     }
     async run(options) {
         console.log('🚀 Starting Ralph autonomous loop...\n');
@@ -152,18 +153,10 @@ class RalphCLI {
         return tools;
     }
     detectStruggle() {
-        if (!fs.existsSync(this.historyFile))
+        if (this.history.length < 3)
             return false;
-        try {
-            const history = JSON.parse(fs.readFileSync(this.historyFile, 'utf-8'));
-            if (history.length < 3)
-                return false;
-            const recent = history.slice(-3);
-            return !recent.some((h) => h.tools?.some((t) => ['Write', 'Edit', 'Bash'].includes(t)));
-        }
-        catch {
-            return false;
-        }
+        const recent = this.history.slice(-3);
+        return !recent.some((h) => h.tools?.some((t) => ['Write', 'Edit', 'Bash'].includes(t)));
     }
     ensureStateDir() {
         fs.mkdirSync(this.stateDir, { recursive: true });
@@ -181,7 +174,10 @@ class RalphCLI {
         };
         fs.writeFileSync(path.join(this.stateDir, 'state.json'), JSON.stringify(state, null, 2));
         fs.writeFileSync(path.join(this.stateDir, 'progress.md'), `# Ralph Progress Log\n\nStarted: ${new Date().toISOString()}\n\n`);
-        fs.writeFileSync(this.historyFile, JSON.stringify({ iterations: [], totalTime: 0 }, null, 2));
+        // Initialize in-memory history
+        this.history = [];
+        // Clear/Create history file
+        fs.writeFileSync(this.historyFile, '');
     }
     logProgress(iteration, duration, tools) {
         const log = `\n## Iteration ${iteration} - ${new Date().toISOString()}\n` +
@@ -190,16 +186,15 @@ class RalphCLI {
         fs.appendFileSync(this.progressFile, log);
     }
     appendHistory(iteration, duration, tools, success) {
-        const history = JSON.parse(fs.readFileSync(this.historyFile, 'utf-8'));
-        history.iterations.push({
+        const entry = {
             iteration,
             timestamp: new Date().toISOString(),
             duration,
             tools,
             success
-        });
-        history.totalTime = history.iterations.reduce((sum, h) => sum + h.duration, 0);
-        fs.writeFileSync(this.historyFile, JSON.stringify(history, null, 2));
+        };
+        this.history.push(entry);
+        fs.appendFileSync(this.historyFile, JSON.stringify(entry) + '\n');
     }
     printSummary(iteration, success) {
         console.log('\n═══════════════════════════════════════════');
@@ -207,9 +202,8 @@ class RalphCLI {
         console.log('═══════════════════════════════════════════');
         console.log(`Status:      ${success ? '✅ Completed' : '⚠️  Max iterations'}`);
         console.log(`Iterations:  ${iteration}`);
-        if (fs.existsSync(this.historyFile)) {
-            const history = JSON.parse(fs.readFileSync(this.historyFile, 'utf-8'));
-            const totalTime = Math.round(history.totalTime / 1000);
+        if (this.history.length > 0) {
+            const totalTime = Math.round(this.history.reduce((sum, h) => sum + h.duration, 0) / 1000);
             console.log(`Total time:  ${totalTime}s`);
             console.log(`Log file:    ${this.progressFile}`);
         }
@@ -221,9 +215,12 @@ class RalphCLI {
             return;
         }
         const state = JSON.parse(fs.readFileSync(path.join(this.stateDir, 'state.json'), 'utf-8'));
-        const history = fs.existsSync(this.historyFile)
-            ? JSON.parse(fs.readFileSync(this.historyFile, 'utf-8'))
-            : { iterations: [] };
+        let iterations = [];
+        if (fs.existsSync(this.historyFile)) {
+            const content = fs.readFileSync(this.historyFile, 'utf-8');
+            const lines = content.split('\n').filter(line => line.trim() !== '');
+            iterations = lines.map(line => JSON.parse(line));
+        }
         console.log('╔═══════════════════════════════════════════════════╗');
         console.log('║              Ralph Status                          ║');
         console.log('╚═══════════════════════════════════════════════════╝');
@@ -239,9 +236,9 @@ class RalphCLI {
         console.log(`   Promise:      ${state.completionPromise}`);
         console.log(`   Prompt:       ${state.prompt?.substring(0, 50)}...`);
         console.log('');
-        if (history.iterations?.length > 0) {
+        if (iterations.length > 0) {
             console.log('📊 HISTORY');
-            history.iterations.slice(-5).forEach((h) => {
+            iterations.slice(-5).forEach((h) => {
                 console.log(`   🔄 #${h.iteration}: ${Math.round(h.duration / 1000)}s | ${h.tools?.join(' ') || 'none'}`);
             });
             console.log('');

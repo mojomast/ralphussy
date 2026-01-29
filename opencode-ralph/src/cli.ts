@@ -17,11 +17,12 @@ class RalphCLI {
   private stateDir: string;
   private progressFile: string;
   private historyFile: string;
+  private history: any[] = [];
 
   constructor() {
     this.stateDir = 'projects/.ralph';
     this.progressFile = path.join(this.stateDir, 'progress.md');
-    this.historyFile = path.join(this.stateDir, 'history.json');
+    this.historyFile = path.join(this.stateDir, 'history.jsonl');
   }
 
   async run(options: RalphOptions): Promise<void> {
@@ -162,19 +163,12 @@ class RalphCLI {
   }
 
   private detectStruggle(): boolean {
-    if (!fs.existsSync(this.historyFile)) return false;
+    if (this.history.length < 3) return false;
 
-    try {
-      const history = JSON.parse(fs.readFileSync(this.historyFile, 'utf-8'));
-      if (history.length < 3) return false;
-
-      const recent = history.slice(-3);
-      return !recent.some((h: any) => 
-        h.tools?.some((t: string) => ['Write', 'Edit', 'Bash'].includes(t))
-      );
-    } catch {
-      return false;
-    }
+    const recent = this.history.slice(-3);
+    return !recent.some((h: any) =>
+      h.tools?.some((t: string) => ['Write', 'Edit', 'Bash'].includes(t))
+    );
   }
 
   private ensureStateDir(): void {
@@ -202,10 +196,10 @@ class RalphCLI {
       `# Ralph Progress Log\n\nStarted: ${new Date().toISOString()}\n\n`
     );
 
-    fs.writeFileSync(
-      this.historyFile,
-      JSON.stringify({ iterations: [], totalTime: 0 }, null, 2)
-    );
+    // Initialize in-memory history
+    this.history = [];
+    // Clear/Create history file
+    fs.writeFileSync(this.historyFile, '');
   }
 
   private logProgress(iteration: number, duration: number, tools: string[]): void {
@@ -217,16 +211,16 @@ class RalphCLI {
   }
 
   private appendHistory(iteration: number, duration: number, tools: string[], success: boolean): void {
-    const history = JSON.parse(fs.readFileSync(this.historyFile, 'utf-8'));
-    history.iterations.push({
+    const entry = {
       iteration,
       timestamp: new Date().toISOString(),
       duration,
       tools,
       success
-    });
-    history.totalTime = history.iterations.reduce((sum: number, h: any) => sum + h.duration, 0);
-    fs.writeFileSync(this.historyFile, JSON.stringify(history, null, 2));
+    };
+
+    this.history.push(entry);
+    fs.appendFileSync(this.historyFile, JSON.stringify(entry) + '\n');
   }
 
   private printSummary(iteration: number, success: boolean): void {
@@ -236,9 +230,8 @@ class RalphCLI {
     console.log(`Status:      ${success ? '✅ Completed' : '⚠️  Max iterations'}`);
     console.log(`Iterations:  ${iteration}`);
     
-    if (fs.existsSync(this.historyFile)) {
-      const history = JSON.parse(fs.readFileSync(this.historyFile, 'utf-8'));
-      const totalTime = Math.round(history.totalTime / 1000);
+    if (this.history.length > 0) {
+      const totalTime = Math.round(this.history.reduce((sum: number, h: any) => sum + h.duration, 0) / 1000);
       console.log(`Total time:  ${totalTime}s`);
       console.log(`Log file:    ${this.progressFile}`);
     }
@@ -253,9 +246,13 @@ class RalphCLI {
     }
 
     const state = JSON.parse(fs.readFileSync(path.join(this.stateDir, 'state.json'), 'utf-8'));
-    const history = fs.existsSync(this.historyFile) 
-      ? JSON.parse(fs.readFileSync(this.historyFile, 'utf-8'))
-      : { iterations: [] };
+
+    let iterations: any[] = [];
+    if (fs.existsSync(this.historyFile)) {
+      const content = fs.readFileSync(this.historyFile, 'utf-8');
+      const lines = content.split('\n').filter((line: string) => line.trim() !== '');
+      iterations = lines.map((line: string) => JSON.parse(line));
+    }
 
     console.log('╔═══════════════════════════════════════════════════╗');
     console.log('║              Ralph Status                          ║');
@@ -275,9 +272,9 @@ class RalphCLI {
     console.log(`   Prompt:       ${state.prompt?.substring(0, 50)}...`);
     console.log('');
 
-    if (history.iterations?.length > 0) {
+    if (iterations.length > 0) {
       console.log('📊 HISTORY');
-      history.iterations.slice(-5).forEach((h: any) => {
+      iterations.slice(-5).forEach((h: any) => {
         console.log(`   🔄 #${h.iteration}: ${Math.round(h.duration / 1000)}s | ${h.tools?.join(' ') || 'none'}`);
       });
       console.log('');
