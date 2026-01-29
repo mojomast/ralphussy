@@ -60,6 +60,7 @@ export interface TaskCost {
 
 export class SwarmDatabase {
   private db: Database.Database;
+  private getCurrentRunStmt: Database.Statement;
 
   constructor(dbPath: string) {
     const absolutePath = path.resolve(dbPath);
@@ -67,6 +68,12 @@ export class SwarmDatabase {
       throw new Error(`Database not found: ${absolutePath}`);
     }
     this.db = new Database(absolutePath, { readonly: true, fileMustExist: true });
+    this.getCurrentRunStmt = this.db.prepare(`
+      SELECT * FROM swarm_runs
+      WHERE status = 'running'
+      ORDER BY started_at DESC
+      LIMIT 1
+    `);
   }
 
   close(): void {
@@ -74,13 +81,7 @@ export class SwarmDatabase {
   }
 
   getCurrentRun(): SwarmRun | null {
-    const stmt = this.db.prepare(`
-      SELECT * FROM swarm_runs 
-      WHERE status = 'running' 
-      ORDER BY started_at DESC 
-      LIMIT 1
-    `);
-    return stmt.get() as SwarmRun | null;
+    return this.getCurrentRunStmt.get() as SwarmRun | null;
   }
 
   getWorkersByRun(runId: string): Worker[] {

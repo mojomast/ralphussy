@@ -3,24 +3,25 @@ import path from 'path';
 import fs from 'fs';
 export class SwarmDatabase {
     db;
+    getCurrentRunStmt;
     constructor(dbPath) {
         const absolutePath = path.resolve(dbPath);
         if (!fs.existsSync(absolutePath)) {
             throw new Error(`Database not found: ${absolutePath}`);
         }
         this.db = new Database(absolutePath, { readonly: true, fileMustExist: true });
-    }
-    close() {
-        this.db.close();
-    }
-    getCurrentRun() {
-        const stmt = this.db.prepare(`
+        this.getCurrentRunStmt = this.db.prepare(`
       SELECT * FROM swarm_runs 
       WHERE status = 'running' 
       ORDER BY started_at DESC 
       LIMIT 1
     `);
-        return stmt.get();
+    }
+    close() {
+        this.db.close();
+    }
+    getCurrentRun() {
+        return this.getCurrentRunStmt.get();
     }
     getWorkersByRun(runId) {
         const stmt = this.db.prepare(`
