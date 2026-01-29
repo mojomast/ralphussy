@@ -58,6 +58,43 @@ export interface TaskCost {
   created_at: string;
 }
 
+async function readLastLines(filePath: string, maxLines: number, maxBytes: number = 64 * 1024): Promise<string[]> {
+  try {
+    const stats = await fs.promises.stat(filePath);
+    const size = stats.size;
+    if (size === 0) return [];
+
+    const handle = await fs.promises.open(filePath, 'r');
+    try {
+      const readSize = Math.min(size, maxBytes);
+      const buffer = Buffer.alloc(readSize);
+      const position = size - readSize;
+
+      await handle.read(buffer, 0, readSize, position);
+
+      let content = buffer.toString('utf-8');
+      // If we didn't read the whole file and the first line is partial, discard it
+      if (position > 0) {
+        const firstNewLine = content.indexOf('\n');
+        if (firstNewLine !== -1) {
+          content = content.substring(firstNewLine + 1);
+        }
+      }
+
+      const lines = content.split('\n')
+        .map(l => l.trim())
+        .filter(l => l.length > 0)
+        .reverse(); // Newest first
+
+      return lines.slice(0, maxLines);
+    } finally {
+      await handle.close();
+    }
+  } catch (error) {
+    return [];
+  }
+}
+
 export class SwarmDatabase {
   private db: Database;
 
@@ -184,40 +221,44 @@ export class SwarmDatabase {
     return costs;
   }
 
-  getRecentLogs(runId: string, limit: number = 20): Array<{ worker_num: string; log_line: string; timestamp: number }> {
+  async getRecentLogs(runId: string, limit: number = 20): Promise<Array<{ worker_num: string; log_line: string; timestamp: number }>> {
     const ralphDir = process.env.RALPH_DIR || path.join(process.env.HOME || '', 'projects', '.ralph');
     const runDir = path.join(ralphDir, 'swarm', 'runs', runId);
     const logs: Array<{ worker_num: string; log_line: string; timestamp: number }> = [];
 
     try {
-      const workerDirs = fs.readdirSync(runDir, { withFileTypes: true })
-        .filter(dirent => dirent.isDirectory() && dirent.name.startsWith('worker-'));
+      const entries = await fs.promises.readdir(runDir, { withFileTypes: true });
+      const workerDirs = entries.filter(dirent => dirent.isDirectory() && dirent.name.startsWith('worker-'));
 
-      const now = Date.now();
       let lineCounter = 0;
 
       for (const workerDir of workerDirs) {
         const logsDir = path.join(runDir, workerDir.name, 'logs');
-        if (!fs.existsSync(logsDir)) continue;
+        try {
+          await fs.promises.access(logsDir);
+        } catch {
+          continue;
+        }
 
-        const logFiles = fs.readdirSync(logsDir)
+        const logFiles = await fs.promises.readdir(logsDir);
+        const logFilesWithStats = await Promise.all(logFiles
           .filter(file => file.endsWith('.log'))
-          .sort((a, b) => {
-            const statA = fs.statSync(path.join(logsDir, a));
-            const statB = fs.statSync(path.join(logsDir, b));
-            return statB.mtimeMs - statA.mtimeMs;
-          });
+          .map(async file => {
+             const stats = await fs.promises.stat(path.join(logsDir, file));
+             return { file, mtimeMs: stats.mtimeMs };
+          }));
 
-        for (const logFile of logFiles) {
-          const logPath = path.join(logsDir, logFile);
-          const stats = fs.statSync(logPath);
+        logFilesWithStats.sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+        for (const { file, mtimeMs } of logFilesWithStats) {
+          const logPath = path.join(logsDir, file);
           
-          const lines = fs.readFileSync(logPath, 'utf-8').split('\n').reverse().filter(line => line.trim());
+          const lines = await readLastLines(logPath, limit * 2);
           for (const line of lines) {
             logs.push({
               worker_num: workerDir.name.replace('worker-', ''),
               log_line: line,
-              timestamp: stats.mtimeMs - (lineCounter * 1000)
+              timestamp: mtimeMs - (lineCounter * 1000)
             });
             lineCounter++;
             if (logs.length >= limit * 2) break;

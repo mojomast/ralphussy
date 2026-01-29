@@ -6,6 +6,7 @@ export class SwarmDashboard {
   private db!: ReturnType<typeof createSwarmDatabase>;
   private refreshInterval: number = 2000;
   private refreshTimer: NodeJS.Timeout | null = null;
+  private isStopped: boolean = false;
   private currentRunId: string | null = null;
   private lastLogTimestamp: number = 0;
   private logLines: Array<{ worker_num: string; log_line: string }> = [];
@@ -298,23 +299,25 @@ export class SwarmDashboard {
   }
 
   private startRefreshLoop() {
-    this.refreshData();
-    this.refreshTimer = setInterval(() => {
-      this.refreshData();
-    }, this.refreshInterval);
+    if (this.isStopped) return;
+    this.refreshData().finally(() => {
+      if (!this.isStopped) {
+        this.refreshTimer = setTimeout(() => this.startRefreshLoop(), this.refreshInterval);
+      }
+    });
   }
 
-  private refreshData() {
+  private async refreshData() {
     try {
       const run = this.db.getCurrentRun();
       
       if (run) {
         this.currentRunId = run.run_id;
         this.updateHeader(run);
-        this.updateWorkers(run.run_id);
+        await this.updateWorkers(run.run_id);
         this.updateTasks(run.run_id);
         this.updateResources(run.run_id);
-        this.updateConsole(run.run_id);
+        await this.updateConsole(run.run_id);
       } else {
         this.updateHeaderNoRun();
         this.clearLists();
@@ -347,7 +350,7 @@ export class SwarmDashboard {
     }
   }
 
-  private updateWorkers(runId: string) {
+  private async updateWorkers(runId: string) {
     const workers = this.db.getWorkersByRun(runId);
     const workersList = this.renderer.root.findDescendantById('workers-list');
     if (!workersList) return;
@@ -393,7 +396,7 @@ export class SwarmDashboard {
         actionsList.remove(child.id);
       }
 
-      const logs = this.db.getRecentLogs(runId, 200);
+      const logs = await this.db.getRecentLogs(runId, 200);
       const actionLines: Array<{ content: string; fg: string }> = [];
       for (const log of logs) {
         const clean = String(log.log_line).replace(/\x1b\[[0-9;]*m/g, '').trim();
@@ -529,8 +532,8 @@ export class SwarmDashboard {
     }
   }
 
-  private updateConsole(runId: string) {
-    const logs = this.db.getRecentLogs(runId, 15);
+  private async updateConsole(runId: string) {
+    const logs = await this.db.getRecentLogs(runId, 15);
     const consoleList = this.renderer.root.findDescendantById('console-list');
     
     if (!consoleList) {
@@ -631,8 +634,9 @@ export class SwarmDashboard {
   }
 
   private cleanup() {
+    this.isStopped = true;
     if (this.refreshTimer) {
-      clearInterval(this.refreshTimer);
+      clearTimeout(this.refreshTimer);
     }
     try {
       this.db.close();
