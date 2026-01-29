@@ -52,6 +52,7 @@ export interface TaskCost {
 }
 export declare class SwarmDatabase {
     private db;
+    private getCurrentRunStmt;
     constructor(dbPath: string);
     close(): void;
     getCurrentRun(): SwarmRun | null;
